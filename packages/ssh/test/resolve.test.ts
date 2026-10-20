@@ -135,7 +135,7 @@ describe('password, key and port precedence', () => {
     expect(groupKey).not.toHaveProperty('passphrase');
   });
 
-  it('uses the host port unless it is the default, then the nearest group port, then 22', () => {
+  it('always uses the host port, even an explicit 22; a group port is not inherited', () => {
     const G_NEAR = uid(10);
     const G_FAR = uid(11);
     const items = (
@@ -149,8 +149,9 @@ describe('password, key and port precedence', () => {
         [H, host({ group_id: G_NEAR, ...(hostPort ? { port: hostPort } : {}) })],
       ]);
     expect(resolveConnection(items(2200, 2201, 2202), H).port).toBe(2200);
-    expect(resolveConnection(items(undefined, 2201, 2202), H).port).toBe(2201);
-    expect(resolveConnection(items(22, undefined, 2202), H).port).toBe(2202);
+    expect(resolveConnection(items(22, undefined, 2202), H).port).toBe(22);
+    expect(resolveConnection(items(22, 2201, 2202), H).port).toBe(22);
+    expect(resolveConnection(items(undefined, 2201, 2202), H).port).toBe(22);
     expect(resolveConnection(items(undefined, undefined, undefined), H).port).toBe(22);
   });
 });
