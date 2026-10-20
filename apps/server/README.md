@@ -41,8 +41,41 @@ the WebSocket to the `ternix` service. Set `TERNIX_TRUST_PROXY=true` so rate lim
 real client address, and only when the app port is not reachable except through the proxy
 (the default loopback binding is fine).
 
-On a trusted network such as a LAN or Tailscale you can skip TLS and publish the app port
-with `TERNIX_BIND=0.0.0.0`.
+On a trusted LAN you can skip TLS and publish the app port with `TERNIX_BIND=0.0.0.0`.
+
+### On your tailnet only (Tailscale)
+
+This puts the server on your Tailscale network with HTTPS and publishes no port on the
+host, so nothing outside the tailnet can reach it.
+
+1. In the Tailscale admin console, enable MagicDNS and HTTPS certificates, then create an
+   auth key (Settings → Keys). A one-off, pre-approved key is enough; add a tag such as
+   `tag:ternix` if you use ACL tags.
+2. Start it:
+
+   ```sh
+   cat > .env <<'ENV'
+   TS_AUTHKEY=tskey-auth-...
+   TERNIX_TS_HOSTNAME=ternix
+   ENV
+   docker compose -f docker-compose.yml -f docker-compose.tailscale.yml up -d --build
+   ```
+
+3. From any device on the tailnet: `curl https://ternix.<your-tailnet>.ts.net/api/v1/server`.
+   Use that URL as the server address in the desktop app. The first request can take a few
+   seconds while Tailscale issues the certificate.
+
+Without `TS_AUTHKEY` the sidecar prints a login URL instead
+(`docker compose -f docker-compose.yml -f docker-compose.tailscale.yml logs tailscale`); open
+it and approve the machine.
+
+The Tailscale sidecar keeps its node identity in the `tailscale-state` volume, so after the
+first start you can delete `TS_AUTHKEY` from `.env`. The ternix container shares the
+sidecar's network namespace; `tailscale serve` (`apps/server/deploy/tailscale-serve.json`)
+terminates HTTPS on port 443 and proxies HTTP and WebSockets to the server. Restrict who can
+reach the node with your tailnet ACLs. Pass `TS_EXTRA_ARGS` (for example
+`--advertise-tags=tag:ternix`) for extra `tailscale up` flags. Use the same two `-f` flags on
+later `docker compose` commands.
 
 ## Configuration
 
