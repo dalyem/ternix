@@ -164,8 +164,8 @@ describe('Realtime (fake socket)', () => {
 });
 
 describe('Realtime against the server', () => {
-  afterEach(() => {
-    closeClients();
+  afterEach(async () => {
+    await closeClients();
   });
 
   it('reconnects after the server drops the socket and catches up on what it missed', async () => {
@@ -195,7 +195,7 @@ describe('Realtime against the server', () => {
       await caughtUp;
       expect(b.client.getItem(a.personalVaultId, missed.item!.id)).not.toBeNull();
     } finally {
-      closeClients();
+      await closeClients();
       await server.close();
     }
   });

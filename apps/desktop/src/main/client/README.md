@@ -35,7 +35,9 @@ Server and account
   default (`KdfTooWeakError`) before deriving or sending anything.
 - `unlock(password)` works offline from the saved session (`WrongPasswordError`);
   `lock()` zeroes and drops every key.
-- `logout()` revokes the token (best effort) and clears session and cache.
+- `logout()` revokes the token (best effort) and clears session, cache and pinned keys.
+- `lock()`, `close()` and `flush()` return promises that settle once the pending cache
+  writes are stored; call `await client.flush()` from the app's quit hook.
 - `revalidate()` (`GET /me`), `changePassword(current, next)` (other devices are revoked).
 - `listDevices()`, `revokeDevice(id)`.
 - Admin: `createInvite`, `listInvites`, `deleteInvite`, `listUsers`, `deleteUser`.
@@ -45,13 +47,23 @@ Vaults and sharing (unlocked)
 - `listVaults()`, `getVault(id)`: from memory, so they work offline. A vault whose key or
   name cannot be opened has `name: null` and `error` set.
 - `createVault(name)`, `renameVault(id, name)`, `deleteVault(id)`.
-- `listMembers(id)` (with fingerprints), `changeMemberRole`, `leaveVault`.
+- `listMembers(id)` (with fingerprints and key-pin status), `changeMemberRole`, `leaveVault`.
 - Sharing is two steps so the UI can show the fingerprint:
   `lookupUser(email)` returns `{id, publicKey, fingerprint}`; after the user compares the
   fingerprint out of band, `addMember(vaultId, id, role, publicKey)` wraps the vault key for
   exactly that key and refuses (`key_changed`) if the server now reports another one.
+- Member keys are pinned per account (trust on first use, kept in the `SecretStore`, cleared
+  on logout). `addMember` pins the key the user verified; members seen only in a list are
+  pinned unverified. Members carry `verified`, `keyChanged` and `pinnedFingerprint`. Before a
+  vault key is wrapped for anyone (rotation, sharing) every member's server-reported key must
+  equal its pin, else `member_key_changed` (`change`/`keyChange`: `userId`, `email`,
+  `pinnedFingerprint`, `serverFingerprint`) is thrown and nothing is sent. After comparing
+  the new fingerprint out of band, `acceptMemberKey(userId, publicKey)` re-pins it as
+  verified; `markMemberVerified(userId)` marks a pin verified. A changed key of your own
+  account is `own_key_mismatch` everywhere the server reports it.
 - `removeMember(vaultId, userId)`: an owner removing someone else rotates the key right
-  after; the result says whether the rotation went through.
+  after; the result says whether the rotation went through (`rotationError` can be a
+  `member_key_changed`).
 - `rotateVault(id)`: retries on `409` (refreshing members and items) up to
   `MAX_ROTATION_ATTEMPTS`, then `RotationError`.
 
@@ -64,6 +76,11 @@ Items (unlocked)
   result `status` is `saved` or `dropped` (the server kept a newer version). Writes need
   the server and throw `OfflineError` without it; there is no offline queue.
 - `sync()`, `refreshVaults()`, `pullVault(id)`: realtime calls these by itself.
+
+Cache writes: item documents (items and `since` cursor together) are held in memory and
+written once per vault after 250 ms of quiet or 2 s at most (`cacheWrite` option), and on
+`lock`, `logout`, `close` and `flush`. Reads see the pending state. A crash loses at most that
+window; the cursor is never stored ahead of the items it covers.
 
 Events: `on(event, listener)` returns an unsubscribe function. Events are `state`,
 `connection`, `vaults-changed`, `items-changed` (`{vaultId}`), `session-revoked`

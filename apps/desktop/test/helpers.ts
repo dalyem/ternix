@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ready } from '@ternix/core/crypto';
+import { generateAccountKeypair, ready, toB64 } from '@ternix/core/crypto';
 import type { KdfParams, RegistrationMode } from '@ternix/core/protocol';
 import { buildApp, type BuiltApp } from '../../server/src/app.js';
 import { DEFAULT_RATE_LIMIT, type Config } from '../../server/src/config.js';
@@ -129,8 +129,8 @@ export async function makeClient(
 }
 
 /** Close every client made by `makeClient` (call before stopping the server). */
-export function closeClients(): void {
-  for (const client of open.splice(0)) client.close();
+export async function closeClients(): Promise<void> {
+  await Promise.all(open.splice(0).map((client) => client.close()));
 }
 
 let counter = 0;
@@ -149,9 +149,14 @@ export interface Registered extends TestClient {
 export async function registerUser(
   server: TestServer,
   overrides: Partial<TernixClientOptions> = {},
-  opts: { email?: string; password?: string; inviteCode?: string } = {},
+  opts: {
+    email?: string;
+    password?: string;
+    inviteCode?: string;
+    stores?: { secretStore: MemorySecretStore; cacheStore: MemoryCacheStore };
+  } = {},
 ): Promise<Registered> {
-  const t = await makeClient(overrides);
+  const t = await makeClient(overrides, opts.stores);
   const email = opts.email ?? uniqueEmail();
   const password = opts.password ?? `correct horse ${counter}`;
   await t.client.register({
@@ -243,6 +248,30 @@ export async function rawRequest(
   });
   const text = await res.text();
   return { status: res.status, body: text ? JSON.parse(text) : undefined };
+}
+
+/** A malicious server swapping a user's public key: rewrite it in the server's database. */
+export function substituteKey(server: TestServer, userId: string): string {
+  const publicKey = toB64(generateAccountKeypair().publicKey);
+  const res = server.db
+    .prepare('UPDATE users SET public_key = ? WHERE id = ?')
+    .run(publicKey, userId);
+  if (res.changes !== 1) throw new Error('no such user');
+  return publicKey;
+}
+
+/** A cache store that counts writes per key. */
+export class CountingCacheStore extends MemoryCacheStore {
+  readonly sets = new Map<string, number>();
+
+  override async set(account: string, key: string, value: unknown): Promise<void> {
+    this.sets.set(key, (this.sets.get(key) ?? 0) + 1);
+    return super.set(account, key, value);
+  }
+
+  setsOf(keyPart: string): number {
+    return [...this.sets].filter(([k]) => k.includes(keyPart)).reduce((n, [, c]) => n + c, 0);
+  }
 }
 
 export function snippet(label: string, script = `echo ${label}`) {

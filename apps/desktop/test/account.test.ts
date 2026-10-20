@@ -34,7 +34,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  closeClients();
+  await closeClients();
   await server.close();
 });
 
@@ -107,7 +107,7 @@ describe('register, logout, login, unlock', () => {
     ]);
 
     // Lock drops the keys; unlock with a wrong then the right password.
-    a.client.lock();
+    await a.client.lock();
     expect(a.client.state).toBe('locked');
     expect(() => a.client.listVaults()).toThrow(expect.objectContaining({ code: 'locked' }));
     await expect(a.client.unlock('not it')).rejects.toBeInstanceOf(WrongPasswordError);
@@ -120,7 +120,7 @@ describe('register, logout, login, unlock', () => {
   it('unlocks offline from the saved session and cache; writes need the server', async () => {
     const a = await registerUser(server, { realtime: false });
     await a.client.putItem(a.personalVaultId, undefined, snippet('cached'));
-    a.client.close();
+    await a.client.close();
 
     // A fresh process with the same stores and no network.
     const b = await makeClient({ realtime: false }, a);
@@ -243,7 +243,7 @@ describe('password change', () => {
     expect(other.client.state).toBe('expired');
 
     // This device still works and unlocks only with the new password.
-    a.client.lock();
+    await a.client.lock();
     await expect(a.client.unlock(a.password)).rejects.toBeInstanceOf(WrongPasswordError);
     await a.client.unlock('new password 2');
     await a.client.sync();
@@ -309,7 +309,7 @@ describe('admin', () => {
       await expect(user.client.revalidate()).rejects.toBeInstanceOf(TernixError);
       expect(user.client.state).toBe('expired');
     } finally {
-      closeClients();
+      await closeClients();
       await invServer.close();
     }
   });

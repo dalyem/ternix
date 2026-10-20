@@ -1,5 +1,5 @@
 import type { ErrorCode, Item, RotateConflictResponse } from '@ternix/core/protocol';
-import type { ErrorDto } from '../../shared/types.js';
+import type { ErrorDto, KeyChangeDto } from '../../shared/types.js';
 
 /** Codes of errors raised by the client itself (server codes are `ErrorCode`). */
 export type ClientErrorCode =
@@ -17,6 +17,8 @@ export type ClientErrorCode =
   | 'invalid_input'
   | 'vault_unavailable'
   | 'key_changed'
+  | 'member_key_changed'
+  | 'own_key_mismatch'
   | 'rotation_failed'
   | 'conflict_unresolved';
 
@@ -96,6 +98,33 @@ export class RotationError extends TernixError {
   }
 }
 
+/**
+ * A member's public key, as the server reports it, is not the one this device pinned. Raised
+ * before any vault key is wrapped for it (rotation, sharing); nothing was sent.
+ */
+export class MemberKeyChangedError extends TernixError {
+  override name = 'MemberKeyChangedError';
+  constructor(readonly change: KeyChangeDto) {
+    super(
+      'member_key_changed',
+      `The key of ${change.email} changed (pinned ${change.pinnedFingerprint}, server reports ` +
+        `${change.serverFingerprint}). Compare the new fingerprint with them, then accept it.`,
+    );
+  }
+}
+
+/** The server reports an account key for this user that differs from the pinned one. */
+export class OwnKeyMismatchError extends TernixError {
+  override name = 'OwnKeyMismatchError';
+  constructor() {
+    super(
+      'own_key_mismatch',
+      'The server reports a different account key than the one this device pinned for you. ' +
+        'Ternix stopped, because the server may be trying to impersonate you.',
+    );
+  }
+}
+
 export const isApiError = (err: unknown, code?: ErrorCode): err is ApiError =>
   err instanceof ApiError && (code === undefined || err.code === code);
 
@@ -103,6 +132,9 @@ export const isApiError = (err: unknown, code?: ErrorCode): err is ApiError =>
 export function toErrorDto(err: unknown): ErrorDto {
   if (err instanceof ApiError) {
     return { name: err.name, code: err.code, message: err.message, status: err.status };
+  }
+  if (err instanceof MemberKeyChangedError) {
+    return { name: err.name, code: err.code, message: err.message, keyChange: err.change };
   }
   if (err instanceof TernixError) return { name: err.name, code: err.code, message: err.message };
   if (err instanceof Error) return { name: err.name, code: 'internal', message: err.message };

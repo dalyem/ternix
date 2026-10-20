@@ -56,9 +56,16 @@ import type {
   VaultItemsDto,
   WriteResultDto,
 } from '../../shared/types.js';
+import { CoalescingCacheStore, type CoalescingOptions } from './coalescing.js';
 import { TypedEmitter } from './emitter.js';
 import { VaultEngine } from './engine.js';
-import { isApiError, KdfTooWeakError, TernixError, WrongPasswordError } from './errors.js';
+import {
+  isApiError,
+  KdfTooWeakError,
+  TernixError,
+  toErrorDto,
+  WrongPasswordError,
+} from './errors.js';
 import { type FetchLike, Http } from './http.js';
 import { Keyring } from './keyring.js';
 import {
@@ -67,11 +74,20 @@ import {
   type WebSocketFactory,
   wsSocketFactory,
 } from './realtime.js';
+import { PinStore, pinsKey } from './pins.js';
 import { normalizeServerUrl, probeServer, wsUrlFor } from './serverUrl.js';
-import { accountKey, SESSION_KEY, type StoredSession, storedSessionSchema } from './session.js';
+import {
+  accountKey,
+  isItemsCacheKey,
+  SESSION_KEY,
+  type StoredSession,
+  storedSessionSchema,
+} from './session.js';
 import type { CacheStore, SecretStore } from './stores.js';
 
 export * from './errors.js';
+export { CoalescingCacheStore, type CoalescingOptions, DEFAULT_COALESCING } from './coalescing.js';
+export { type KeyPin, PinStore } from './pins.js';
 export { chunkBatch, MAX_ROTATION_ATTEMPTS } from './engine.js';
 export type { FetchLike } from './http.js';
 export type {
@@ -98,8 +114,15 @@ export {
 } from './stores.js';
 
 export interface TernixClientOptions {
+  /** Session and pinned member keys; integrity matters. Electron: `safeStorage`. */
   secretStore: SecretStore;
   cacheStore: CacheStore;
+  /**
+   * Item-cache writes are coalesced per vault: written once changes pause for `debounceMs`
+   * (default 250), or `maxDelayMs` (default 2000) after the first one. `lock`, `logout`,
+   * `close` and `flush` write everything at once.
+   */
+  cacheWrite?: Partial<CoalescingOptions>;
   /** Default `globalThis.fetch`; Electron passes `net.fetch`. */
   fetch?: FetchLike;
   /** Default: the `ws` package. */
@@ -166,6 +189,9 @@ export class TernixClient {
   private readonly deriveKeys: (password: string, kdf: KdfParams) => Promise<DerivedKeys>;
   private readonly isKdfStrongEnough: (kdf: KdfParams) => boolean;
   private readonly now: () => Date;
+  /** The caller's cache store behind the write coalescer; everything reads and writes here. */
+  private readonly cache: CoalescingCacheStore;
+  private pins: { account: string; loading: Promise<PinStore> } | null = null;
   private session: StoredSession | null = null;
   private http: Http | null = null;
   private engine: VaultEngine | null = null;
@@ -178,6 +204,12 @@ export class TernixClient {
     this.deriveKeys = options.deriveKeys ?? coreDeriveKeys;
     this.isKdfStrongEnough = options.isKdfStrongEnough ?? coreIsKdfStrongEnough;
     this.now = options.now ?? (() => new Date());
+    this.cache = new CoalescingCacheStore(
+      options.cacheStore,
+      isItemsCacheKey,
+      (err) => this.emitter.emit('error', toErrorDto(err)),
+      options.cacheWrite,
+    );
   }
 
   // Events and state
@@ -276,6 +308,34 @@ export class TernixClient {
     return this.engine;
   }
 
+  /** The pinned member keys of an account; loaded once and kept across lock and unlock. */
+  private pinStoreFor(serverUrl: string, userId: string): Promise<PinStore> {
+    const account = accountKey(serverUrl, userId);
+    if (this.pins?.account !== account) {
+      const loading = PinStore.load(this.options.secretStore, account, userId, this.now);
+      this.pins = { account, loading };
+      loading.catch(() => {
+        if (this.pins?.loading === loading) this.pins = null;
+      });
+    }
+    return this.pins.loading;
+  }
+
+  /** Pins of the saved session; its account key is pinned as the account's own. */
+  private async sessionPins(session: StoredSession): Promise<PinStore> {
+    const pins = await this.pinStoreFor(session.serverUrl, session.user.id);
+    await pins.pinSelf(session.keys.public_key);
+    return pins;
+  }
+
+  private async forgetPins(account: string): Promise<void> {
+    const loaded =
+      this.pins?.account === account ? await this.pins.loading.catch(() => null) : null;
+    this.pins = this.pins?.account === account ? null : this.pins;
+    if (loaded) await loaded.clear();
+    else await this.options.secretStore.delete(pinsKey(account));
+  }
+
   private get device(): DeviceInfo {
     return (
       this.options.device ?? { name: hostname() || 'Ternix desktop', platform: process.platform }
@@ -334,6 +394,9 @@ export class TernixClient {
         },
         schema: registerResponseSchema,
       });
+      const pins = await this.pinStoreFor(serverUrl, res.user.id);
+      await pins.pinSelf(publicKey);
+      pins.checkSelf(res.user.id, res.user.public_key);
       await this.startSession({
         serverUrl,
         email,
@@ -415,6 +478,12 @@ export class TernixClient {
         privateKey.fill(0);
         throw new TernixError('protocol_error', 'The account key from the server does not match');
       }
+      try {
+        await (await this.pinStoreFor(serverUrl, res.user.id)).pinSelf(res.keys.public_key);
+      } catch (err) {
+        privateKey.fill(0);
+        throw err;
+      }
       await this.startSession({
         serverUrl,
         email,
@@ -443,7 +512,8 @@ export class TernixClient {
     const previous = this.session;
     const oldAccount = previous && accountKey(previous.serverUrl, previous.user.id);
     if (oldAccount && oldAccount !== accountKey(session.serverUrl, session.user.id)) {
-      await this.options.cacheStore.clear(oldAccount);
+      await this.cache.clear(oldAccount);
+      await this.forgetPins(oldAccount);
     }
     this.useSession(session);
     await this.saveSession();
@@ -474,6 +544,12 @@ export class TernixClient {
       privateKey.fill(0);
       throw new TernixError('protocol_error', 'The saved account key is inconsistent');
     }
+    try {
+      await (await this.sessionPins(session)).pinSelf(toB64(publicKey));
+    } catch (err) {
+      privateKey.fill(0);
+      throw err;
+    }
     // Another unlock, a lock or a logout may have happened during the KDF.
     if (this.session !== session || this.state === 'unlocked') {
       privateKey.fill(0);
@@ -488,10 +564,11 @@ export class TernixClient {
     this.engine?.close();
     const engine = new VaultEngine({
       http: this.http!,
-      cache: this.options.cacheStore,
+      cache: this.cache,
       account: accountKey(session.serverUrl, session.user.id),
       userId: session.user.id,
       keyring,
+      pins: await this.pinStoreFor(session.serverUrl, session.user.id),
       now: this.now,
       emit: (event, payload) => this.emitter.emit(event, payload),
     });
@@ -536,13 +613,34 @@ export class TernixClient {
     realtime.start();
   }
 
-  /** Forget all key material and stop syncing. The session stays; `unlock` resumes. */
-  lock(): void {
+  /**
+   * Forget all key material and stop syncing. The session stays; `unlock` resumes. Keys are
+   * gone and the state has changed when this returns; the promise settles once the pending
+   * cache writes are stored (it never rejects: failures are emitted as `error` events).
+   */
+  lock(): Promise<void> {
     this.realtime?.stop();
     this.realtime = null;
     this.engine?.close();
     this.engine = null;
     if (this.session) this.setState(this.session.token ? 'locked' : 'expired');
+    return this.flushQuietly();
+  }
+
+  /**
+   * Write every pending cache update now. Call it before the app quits; `lock`, `logout` and
+   * `close` do it themselves. Rejects if a write failed.
+   */
+  flush(): Promise<void> {
+    return this.cache.flush();
+  }
+
+  private async flushQuietly(): Promise<void> {
+    try {
+      await this.cache.flush();
+    } catch (err) {
+      this.emitter.emit('error', toErrorDto(err));
+    }
   }
 
   /** The session is gone on the server: drop the token and keys, keep the account. */
@@ -550,7 +648,7 @@ export class TernixClient {
     const session = this.session;
     if (!session || session.token === null) return;
     this.session = { ...session, token: null };
-    this.lock();
+    void this.lock();
     this.saveSession().catch(() => undefined);
     this.setState('expired');
     this.emitter.emit('session-revoked', { reason });
@@ -571,8 +669,10 @@ export class TernixClient {
         serverRevoked = false;
       }
     }
-    this.lock();
-    await this.options.cacheStore.clear(accountKey(session.serverUrl, session.user.id));
+    await this.lock();
+    const account = accountKey(session.serverUrl, session.user.id);
+    await this.cache.clear(account);
+    await this.forgetPins(account);
     await this.options.secretStore.delete(SESSION_KEY);
     this.session = null;
     this.http = null;
@@ -585,6 +685,8 @@ export class TernixClient {
     const { http } = this.requireOnline();
     const { user } = await http.request(routes.me, { schema: meResponseSchema });
     if (this.session) {
+      // The server must keep reporting the account key this device pinned.
+      (await this.sessionPins(this.session)).checkSelf(user.id, user.public_key);
       this.session = { ...this.session, user };
       await this.saveSession();
     }
@@ -701,8 +803,10 @@ export class TernixClient {
   }
 
   async listUsers(): Promise<UserDto[]> {
-    const { http } = this.requireOnline();
+    const { session, http } = this.requireOnline();
     const { users } = await http.request(routes.listUsers, { schema: listUsersResponseSchema });
+    const pins = await this.sessionPins(session);
+    for (const u of users) pins.checkSelf(u.id, u.public_key);
     return users.map(toUserDto);
   }
 
@@ -761,6 +865,19 @@ export class TernixClient {
     return this.requireEngine().addMember(vaultId, userId, role, expectedPublicKey);
   }
 
+  /**
+   * After comparing the new fingerprint with the user out of band: trust `publicKey` as the
+   * user's key (replacing the pin that made rotation and sharing refuse).
+   */
+  acceptMemberKey(userId: string, publicKey: string): Promise<void> {
+    return this.requireEngine().acceptMemberKey(userId, publicKey);
+  }
+
+  /** After comparing the pinned fingerprint with the user out of band. */
+  markMemberVerified(userId: string): Promise<void> {
+    return this.requireEngine().markMemberVerified(userId);
+  }
+
   changeMemberRole(vaultId: string, userId: string, role: VaultRole): Promise<MemberDto> {
     return this.requireEngine().changeMemberRole(vaultId, userId, role);
   }
@@ -810,9 +927,13 @@ export class TernixClient {
     );
   }
 
-  /** Stop realtime and drop keys; the client object can be thrown away afterwards. */
-  close(): void {
-    this.lock();
+  /**
+   * Stop realtime and drop keys; the client object can be thrown away afterwards. The promise
+   * settles once pending cache writes are stored.
+   */
+  async close(): Promise<void> {
+    const flushed = this.lock();
     this.emitter.removeAllListeners();
+    await flushed;
   }
 }

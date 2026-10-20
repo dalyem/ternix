@@ -33,6 +33,7 @@ import {
   type Member,
   memberSchema,
   normalizeEmail,
+  publicKeySchema,
   routes,
   type RotateRequest,
   UUID_V4_RE,
@@ -55,9 +56,17 @@ import type {
   VaultItemsDto,
   WriteResultDto,
 } from '../../shared/types.js';
-import { isApiError, OfflineError, RotationError, TernixError, toErrorDto } from './errors.js';
+import {
+  isApiError,
+  MemberKeyChangedError,
+  OfflineError,
+  RotationError,
+  TernixError,
+  toErrorDto,
+} from './errors.js';
 import { type Http, LONG_TIMEOUT_MS } from './http.js';
 import type { Keyring } from './keyring.js';
+import { fingerprintOf, type PinObservation, type PinStore } from './pins.js';
 import { itemsCacheKey, itemsCacheSchema, VAULTS_CACHE_KEY, vaultsCacheSchema } from './session.js';
 import type { CacheStore } from './stores.js';
 
@@ -74,6 +83,8 @@ export interface EngineDeps {
   account: string;
   userId: string;
   keyring: Keyring;
+  /** Pinned member keys; see `pins.ts`. */
+  pins: PinStore;
   now: () => Date;
   emit: <K extends keyof ClientEvents>(event: K, payload: ClientEvents[K]) => void;
 }
@@ -253,13 +264,20 @@ export class VaultEngine {
     await this.deps.cache.set(this.deps.account, VAULTS_CACHE_KEY, { version: 1, vaults });
   }
 
-  private async persistItems(state: VaultState): Promise<void> {
+  /**
+   * Hand the vault's items and cursor to the cache, which writes them once changes pause
+   * (`CoalescingCacheStore`). Cursor and items go in one document, so the cursor never
+   * covers items that were not stored with it.
+   */
+  private persistItems(state: VaultState): void {
     if (this.closed || this.vaults.get(state.vault.id) !== state) return;
-    await this.deps.cache.set(this.deps.account, itemsCacheKey(state.vault.id), {
-      version: 1,
-      since: state.since,
-      items: [...state.items.values()],
-    });
+    this.deps.cache
+      .set(this.deps.account, itemsCacheKey(state.vault.id), {
+        version: 1,
+        since: state.since,
+        items: [...state.items.values()],
+      })
+      .catch((err: unknown) => this.reportBackground(err));
   }
 
   // Keys and vault state
@@ -466,7 +484,7 @@ export class VaultEngine {
     const moved = since !== state.since;
     state.since = Math.max(state.since, since);
     this.pruneKeys(state);
-    if (changed || moved) await this.persistItems(state);
+    if (changed || moved) this.persistItems(state);
     if (changed) this.deps.emit('items-changed', { vaultId });
   }
 
@@ -708,7 +726,7 @@ export class VaultEngine {
         } else if (w.op === 'delete' && isApiError(err, 'not_found')) {
           const local = this.vaults.get(vaultId);
           if (local?.items.delete(w.id)) {
-            await this.persistItems(local);
+            this.persistItems(local);
             this.deps.emit('items-changed', { vaultId });
           }
           return { id: w.id, status: 'saved', item: null };
@@ -718,7 +736,7 @@ export class VaultEngine {
       }
       const local = this.vaults.get(vaultId);
       if (!this.closed && local && this.applyItem(local, outcome.item)) {
-        await this.persistItems(local);
+        this.persistItems(local);
         this.deps.emit('items-changed', { vaultId });
       }
       return this.result(outcome.item, outcome.status, outcome.payload);
@@ -865,7 +883,7 @@ export class VaultEngine {
       }
     } finally {
       if (changed) {
-        await this.persistItems(state);
+        this.persistItems(state);
         this.deps.emit('items-changed', { vaultId });
       }
     }
@@ -954,7 +972,7 @@ export class VaultEngine {
 
   // Members and sharing
 
-  private toMemberDto(m: Member): MemberDto {
+  private toMemberDto(m: Member, obs: PinObservation): MemberDto {
     return {
       userId: m.user_id,
       email: m.email,
@@ -964,7 +982,43 @@ export class VaultEngine {
       fingerprint: fingerprint(fromB64(m.public_key)),
       addedAt: m.added_at,
       isSelf: m.user_id === this.deps.userId,
+      pinnedFingerprint: fingerprintOf(obs.pin.public_key),
+      verified: obs.pin.verified,
+      keyChanged: obs.status === 'mismatch',
     };
+  }
+
+  /** Compare listed members' keys with the pins, pinning new ones (TOFU). */
+  private observeMembers(members: Member[]): Promise<PinObservation[]> {
+    return this.deps.pins.observe(
+      members.map((m) => ({ userId: m.user_id, publicKey: m.public_key })),
+    );
+  }
+
+  private async memberDtos(members: Member[]): Promise<MemberDto[]> {
+    const observed = await this.observeMembers(members);
+    return members.map((m, i) => this.toMemberDto(m, observed[i]!));
+  }
+
+  /** Throws `MemberKeyChangedError` for the first member whose key is not the pinned one. */
+  private assertKeysPinned(members: Member[], observed: PinObservation[]): void {
+    for (const [i, m] of members.entries()) {
+      const obs = observed[i]!;
+      if (obs.status === 'mismatch') throw this.keyChanged(m.user_id, m.email, obs);
+    }
+  }
+
+  private keyChanged(
+    userId: string,
+    email: string,
+    obs: Extract<PinObservation, { status: 'mismatch' }>,
+  ): MemberKeyChangedError {
+    return new MemberKeyChangedError({
+      userId,
+      email,
+      pinnedFingerprint: fingerprintOf(obs.pin.public_key),
+      serverFingerprint: fingerprintOf(obs.serverKey),
+    });
   }
 
   private async fetchMembers(vaultId: string): Promise<Member[]> {
@@ -978,7 +1032,30 @@ export class VaultEngine {
 
   async listMembers(vaultId: string): Promise<MemberDto[]> {
     this.state(vaultId);
-    return (await this.fetchMembers(vaultId)).map((m) => this.toMemberDto(m));
+    return this.memberDtos(await this.fetchMembers(vaultId));
+  }
+
+  /**
+   * The user compared the new fingerprint out of band and trusts `publicKey`: pin it as
+   * verified, replacing the old pin. Rotation and sharing proceed once the server reports it.
+   */
+  async acceptMemberKey(userId: string, publicKey: string): Promise<void> {
+    this.assertOpen();
+    if (userId === this.deps.userId) {
+      throw new TernixError('invalid_input', 'Your own key cannot be replaced');
+    }
+    if (!publicKeySchema.safeParse(publicKey).success) {
+      throw new TernixError('invalid_input', 'Not a valid public key');
+    }
+    await this.deps.pins.pin(userId, publicKey, true);
+  }
+
+  /** The user compared the pinned fingerprint out of band: lose the "unverified" mark. */
+  async markMemberVerified(userId: string): Promise<void> {
+    this.assertOpen();
+    if (!(await this.deps.pins.markVerified(userId))) {
+      throw new TernixError('not_found', 'No key is pinned for this user yet');
+    }
   }
 
   /** Find a user to share with. Show `fingerprint` and have it compared out of band. */
@@ -989,20 +1066,27 @@ export class VaultEngine {
       schema: lookupUserResponseSchema,
     });
     this.assertOpen();
+    this.deps.pins.checkSelf(res.id, res.public_key);
     this.lookups.set(res.id, { email: res.email, publicKey: res.public_key });
+    const pin = this.deps.pins.get(res.id);
     return {
       id: res.id,
       email: res.email,
       name: res.name,
       publicKey: res.public_key,
       fingerprint: fingerprint(fromB64(res.public_key)),
+      pinnedFingerprint: pin ? fingerprintOf(pin.public_key) : null,
+      verified: pin?.verified ?? false,
+      keyChanged: pin !== undefined && pin.public_key !== res.public_key,
     };
   }
 
   /**
    * Share a vault with a user found by `lookupUser`. `expectedPublicKey` is the key whose
    * fingerprint the user confirmed; the vault key is wrapped for exactly that key, and the
-   * call refuses if the server now returns a different key for the user.
+   * call refuses if the server now returns a different key for the user. The key is then
+   * pinned as verified; a different earlier pin refuses (`member_key_changed`) until
+   * `acceptMemberKey`.
    */
   async addMember(
     vaultId: string,
@@ -1022,6 +1106,15 @@ export class VaultEngine {
         "This user's key is not the one you verified. Look them up again and compare the fingerprint before sharing.",
       );
     }
+    const pinned = this.deps.pins.get(userId);
+    if (pinned && pinned.public_key !== expectedPublicKey) {
+      throw this.keyChanged(userId, fresh.email, {
+        status: 'mismatch',
+        pin: pinned,
+        serverKey: expectedPublicKey,
+      });
+    }
+    await this.deps.pins.pin(userId, expectedPublicKey, true);
     const publicKey = fromB64(expectedPublicKey);
     for (let attempt = 0; ; attempt++) {
       const state = this.owned(vaultId, 'share a vault');
@@ -1038,7 +1131,7 @@ export class VaultEngine {
           schema: memberSchema,
         });
         await this.settleQuietly(this.refreshVaults());
-        return this.toMemberDto(member);
+        return (await this.memberDtos([member]))[0]!;
       } catch (err) {
         if (attempt === 0 && isApiError(err, 'key_version_mismatch')) {
           await this.refreshVaults();
@@ -1057,7 +1150,7 @@ export class VaultEngine {
       schema: memberSchema,
     });
     await this.settleQuietly(this.refreshVaults());
-    return this.toMemberDto(member);
+    return (await this.memberDtos([member]))[0]!;
   }
 
   /**
@@ -1118,6 +1211,8 @@ export class VaultEngine {
         await this.refreshVaults();
         this.owned(vaultId, 'rotate the vault key');
         const members = await this.fetchMembers(vaultId);
+        // Before any key exists for them: a member whose key is not the pinned one gets nothing.
+        this.assertKeysPinned(members, await this.observeMembers(members));
         await this.pullVault(vaultId);
         const state = this.owned(vaultId, 'rotate the vault key');
 

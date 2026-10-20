@@ -85,15 +85,15 @@ Every payload has `type`, `schema: 1` and `updated_at` (client clock, used for
 conflict resolution). References are item IDs; a client resolves them across all
 vaults it can read and treats a missing reference as unset.
 
-| type | fields |
-|---|---|
-| `group` | `label`, `parent_id?`, `username?`, `port?`, `identity_id?` |
-| `host` | `label`, `address`, `port` (default 22), `username?`, `password?`, `identity_id?`, `key_id?`, `group_id?`, `jump_host_id?`, `tags: string[]`, `startup_snippet_id?`, `keepalive_interval?`, `agent_forwarding: bool`, `color?`, `notes?` |
-| `identity` | `label`, `username`, `password?`, `key_id?` |
-| `ssh_key` | `label`, `private_key` (OpenSSH PEM), `passphrase?`, `public_key?` |
-| `snippet` | `label`, `script`, `tags: string[]` |
-| `port_forward` | `label`, `host_id`, `kind: "local"\|"remote"\|"dynamic"`, `bind_address`, `bind_port`, `dest_host?`, `dest_port?` |
-| `known_host` | `host`, `port`, `key_type`, `public_key` (b64 wire format) |
+| type           | fields                                                                                                                                                                                                                                   |
+| -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `group`        | `label`, `parent_id?`, `username?`, `port?`, `identity_id?`                                                                                                                                                                              |
+| `host`         | `label`, `address`, `port` (default 22), `username?`, `password?`, `identity_id?`, `key_id?`, `group_id?`, `jump_host_id?`, `tags: string[]`, `startup_snippet_id?`, `keepalive_interval?`, `agent_forwarding: bool`, `color?`, `notes?` |
+| `identity`     | `label`, `username`, `password?`, `key_id?`                                                                                                                                                                                              |
+| `ssh_key`      | `label`, `private_key` (OpenSSH PEM), `passphrase?`, `public_key?`                                                                                                                                                                       |
+| `snippet`      | `label`, `script`, `tags: string[]`                                                                                                                                                                                                      |
+| `port_forward` | `label`, `host_id`, `kind: "local"\|"remote"\|"dynamic"`, `bind_address`, `bind_port`, `dest_host?`, `dest_port?`                                                                                                                        |
+| `known_host`   | `host`, `port`, `key_type`, `public_key` (b64 wire format)                                                                                                                                                                               |
 
 Effective connection settings resolve as: host fields, then identity, then group
 chain (nearest first).
@@ -105,49 +105,66 @@ It is sent as `Authorization: Bearer <token>`. The server stores only
 `sha256(token)`. Each token belongs to one device row.
 
 ### `GET /api/v1/server`
+
 `200 {name, version, registration: "open"|"invite"|"closed", protocol: 1}`. No auth.
 
 ### `POST /api/v1/auth/prelogin`
+
 `{email}` → `200 {kdf}`. For an unknown email the server returns a stable fake
 salt, `HMAC-SHA256(server_secret, email)[0..16]`, with default limits, so the
 response does not reveal whether an account exists. Rate limited.
 
 ### `POST /api/v1/auth/register`
+
 ```
 { email, name, invite_code?, kdf, auth_key: b64,
   public_key: b64, encrypted_private_key,
   personal_vault: { id, name_enc, wrapped_key },
   device: { name, platform } }
 ```
+
 → `201 {token, user, device_id}`. The first account on a server becomes `admin`.
 The personal vault is created with `kind: "personal"`, `key_version: 1`, and the
 user as `owner`. Errors: `registration_closed`, `invalid_invite`, `email_taken`.
 
 ### `POST /api/v1/auth/login`
+
 `{email, auth_key, device: {name, platform}}` →
 `200 {token, user, device_id, keys: {public_key, encrypted_private_key, kdf}}`.
 Bad credentials return `401 unauthorized`. Rate limited per IP and per email.
 
 ### `POST /api/v1/auth/logout`
+
 Revokes the current token. `204`.
 
 ### `GET /api/v1/me`
+
 `200 {user}`. `user = {id, email, name, role: "admin"|"user", public_key, created_at}`.
 
 ### `POST /api/v1/me/password`
+
 `{current_auth_key, new_auth_key, new_kdf, new_encrypted_private_key}` → `204`.
 The keypair stays the same, so no vault keys change. All other devices' tokens
 are revoked.
 
+`401 unauthorized` if the session is gone or `current_auth_key` is wrong.
+`409 conflict` if a concurrent password change landed while this request was in
+flight: the server applies the update only to the password hash it verified, so
+nothing is overwritten and no device is revoked. The client reloads its session
+(`GET /me`) and tries again.
+
 ### Devices
+
 `GET /api/v1/devices` → `{devices: [{id, name, platform, created_at, last_seen_at, current}]}`.
 `DELETE /api/v1/devices/:id` revokes that device's token. `204`.
 
 ### Users
+
 `GET /api/v1/users/lookup?email=` → `200 {id, email, name, public_key}` or `404`.
 Requires auth.
 
 ### Admin (role `admin`)
+
 - `POST /api/v1/admin/invites {email?, expires_in_hours?}` → `201 {code, expires_at}`.
 - `GET /api/v1/admin/invites`, `DELETE /api/v1/admin/invites/:code`.
 - `GET /api/v1/admin/users`, `DELETE /api/v1/admin/users/:id`.
@@ -176,22 +193,27 @@ vault always has at least one owner; the last owner cannot leave or be demoted.
   rotate afterwards, and the desktop app does so automatically.
 
 ### Key rotation
+
 `POST /api/v1/vaults/:id/rotate` (owner):
+
 ```
 { key_version: <current + 1>, name_enc,
   members: [{user_id, wrapped_key}],         // must be exactly the current member set
   items:   [{id, ciphertext, base_seq}] }    // must be exactly the current non-deleted item set
 ```
+
 `base_seq` is the `seq` of the item the owner decrypted and re-encrypted `ciphertext` from.
 
 The server applies it in one transaction. Before writing anything it checks, against
 the stored state, that the member set and the item set match exactly and that every item's
 current `seq` equals its `base_seq`. If anything differs it changes nothing and returns
+
 ```
 409 { error: {code: "conflict", ...},
       expected: { user_ids: [...], item_ids: [...] },   // the server's member and live item IDs
       stale_item_ids: [...] }                           // requested items whose seq is not base_seq
 ```
+
 so a rotation can never overwrite an edit made while the owner was re-encrypting. The
 client refreshes (`GET .../items?since=`), re-encrypts the stale items and retries. If it
 passes, the server stores the new wrapped keys, replaces each item's ciphertext in place with
@@ -230,6 +252,7 @@ so a client that comes back after any length of time still sees the delete.
   `413 payload_too_large`.
 
 ### Client conflict rule
+
 On a conflict the client decrypts `current`. If the local payload's `updated_at`
 is newer, it retries the write with `base_seq = current.seq`; otherwise it drops
 the local change and keeps the server version. A delete conflicting with an edit
@@ -246,7 +269,11 @@ Server events (they are hints; the client pulls with `GET .../items?since=`):
 - `{"type": "vault.changed", "vault_id", "seq"}`: items changed.
 - `{"type": "vaults.changed"}`: the caller's vault list, roles or keys changed
   (membership added or removed, rotation, rename, delete).
-- `{"type": "session.revoked"}`: the server then closes the socket.
+- `{"type": "session.revoked"}`: the device's token was revoked (logout, device
+  revoked, password change on another device, user deleted). The server sends it
+  to every socket of that device and then closes each with code 1008 (reason
+  `session revoked`). The client must not reconnect with that token. Code 4401
+  (bad or missing auth, auth timeout) means the same.
 
 The client sends `{"type": "ping"}` every 30 s; the server answers `{"type": "pong"}`.
 
@@ -256,14 +283,14 @@ These bound the data so that every vault the server accepts can still be rotated
 request. The constants are exported from `@ternix/core/protocol`; clients enforce them
 before sending.
 
-| Constant                      | Value         | Effect                                                                   |
-| ----------------------------- | ------------- | ------------------------------------------------------------------------ |
-| `MAX_ITEM_CIPHERTEXT_LENGTH`  | 32768 chars   | Longest item `ciphertext`, `v1.` prefix included (about 24 KiB of plaintext). Larger: `413 payload_too_large`. |
-| `MAX_LIVE_ITEMS_PER_VAULT`    | 5000          | Most non-deleted items per vault. A create beyond it: `409 vault_full`. Tombstones do not count. |
-| `MAX_BATCH_OPS`               | 500           | Operations per batch request.                                            |
-| `MAX_BATCH_BODY_BYTES`        | 20 MiB        | Body limit of the batch endpoint (500 maximal puts are about 16 MiB).    |
-| `MAX_ROTATE_BODY_BYTES`       | 200 MiB       | Body limit of the rotate endpoint.                                       |
-| `DEFAULT_BODY_LIMIT_BYTES`    | 1 MiB         | Body limit of every other endpoint; larger: `413 payload_too_large`.     |
+| Constant                     | Value       | Effect                                                                                                         |
+| ---------------------------- | ----------- | -------------------------------------------------------------------------------------------------------------- |
+| `MAX_ITEM_CIPHERTEXT_LENGTH` | 32768 chars | Longest item `ciphertext`, `v1.` prefix included (about 24 KiB of plaintext). Larger: `413 payload_too_large`. |
+| `MAX_LIVE_ITEMS_PER_VAULT`   | 5000        | Most non-deleted items per vault. A create beyond it: `409 vault_full`. Tombstones do not count.               |
+| `MAX_BATCH_OPS`              | 500         | Operations per batch request.                                                                                  |
+| `MAX_BATCH_BODY_BYTES`       | 20 MiB      | Body limit of the batch endpoint (500 maximal puts are about 16 MiB).                                          |
+| `MAX_ROTATE_BODY_BYTES`      | 200 MiB     | Body limit of the rotate endpoint.                                                                             |
+| `DEFAULT_BODY_LIMIT_BYTES`   | 1 MiB       | Body limit of every other endpoint; larger: `413 payload_too_large`.                                           |
 
 The rotate limit follows from the others: a full vault is 5000 items of about
 32,858 bytes of JSON each (32768 characters of ciphertext, a UUID, `base_seq`, and field

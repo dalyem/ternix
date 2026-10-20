@@ -21,7 +21,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  closeClients();
+  await closeClients();
   await server.close();
 });
 

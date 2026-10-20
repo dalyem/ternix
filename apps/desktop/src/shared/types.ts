@@ -47,13 +47,21 @@ export interface DeviceDto {
   current: boolean;
 }
 
-/** A user found by email, with the fingerprint to compare out of band before sharing. */
+/**
+ * A user found by email, with the fingerprint to compare out of band before sharing. The
+ * `pinned*` fields say what this device already knows about the user's key: `pinnedFingerprint`
+ * is null for a user it has never seen; `keyChanged` means the server now reports another key.
+ */
 export interface LookupUserDto {
   id: string;
   email: string;
   name: string;
   publicKey: string;
   fingerprint: string;
+  pinnedFingerprint: string | null;
+  /** The pinned key was confirmed out of band (false for a trust-on-first-use pin). */
+  verified: boolean;
+  keyChanged: boolean;
 }
 
 export interface InviteDto {
@@ -93,6 +101,13 @@ export interface MemberDto {
   fingerprint: string;
   addedAt: string;
   isSelf: boolean;
+  /** Fingerprint of the key this device pinned for the user (equals `fingerprint` unless `keyChanged`). */
+  pinnedFingerprint: string;
+  /** The pinned key was confirmed out of band; false means trust on first use ("unverified"). */
+  verified: boolean;
+  /** The server reports a key other than the pinned one. Sharing and rotation refuse until
+   * `acceptMemberKey` is called after comparing the new fingerprint out of band. */
+  keyChanged: boolean;
 }
 
 export interface ItemDto {
@@ -168,10 +183,20 @@ export interface LogoutResultDto {
   serverRevoked: boolean;
 }
 
+/** Details of `member_key_changed`: the pinned key and the one the server reports now. */
+export interface KeyChangeDto {
+  userId: string;
+  email: string;
+  pinnedFingerprint: string;
+  serverFingerprint: string;
+}
+
 /** Every error the client throws carries a `code`; this is its IPC-safe form. */
 export interface ErrorDto {
   name: string;
   code: string;
   message: string;
   status?: number;
+  /** Set for `member_key_changed`. */
+  keyChange?: KeyChangeDto;
 }

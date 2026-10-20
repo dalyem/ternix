@@ -30,6 +30,7 @@ export type StoredSession = z.infer<typeof storedSessionSchema>;
 
 export const VAULTS_CACHE_KEY = 'vaults';
 export const itemsCacheKey = (vaultId: string): string => `items-${vaultId}`;
+export const isItemsCacheKey = (key: string): boolean => key.startsWith('items-');
 
 export const cachedVaultSchema = z.object({
   /** The vault as last listed by the server. */

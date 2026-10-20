@@ -1,4 +1,4 @@
-// Size limits (docs/protocol.md section 7). Clients enforce them before sending.
+// Size limits (docs/protocol.md section 8). Clients enforce them before sending.
 
 const KIB = 1024;
 const MIB = 1024 * KIB;
