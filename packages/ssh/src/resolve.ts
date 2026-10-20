@@ -83,7 +83,6 @@ interface Layer {
   username?: string | undefined;
   password?: string | undefined;
   keyId?: string | undefined;
-  port?: number | undefined;
 }
 
 function nonEmpty(value: string | undefined): string | undefined {
@@ -145,12 +144,11 @@ function resolveHop(items: ItemLookup, hostId: string, host: HostPayload): HopSe
       username: nonEmpty(host.username),
       password: nonEmpty(host.password),
       keyId: host.key_id,
-      port: host.port !== DEFAULT_PORT ? host.port : undefined,
     },
     identityLayer(lookupAs(items, host.identity_id, 'identity')),
   ];
   for (const group of groupChain(items, host, hostId)) {
-    layers.push({ username: nonEmpty(group.username), port: group.port });
+    layers.push({ username: nonEmpty(group.username) });
     layers.push(identityLayer(lookupAs(items, group.identity_id, 'identity')));
   }
 
@@ -173,7 +171,9 @@ function resolveHop(items: ItemLookup, hostId: string, host: HostPayload): HopSe
     hostId,
     label: host.label,
     address: host.address,
-    port: layers.find((l) => l.port !== undefined)?.port ?? DEFAULT_PORT,
+    // A host always has a port (the payload defaults it to 22), so it is never inherited. A
+    // group's `port` is only the default the UI offers when creating a host in that group.
+    port: host.port,
     username,
   };
   const password = layers.find((l) => l.password !== undefined)?.password;

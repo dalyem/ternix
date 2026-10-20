@@ -74,9 +74,13 @@ export interface KeyPair {
 }
 
 export function generateKey(passphrase?: string): KeyPair {
-  return passphrase
-    ? utils.generateKeyPairSync('ed25519', { passphrase, cipher: 'aes256-ctr', rounds: 4 })
-    : utils.generateKeyPairSync('ed25519');
+  // ssh2 now and then emits an ed25519 key that its own parser rejects; draw again.
+  for (;;) {
+    const pair = passphrase
+      ? utils.generateKeyPairSync('ed25519', { passphrase, cipher: 'aes256-ctr', rounds: 4 })
+      : utils.generateKeyPairSync('ed25519');
+    if (!(utils.parseKey(pair.private, passphrase) instanceof Error)) return pair;
+  }
 }
 
 /** Wire-format public key of an OpenSSH public key line. */
@@ -121,6 +125,16 @@ export class TestSshServer {
   readonly agentForwardRequests: number[] = [];
   readonly remoteListeners = new Map<number, NetServer>();
   readonly clients = new Set<Connection>();
+  /** Cancelled remote forwards (`cancel-tcpip-forward`), by bound port. */
+  readonly cancelledForwards: number[] = [];
+  /** `direct-tcpip` opens (and `tcpip-forward` acks) the server is holding back. */
+  readonly heldTcpip: { accept: () => void; reject: () => void }[] = [];
+  readonly heldForwards: (() => void)[] = [];
+  /** While set, channel opens and remote-forward acks are held until the test releases them. */
+  holdTcpip = false;
+  holdForwardAcks = false;
+  /** Called with each channel the server accepts for a `direct-tcpip` open. */
+  onChannel: ((channel: ServerChannel) => void) | undefined;
   connections = 0;
   /** Everything typed into any shell. */
   shellInput = '';
@@ -167,6 +181,35 @@ export class TestSshServer {
   /** Drop every client connection without a goodbye, as a network failure would. */
   dropClients(): void {
     for (const client of this.clients) client.end();
+  }
+
+  /** Let the held `tcpip-forward` requests through. */
+  releaseForwardAcks(): void {
+    this.holdForwardAcks = false;
+    for (const bind of this.heldForwards.splice(0)) bind();
+  }
+
+  /**
+   * Start a key re-exchange on every client connection, optionally presenting `hostKey` instead of
+   * the server's own. Resolves per connection once the exchange completes.
+   */
+  rekeyAll(hostKey?: KeyPair): Promise<void[]> {
+    return Promise.all(
+      [...this.clients].map((client) => {
+        if (hostKey) {
+          const parsed = utils.parseKey(hostKey.private);
+          const key = Array.isArray(parsed) ? parsed[0] : parsed;
+          if (!key || key instanceof Error) throw new Error('bad host key');
+          const protocol = (
+            client as unknown as { _protocol: { _hostKeys: Record<string, unknown> } }
+          )._protocol;
+          protocol._hostKeys[key.type] = key;
+        }
+        return new Promise<void>((resolve, reject) =>
+          client.rekey((err?: Error) => (err ? reject(err) : resolve())),
+        );
+      }),
+    );
   }
 
   private accept(client: Connection, options: TestServerOptions): void {
@@ -233,6 +276,16 @@ export class TestSshServer {
 
       client.on('tcpip', (accept, reject, info) => {
         this.tcpip.push({ host: info.destIP, port: info.destPort });
+        if (this.holdTcpip) {
+          this.heldTcpip.push({
+            accept: () => {
+              const channel = accept();
+              this.onChannel?.(channel);
+            },
+            reject: () => reject(),
+          });
+          return;
+        }
         const target = (options.route ?? ((h, p) => ({ host: h, port: p })))(
           info.destIP,
           info.destPort,
@@ -269,13 +322,17 @@ export class TestSshServer {
               },
             );
           });
-          return listener.listen(info.bindPort, '127.0.0.1', () => {
-            const bound = (listener.address() as AddressInfo).port;
-            this.remoteListeners.set(bound, listener);
-            (accept as (port: number) => void)(bound);
-          });
+          const bind = () =>
+            listener.listen(info.bindPort, '127.0.0.1', () => {
+              const bound = (listener.address() as AddressInfo).port;
+              this.remoteListeners.set(bound, listener);
+              (accept as (port: number) => void)(bound);
+            });
+          if (this.holdForwardAcks) return void this.heldForwards.push(bind);
+          return void bind();
         }
         if (name === 'cancel-tcpip-forward' && 'bindPort' in info) {
+          this.cancelledForwards.push(info.bindPort);
           const listener = this.remoteListeners.get(info.bindPort);
           this.remoteListeners.delete(info.bindPort);
           listener?.close();
@@ -369,5 +426,18 @@ export async function waitFor(check: () => boolean, what: string, timeoutMs = 50
   while (!check()) {
     if (Date.now() > deadline) throw new Error(`Timed out waiting for ${what}`);
     await new Promise((r) => setTimeout(r, 10));
+  }
+}
+
+/** Reject if `promise` has not settled within `ms`: a hang becomes a test failure, not a timeout. */
+export async function withTimeout<T>(promise: Promise<T>, what: string, ms = 3000): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`Timed out waiting for ${what}`)), ms);
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    clearTimeout(timer);
   }
 }

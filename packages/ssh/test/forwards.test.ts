@@ -3,7 +3,14 @@ import type { AddressInfo, Socket } from 'node:net';
 import { afterEach, describe, expect, it } from 'vitest';
 import { SshError, SshSession } from '../src/index.js';
 import type { ForwardStatus, PortForwardSpec } from '../src/index.js';
-import { EchoServer, TestSshServer, connection, roundTrip, waitFor } from './helpers.js';
+import {
+  EchoServer,
+  TestSshServer,
+  connection,
+  roundTrip,
+  waitFor,
+  withTimeout,
+} from './helpers.js';
 
 const cleanup: (() => Promise<void> | void)[] = [];
 afterEach(async () => {
@@ -271,6 +278,117 @@ describe('remote forward', () => {
     const { session } = await setup();
     const err = await session.startForward(spec({ kind: 'remote' })).catch((e: unknown) => e);
     expect((err as SshError).code).toBe('forward_failed');
+  });
+});
+
+describe('a channel open the server never answers', () => {
+  it('lets a local forward stop and the session close', async () => {
+    const { srv, echo, session } = await setup();
+    const status = await session.startForward(
+      spec({ kind: 'local', destHost: '127.0.0.1', destPort: echo.port }),
+    );
+    srv.holdTcpip = true;
+    const client = netConnect(status.boundPort!, '127.0.0.1');
+    client.on('error', () => undefined);
+    cleanup.push(() => void client.destroy());
+    const closed = new Promise((resolve) => client.once('close', resolve));
+    await waitFor(() => srv.heldTcpip.length === 1, 'the server to receive the channel open');
+
+    await withTimeout(session.stopForward('fwd-local'), 'the forward to stop');
+    await withTimeout(closed, 'the pending local connection to be dropped');
+    expect(await refused(status.boundPort!)).toBe(true);
+    await withTimeout(session.close(), 'the session to close');
+  });
+
+  it('closes the session while a local connection is pending', async () => {
+    const { srv, echo, session } = await setup();
+    const status = await session.startForward(
+      spec({ kind: 'local', destHost: '127.0.0.1', destPort: echo.port }),
+    );
+    srv.holdTcpip = true;
+    const client = netConnect(status.boundPort!, '127.0.0.1');
+    client.on('error', () => undefined);
+    cleanup.push(() => void client.destroy());
+    await waitFor(() => srv.heldTcpip.length === 1, 'the server to receive the channel open');
+
+    await withTimeout(session.close(), 'the session to close');
+  });
+
+  it('lets a SOCKS forward stop while a CONNECT is pending', async () => {
+    const { srv, echo, session } = await setup();
+    const status = await session.startForward(spec({ kind: 'dynamic' }));
+    srv.holdTcpip = true;
+    const client = netConnect(status.boundPort!, '127.0.0.1');
+    client.on('error', () => undefined);
+    cleanup.push(() => void client.destroy());
+    client.write(Buffer.concat([Buffer.from([5, 1, 0]), ipv4Connect(echo.port)]));
+    await waitFor(() => srv.heldTcpip.length === 1, 'the server to receive the channel open');
+
+    await withTimeout(session.stopForward('fwd-dynamic'), 'the forward to stop');
+    await withTimeout(session.close(), 'the session to close');
+  });
+
+  it('closes a channel that opens after the forward was stopped', async () => {
+    const { srv, echo, session } = await setup();
+    const status = await session.startForward(
+      spec({ kind: 'local', destHost: '127.0.0.1', destPort: echo.port }),
+    );
+    srv.holdTcpip = true;
+    const client = netConnect(status.boundPort!, '127.0.0.1');
+    client.on('error', () => undefined);
+    cleanup.push(() => void client.destroy());
+    await waitFor(() => srv.heldTcpip.length === 1, 'the server to receive the channel open');
+    await withTimeout(session.stopForward('fwd-local'), 'the forward to stop');
+
+    const channelClosed = new Promise<void>((resolve) => {
+      const [held] = srv.heldTcpip;
+      srv.onChannel = (channel) => {
+        channel.once('close', () => resolve());
+        channel.resume(); // an unread channel never reports its close
+      };
+      held?.accept();
+    });
+    await withTimeout(channelClosed, 'the late channel to be closed by the client');
+  });
+});
+
+describe('stopping a forward while it starts', () => {
+  it('cancels a remote forward whose acknowledgement arrives after the stop', async () => {
+    const { srv, echo, session } = await setup();
+    const seen: ForwardStatus[] = [];
+    session.onForwardStatus((s) => seen.push(s));
+    srv.holdForwardAcks = true;
+    const starting = session.startForward(
+      spec({ kind: 'remote', destHost: '127.0.0.1', destPort: echo.port }),
+    );
+    await waitFor(() => srv.heldForwards.length === 1, 'the server to receive the request');
+
+    await session.stopForward('fwd-remote');
+    srv.releaseForwardAcks();
+    const result = await withTimeout(starting, 'the start to settle');
+
+    expect(result.state).toBe('stopped');
+    expect(seen.map((s) => s.state)).not.toContain('active');
+    expect(srv.cancelledForwards).toHaveLength(1);
+    expect(srv.remoteListeners.size).toBe(0);
+    expect(session.forwardStatuses()).toEqual([]);
+  });
+
+  it('does not leave a local listener behind when stopped during the bind', async () => {
+    const { echo, session } = await setup();
+    const seen: ForwardStatus[] = [];
+    session.onForwardStatus((s) => seen.push(s));
+    // A host name makes the bind asynchronous, so the stop lands before the listener exists.
+    const starting = session.startForward(
+      spec({ kind: 'local', bindAddress: 'localhost', destHost: '127.0.0.1', destPort: echo.port }),
+    );
+    await session.stopForward('fwd-local');
+    const result = await withTimeout(starting, 'the start to settle');
+
+    expect(result.state).toBe('stopped');
+    expect(result.boundPort).toBeUndefined();
+    expect(seen.map((s) => s.state)).not.toContain('active');
+    expect(session.forwardStatuses()).toEqual([]);
   });
 });
 

@@ -28,6 +28,8 @@ interface Running {
   spec: PortForwardSpec;
   status: ForwardStatus;
   streams: Set<Duplex>;
+  /** Set once the forward is being torn down; anything that completes later cleans up after itself. */
+  cancelled: boolean;
   server?: Server;
   remote?: { address: string; port: number };
 }
@@ -94,6 +96,7 @@ export class ForwardManager {
     const run: Running = {
       spec,
       streams: new Set(),
+      cancelled: false,
       status: {
         id: spec.id,
         label: spec.label,
@@ -109,10 +112,13 @@ export class ForwardManager {
       else if (spec.kind === 'remote') await this.startRemote(run);
       else await this.startDynamic(run);
     } catch (err) {
+      const stoppedMeanwhile = run.cancelled;
       await this.teardown(run);
-      run.status.state = 'error';
-      run.status.error = errorMessage(err);
-      this.emit(run);
+      if (!stoppedMeanwhile) {
+        run.status.state = 'error';
+        run.status.error = errorMessage(err);
+        this.emit(run);
+      }
       throw err instanceof SshError
         ? err
         : new SshError(
@@ -123,6 +129,8 @@ export class ForwardManager {
             },
           );
     }
+    // Stopped while starting: stop() already reported it, and whatever bound late is released.
+    if (run.cancelled) return { ...run.status, state: 'stopped' };
     run.status.state = 'active';
     this.emit(run);
     return { ...run.status };
@@ -155,6 +163,7 @@ export class ForwardManager {
     const { spec } = run;
     const { destHost, destPort } = this.requireDestination(spec);
     await this.listenLocal(run, (socket) => {
+      this.track(run, socket);
       this.openChannel(run, socket, destHost, destPort).then(
         (channel) => this.carry(run, socket, channel),
         (err: unknown) => {
@@ -167,8 +176,7 @@ export class ForwardManager {
 
   private async startDynamic(run: Running): Promise<void> {
     await this.listenLocal(run, (socket) => {
-      run.streams.add(socket);
-      socket.once('close', () => run.streams.delete(socket));
+      this.track(run, socket);
       serveSocks5(socket, async (host, port) => {
         try {
           return await this.openChannel(run, socket, host, port);
@@ -193,8 +201,25 @@ export class ForwardManager {
         { cause: err },
       );
     }
+    if (run.cancelled) {
+      // Stopped while the bind was in flight; teardown could not see the listener yet.
+      run.server = undefined;
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      return;
+    }
     run.status.boundAddress = address;
     run.status.boundPort = (server.address() as AddressInfo).port;
+  }
+
+  /** Track an accepted local socket from the moment it arrives, so teardown can always reach it. */
+  private track(run: Running, socket: Socket): void {
+    if (run.cancelled) {
+      socket.destroy();
+      return;
+    }
+    run.streams.add(socket);
+    socket.on('error', () => undefined);
+    socket.once('close', () => run.streams.delete(socket));
   }
 
   private async startRemote(run: Running): Promise<void> {
@@ -216,6 +241,11 @@ export class ForwardManager {
         { cause: err },
       );
     });
+    if (run.cancelled) {
+      // Stopped before the server acknowledged: the listener exists on the server now, so remove it.
+      await this.unforward({ address, port });
+      return;
+    }
     run.remote = { address, port };
     run.status.boundAddress = address;
     run.status.boundPort = port;
@@ -250,7 +280,7 @@ export class ForwardManager {
           port,
           (err, channel) => {
             if (err) return reject(err);
-            if (from.destroyed || !this.running.has(run.spec.id)) {
+            if (from.destroyed || run.cancelled) {
               channel.destroy();
               return reject(new Error('forward closed'));
             }
@@ -285,6 +315,7 @@ export class ForwardManager {
   }
 
   private async teardown(run: Running): Promise<void> {
+    run.cancelled = true;
     for (const stream of run.streams) stream.destroy();
     run.streams.clear();
     const { server, remote } = run;
@@ -294,24 +325,24 @@ export class ForwardManager {
     if (server?.listening) {
       waits.push(new Promise<void>((resolve) => server.close(() => resolve())));
     }
-    if (remote) {
-      waits.push(
-        new Promise<void>((resolve) => {
-          // A dead connection never answers, so do not wait for it forever.
-          const timer = setTimeout(resolve, UNFORWARD_TIMEOUT_MS);
-          timer.unref();
-          try {
-            this.client.unforwardIn(remote.address, remote.port, () => {
-              clearTimeout(timer);
-              resolve();
-            });
-          } catch {
-            clearTimeout(timer);
-            resolve();
-          }
-        }),
-      );
-    }
+    if (remote) waits.push(this.unforward(remote));
     await Promise.all(waits);
+  }
+
+  private unforward(remote: { address: string; port: number }): Promise<void> {
+    return new Promise<void>((resolve) => {
+      // A dead connection never answers, so do not wait for it forever.
+      const timer = setTimeout(resolve, UNFORWARD_TIMEOUT_MS);
+      timer.unref();
+      try {
+        this.client.unforwardIn(remote.address, remote.port, () => {
+          clearTimeout(timer);
+          resolve();
+        });
+      } catch {
+        clearTimeout(timer);
+        resolve();
+      }
+    });
   }
 }

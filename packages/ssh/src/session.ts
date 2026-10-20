@@ -596,6 +596,8 @@ export class SshSession {
       });
       client.on('banner', (message: string) => hooks.onBanner?.(message, info));
       client.on('handshake', () => {
+        // Also fires for every rekey of an established connection, which is not a state change.
+        if (settled) return;
         connectTimer.clear();
         this.publish({ state: 'authenticating', hop: info });
       });
@@ -607,18 +609,39 @@ export class SshSession {
       });
 
       const knownHosts = this.options.knownHosts ?? [];
+      /** The key the user (or the known hosts) accepted at connect; later rekeys must match it. */
+      let acceptedKey: string | undefined;
+      /** Stop a connection that is already up because its host key is not acceptable. */
+      const abortEstablished = (error: SshError) => {
+        this.runtimeError = error;
+      };
+      // ssh2 calls this on the first key exchange and again on every rekey, and each call must be
+      // answered or the exchange never finishes.
       const hostVerifier = (key: Buffer | string, verify: (accept: boolean) => void) => {
         const keyBuf = typeof key === 'string' ? Buffer.from(key, 'hex') : key;
         const keyType = parseKeyType(keyBuf);
         if (!keyType) {
-          fail(
-            new SshError('handshake_failed', `${info.host} sent an unreadable host key`, {
-              hop: info.index,
-            }),
+          const unreadable = new SshError(
+            'handshake_failed',
+            `${info.host} sent an unreadable host key`,
+            { hop: info.index },
           );
+          if (settled) abortEstablished(unreadable);
+          else fail(unreadable);
           return verify(false);
         }
         const keyB64 = keyBuf.toString('base64');
+        if (acceptedKey !== undefined) {
+          if (keyB64 === acceptedKey) return verify(true);
+          abortEstablished(
+            new SshError(
+              'host_key_rejected',
+              `The host key of ${info.host}:${info.port} has CHANGED during the session`,
+              { hop: info.index },
+            ),
+          );
+          return verify(false);
+        }
         const check = checkHostKey(knownHosts, creds.address, creds.port, keyType, keyB64);
         const hostKey: HostKeyInfo = {
           hop: info,
@@ -642,7 +665,10 @@ export class SshSession {
           : Promise.resolve(check.status === 'trusted');
         void decision.then((accepted) => {
           if (settled) return;
-          if (accepted) return verify(true);
+          if (accepted) {
+            acceptedKey = keyB64;
+            return verify(true);
+          }
           const detail =
             check.status === 'mismatch'
               ? `The host key of ${info.host}:${info.port} has CHANGED`

@@ -21,7 +21,14 @@ import type {
   ResolvedConnection,
   ShellStream,
 } from '../src/index.js';
-import { TestSshServer, connection, generateKey, waitFor, wirePublicKey } from './helpers.js';
+import {
+  TestSshServer,
+  connection,
+  generateKey,
+  waitFor,
+  wirePublicKey,
+  withTimeout,
+} from './helpers.js';
 import type { KeyPair, TestServerOptions } from './helpers.js';
 
 const cleanup: (() => Promise<void> | void)[] = [];
@@ -695,6 +702,48 @@ describe('agent forwarding', () => {
     shell.write('x\n');
     await waitFor(() => srv.shellInput.includes('x'), 'the shell to be live');
     expect(srv.agentForwardRequests).toHaveLength(0);
+  });
+});
+
+describe('key re-exchange', () => {
+  it('completes a server-initiated rekey without asking about the host key again', async () => {
+    const srv = await server({ users: { alice: { password: 'pw' } } });
+    const session = newSession();
+    let asked = 0;
+    await session.connect(connection({ port: srv.port }), {
+      verifyHostKey: async () => (asked++, true),
+    });
+    const shell = await session.openShell({ cols: 80, rows: 24 });
+    const out = collect(shell);
+
+    await withTimeout(srv.rekeyAll(), 'the rekey to complete');
+    shell.write('after rekey\n');
+    await waitFor(() => out.text().includes('after rekey'), 'the shell to answer after the rekey');
+    expect(asked).toBe(1);
+    expect(session.status).toEqual({ state: 'ready' });
+  });
+
+  it('closes the session when a rekey presents a different host key', async () => {
+    const srv = await server({ users: { alice: { password: 'pw' } } });
+    const session = newSession();
+    let asked = 0;
+    await session.connect(connection({ port: srv.port }), {
+      verifyHostKey: async () => (asked++, true),
+    });
+
+    void srv.rekeyAll(generateKey()).catch(() => undefined);
+    await withTimeout(
+      new Promise<void>((resolve) =>
+        session.onStatus((status) => status.state === 'closed' && resolve()),
+      ),
+      'the session to close',
+    );
+
+    expect(session.status).toMatchObject({
+      state: 'closed',
+      reason: { kind: 'error', error: { code: 'host_key_rejected' } },
+    });
+    expect(asked).toBe(1);
   });
 });
 

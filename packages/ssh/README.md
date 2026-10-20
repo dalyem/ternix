@@ -72,10 +72,11 @@ Failures are `SshError`s with a stable `code` (`auth_failed`, `bad_passphrase`,
 | username                   | host, host's identity, then each group nearest first: the group, then the group's identity |
 | password                   | host, host's identity, group identities                                                    |
 | private key and passphrase | host `key_id`, host's identity `key_id`, group identities                                  |
-| port                       | host (if not 22), nearest group with a port, 22                                            |
+| port                       | host (always has one; the payload defaults it to 22)                                       |
 
-The host payload defaults `port` to 22, so a host port of 22 cannot be told from "not set" and
-yields to a group port. Dangling or wrong-type references count as unset. Jump hosts
+A host always has a port (the payload defaults it to 22), so its port is authoritative and an
+explicit 22 is respected. A group's `port` is not inherited when resolving: it is only a default
+for the UI to pre-fill when creating a new host in that group. Dangling or wrong-type references count as unset. Jump hosts
 (`jump_host_id`, up to 8, cycles are errors) are resolved the same way, each with its own
 identity. Keepalive, agent forwarding and the startup snippet come from the host only.
 
