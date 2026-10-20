@@ -12,8 +12,8 @@
     "path": "/api/v1/server"
   },
   "checks": {
-    "lint": "corepack pnpm -r lint",
-    "typecheck": "corepack pnpm -r typecheck",
-    "test": "corepack pnpm -r test"
+    "lint": "corepack pnpm run lint",
+    "typecheck": "corepack pnpm run typecheck",
+    "test": "corepack pnpm run test"
   }
 }
