@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "projectId": "prj_o5mxzwjppxwv",
+  "name": "ternix",
+  "runtime": {
+    "image": "node:22-bookworm-slim"
+  },
+  "install": "corepack pnpm install --frozen-lockfile",
+  "dev": "corepack pnpm --filter @ternix/server dev",
+  "port": 8080,
+  "health": {
+    "path": "/api/v1/server"
+  },
+  "checks": {
+    "lint": "corepack pnpm -r lint",
+    "typecheck": "corepack pnpm -r typecheck",
+    "test": "corepack pnpm -r test"
+  }
+}
