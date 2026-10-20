@@ -26,9 +26,12 @@ export interface RealtimeSocketHandlers {
 /** Opens a socket and wires its events; injectable so tests and Electron can supply their own. */
 export type WebSocketFactory = (url: string, handlers: RealtimeSocketHandlers) => RealtimeSocket;
 
+/** How long a new socket may take to open and authenticate before it is dropped. */
+export const DEFAULT_CONNECT_TIMEOUT_MS = 15_000;
+
 /** Default factory over the `ws` package. */
 export const wsSocketFactory: WebSocketFactory = (url, handlers) => {
-  const ws = new WebSocket(url);
+  const ws = new WebSocket(url, { handshakeTimeout: DEFAULT_CONNECT_TIMEOUT_MS });
   ws.on('open', () => handlers.onOpen());
   ws.on('message', (data, isBinary) => {
     if (!isBinary) handlers.onMessage(data.toString());
@@ -49,6 +52,11 @@ export interface RealtimeOptions {
   pongTimeoutMs?: number;
   /** How long to wait for `ready` after sending `auth`. */
   authTimeoutMs?: number;
+  /**
+   * Deadline from creating a socket to `ready` (TCP, TLS, upgrade and auth); a peer that
+   * accepts and never answers is dropped and retried with backoff. Default 15 s.
+   */
+  connectTimeoutMs?: number;
   /** First reconnect delay; doubles per failure up to `reconnectMaxMs`, with jitter. */
   reconnectBaseMs?: number;
   reconnectMaxMs?: number;
@@ -77,6 +85,7 @@ export class Realtime {
   private failures = 0;
   private state: ConnectionState = 'offline';
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+  private connectTimer: ReturnType<typeof setTimeout> | undefined;
   private authTimer: ReturnType<typeof setTimeout> | undefined;
   private pingTimer: ReturnType<typeof setInterval> | undefined;
   private pongTimer: ReturnType<typeof setTimeout> | undefined;
@@ -92,6 +101,7 @@ export class Realtime {
       pingIntervalMs: options.pingIntervalMs ?? WS_PING_INTERVAL_MS,
       pongTimeoutMs: options.pongTimeoutMs ?? 10_000,
       authTimeoutMs: options.authTimeoutMs ?? WS_AUTH_TIMEOUT_MS,
+      connectTimeoutMs: options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS,
       reconnectBaseMs: options.reconnectBaseMs ?? 1_000,
       reconnectMaxMs: options.reconnectMaxMs ?? 60_000,
       random: options.random ?? Math.random,
@@ -142,10 +152,24 @@ export class Realtime {
   }
 
   private clearConnectionTimers(): void {
+    clearTimeout(this.connectTimer);
     clearTimeout(this.authTimer);
     clearInterval(this.pingTimer);
     clearTimeout(this.pongTimer);
-    this.authTimer = this.pingTimer = this.pongTimer = undefined;
+    this.connectTimer = this.authTimer = this.pingTimer = this.pongTimer = undefined;
+  }
+
+  /** Drop a socket that is not ready in time, whether or not its close event ever comes. */
+  private abandon(socket: RealtimeSocket): void {
+    if (this.socket !== socket) return;
+    this.socket = null;
+    this.clearConnectionTimers();
+    try {
+      socket.terminate();
+    } catch {
+      // Already gone.
+    }
+    this.scheduleReconnect();
   }
 
   private send(socket: RealtimeSocket, message: WsClientMessage): void {
@@ -187,6 +211,8 @@ export class Realtime {
         },
       });
       this.socket = socket;
+      const created = socket;
+      this.connectTimer = setTimeout(() => this.abandon(created), this.opts.connectTimeoutMs);
     } catch {
       this.scheduleReconnect();
     }
@@ -204,6 +230,7 @@ export class Realtime {
     const message = parsed.data;
     switch (message.type) {
       case 'ready':
+        clearTimeout(this.connectTimer);
         clearTimeout(this.authTimer);
         this.failures = 0;
         this.startPing(socket);

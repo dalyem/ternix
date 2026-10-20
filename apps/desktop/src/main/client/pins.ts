@@ -137,14 +137,19 @@ export class PinStore {
     await this.persist();
   }
 
-  async markVerified(userId: string): Promise<boolean> {
+  /**
+   * Mark the pin verified if it is still `publicKey` (the key the user compared). Null when
+   * nothing is pinned; a `mismatch` changes nothing.
+   */
+  async markVerified(userId: string, publicKey: string): Promise<PinObservation | null> {
     const pin = this.pins.get(userId);
-    if (!pin) return false;
-    if (!pin.verified) {
-      this.pins.set(userId, { ...pin, verified: true });
-      await this.persist();
-    }
-    return true;
+    if (!pin) return null;
+    if (pin.public_key !== publicKey) return { status: 'mismatch', pin, serverKey: publicKey };
+    if (pin.verified) return { status: 'match', pin };
+    const marked = { ...pin, verified: true };
+    this.pins.set(userId, marked);
+    await this.persist();
+    return { status: 'match', pin: marked };
   }
 
   /** Forget every pin of the account and delete the saved entry (logout). */

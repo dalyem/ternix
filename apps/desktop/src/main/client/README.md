@@ -30,11 +30,21 @@ await client.init(); // 'loggedOut' | 'locked' | 'expired'
 Server and account
 
 - `probeServer(address)`: normalize the address and check it is a protocol-1 server.
+  Addresses need `https://` except for loopback (`localhost`, 127.0.0.0/8, `::1`); Tailscale
+  addresses too (`tailscale serve` gives `https://<machine>.<tailnet>.ts.net` a certificate).
+  A bare host gets `https://`. `isTailnetHost` is for UI hints only.
+- No request follows a redirect: any 3xx (or opaque redirect) throws `UnexpectedRedirectError`
+  (`unexpected_redirect`, with `location` when known), so the user can enter the final address.
 - `register({serverUrl, email, name, password, inviteCode?})`, `login({serverUrl, email, password})`:
   both leave the client unlocked. Login refuses KDF parameters weaker than the protocol
   default (`KdfTooWeakError`) before deriving or sending anything.
 - `unlock(password)` works offline from the saved session (`WrongPasswordError`);
   `lock()` zeroes and drops every key.
+- `lock()`, `logout()` and `close()` win over operations still waiting: a pending `unlock`,
+  `login` or `register` rejects with `CancelledError` (`cancelled`) and wipes what it derived,
+  and a `changePassword` or `revalidate` whose session ended (logout, another login) does the
+  same. Every request carries only the token of the session it was started for. A login or
+  register waits for a running `logout` to finish.
 - `logout()` revokes the token (best effort) and clears session, cache and pinned keys.
 - `lock()`, `close()` and `flush()` return promises that settle once the pending cache
   writes are stored; call `await client.flush()` from the app's quit hook.
@@ -59,11 +69,13 @@ Vaults and sharing (unlocked)
   equal its pin, else `member_key_changed` (`change`/`keyChange`: `userId`, `email`,
   `pinnedFingerprint`, `serverFingerprint`) is thrown and nothing is sent. After comparing
   the new fingerprint out of band, `acceptMemberKey(userId, publicKey)` re-pins it as
-  verified; `markMemberVerified(userId)` marks a pin verified. A changed key of your own
+  verified; `markMemberVerified(userId, publicKey)` marks the pin verified if it still is
+  `publicKey` (the key whose fingerprint the user compared), else `member_key_changed`. A changed key of your own
   account is `own_key_mismatch` everywhere the server reports it.
 - `removeMember(vaultId, userId)`: an owner removing someone else rotates the key right
   after; the result says whether the rotation went through (`rotationError` can be a
-  `member_key_changed`).
+  `member_key_changed`). A rotation already running when the removal finished is not reused
+  (it may have listed the removed member); a new one is queued behind it.
 - `rotateVault(id)`: retries on `409` (refreshing members and items) up to
   `MAX_ROTATION_ATTEMPTS`, then `RotationError`.
 
@@ -93,7 +105,8 @@ or one of the client's own (`ClientErrorCode`). `toErrorDto(err)` makes any erro
 ## Options worth knowing
 
 - `deriveKeys`: replace Argon2 (for example with a worker thread).
-- `webSocketFactory`, `realtime` (intervals and backoff) or `realtime: false`.
+- `webSocketFactory`, `realtime` (intervals, backoff, `connectTimeoutMs`: socket created to
+  `ready`, default 15 s) or `realtime: false`.
 - `isKdfStrongEnough`, `kdfLimits`: tests only. Production must keep the defaults.
 
 `JsonFileSecretStore` stores the session in a plain file and is meant for tests and
