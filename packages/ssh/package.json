@@ -1,0 +1,36 @@
+{
+  "name": "@ternix/ssh",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Ternix SSH engine: resolves vault items into live ssh2 sessions",
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@ternix/core": "workspace:^",
+    "ssh2": "^1.16.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "@types/ssh2": "^1.15.5",
+    "typescript": "~5.9.3",
+    "vitest": "^3.2.7"
+  }
+}
