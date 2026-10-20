@@ -13,6 +13,11 @@ item plaintext.
 ## 1. Encoding
 
 - JSON over HTTPS. Field names are `snake_case`.
+- Server address: clients require TLS (`https://`, `wss://`) for every server except
+  loopback (`localhost`, 127.0.0.0/8, `::1`), where plain `http://` is allowed. Tailscale
+  names and addresses are no exception: serve Ternix with `tailscale serve` and use
+  `https://<machine>.<tailnet>.ts.net`. Clients do not follow redirects; a 3xx answer is an
+  error and the user enters the final address.
 - Binary values are standard base64 with padding (`b64`).
 - IDs are lowercase UUIDv4 strings. Clients generate vault and item IDs; the
   server generates user, device and invite IDs.

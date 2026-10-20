@@ -8,7 +8,7 @@ import {
   type Route,
   rotateConflictResponseSchema,
 } from '@ternix/core/protocol';
-import { ApiError, OfflineError, TernixError } from './errors.js';
+import { ApiError, OfflineError, TernixError, UnexpectedRedirectError } from './errors.js';
 
 /** `globalThis.fetch`, or Electron's `net.fetch`, or a test double. */
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
@@ -22,6 +22,7 @@ export interface HttpOptions {
   baseUrl: string;
   fetch: FetchLike;
   timeoutMs?: number;
+  /** The bearer token; the client binds it to one session, so it never returns a later one. */
   getToken?: () => string | null;
   /** Called when an authenticated request gets `401`: the session is gone. */
   onUnauthorized?: () => void;
@@ -51,7 +52,16 @@ function codeFor(code: string, status: number): ErrorCode {
   return 'internal';
 }
 
-/** JSON over HTTP with bearer auth, timeouts, and typed errors. */
+function redirectTarget(from: string, location: string | null): string | null {
+  if (!location) return null;
+  try {
+    return new URL(location, from).href;
+  } catch {
+    return null;
+  }
+}
+
+/** JSON over HTTP with bearer auth, timeouts, and typed errors. Redirects are refused. */
 export class Http {
   readonly baseUrl: string;
   private readonly fetchFn: FetchLike;
@@ -61,6 +71,11 @@ export class Http {
     this.baseUrl = options.baseUrl;
     this.fetchFn = options.fetch;
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  }
+
+  /** The token requests would carry now (null once the session it belongs to is gone). */
+  currentToken(): string | null {
+    return this.options.getToken?.() ?? null;
   }
 
   async request<T = undefined>(route: Route, opts: RequestOptions<T> = {}): Promise<T> {
@@ -82,10 +97,24 @@ export class Http {
     let status: number;
     let text: string;
     try {
-      const res = await this.fetchFn(url, { method: route.method, headers, body, signal });
+      // Never follow a redirect: fetch would resend the body (auth keys included) to an
+      // address normalizeServerUrl never checked, possibly over plain http.
+      const res = await this.fetchFn(url, {
+        method: route.method,
+        headers,
+        body,
+        signal,
+        redirect: 'manual',
+      });
+      // Node's fetch returns the 3xx itself; browsers and Electron an opaque redirect.
+      if (res.type === 'opaqueredirect' || (res.status >= 300 && res.status < 400)) {
+        await res.body?.cancel().catch(() => undefined);
+        throw new UnexpectedRedirectError(redirectTarget(url, res.headers.get('location')));
+      }
       status = res.status;
       text = await res.text();
     } catch (err) {
+      if (err instanceof UnexpectedRedirectError) throw err;
       if (signal.aborted) {
         throw new OfflineError('timeout', 'The server did not answer in time', { cause: err });
       }

@@ -91,7 +91,7 @@ describe('key pinning', () => {
     expect((await savedPins(a, a.client.account!))![idOf(c)]).toMatchObject({ verified: false });
 
     // The user compares the fingerprint with C and marks it.
-    await a.client.markMemberVerified(idOf(c));
+    await a.client.markMemberVerified(idOf(c), seen.publicKey);
     expect(await member(a, vault.id, c)).toMatchObject({ verified: true });
   });
 
@@ -264,6 +264,8 @@ describe('key pinning', () => {
     await expect(
       a.client.acceptMemberKey(idOf(a), b.client.account!.user.publicKey),
     ).rejects.toMatchObject({ code: 'invalid_input' });
-    await expect(a.client.markMemberVerified(idOf(b))).rejects.toMatchObject({ code: 'not_found' });
+    await expect(
+      a.client.markMemberVerified(idOf(b), b.client.account!.user.publicKey),
+    ).rejects.toMatchObject({ code: 'not_found' });
   });
 });

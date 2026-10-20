@@ -7,16 +7,22 @@ import { type FetchLike, Http } from './http.js';
 /**
  * Server addresses. The canonical form is an origin plus an optional path prefix (for a
  * reverse proxy at `/ternix`), no trailing slash, query or fragment. Bare hosts default
- * to `https://`. Plain `http://` is accepted only where the link itself is protected:
- * loopback, Tailscale addresses and MagicDNS names (WireGuard encrypts tailnet traffic).
+ * to `https://`. Plain `http://` is accepted only for loopback (this computer). Tailnet
+ * names and addresses need https too: 100.64.0.0/10 is also carrier-grade NAT space, so an
+ * address in it does not prove the traffic stays inside WireGuard, and `tailscale serve`
+ * provides certificates for `*.ts.net` names.
  */
 
 const SCHEME_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
 
 const INSECURE_HTTP_MESSAGE =
-  'Plain http:// is only allowed for this computer (localhost) and Tailscale addresses ' +
-  '(100.x.y.z, fd7a:115c:a1e0::, *.ts.net). Anywhere else your login credential would ' +
-  'cross the network unencrypted. Use https://.';
+  'Plain http:// is only allowed for this computer (localhost, 127.0.0.1, ::1). Anywhere ' +
+  'else your login credential would cross the network unencrypted. Use https://.';
+
+const TAILNET_HTTP_MESSAGE =
+  'Plain http:// is only allowed for this computer (localhost, 127.0.0.1, ::1); a Tailscale ' +
+  'address is no exception, or your login credential could cross the network unencrypted. ' +
+  'Serve Ternix with Tailscale serve and enter https://<machine>.<tailnet>.ts.net.';
 
 /** Strip IPv6 brackets and a trailing dot; lowercase. */
 function bareHost(host: string): string {
@@ -59,8 +65,9 @@ export function isLoopbackHost(host: string): boolean {
 }
 
 /**
- * A host only reachable over a tailnet: a `*.ts.net` MagicDNS name, a Tailscale IPv4
- * address (100.64.0.0/10) or a Tailscale IPv6 address (fd7a:115c:a1e0::/48).
+ * A host that looks like a tailnet address: a `*.ts.net` MagicDNS name, an IPv4 address in
+ * Tailscale's range (100.64.0.0/10, shared with carrier-grade NAT) or a Tailscale IPv6
+ * address (fd7a:115c:a1e0::/48). For UI hints only; it grants no exception from https.
  */
 export function isTailnetHost(host: string): boolean {
   const h = bareHost(host);
@@ -96,8 +103,10 @@ export function normalizeServerUrl(input: string): string {
     );
   }
   if (url.hostname === '') throw new InvalidServerUrlError('The address has no host name.');
-  if (url.protocol === 'http:' && !isLoopbackHost(url.hostname) && !isTailnetHost(url.hostname)) {
-    throw new InvalidServerUrlError(INSECURE_HTTP_MESSAGE);
+  if (url.protocol === 'http:' && !isLoopbackHost(url.hostname)) {
+    throw new InvalidServerUrlError(
+      isTailnetHost(url.hostname) ? TAILNET_HTTP_MESSAGE : INSECURE_HTTP_MESSAGE,
+    );
   }
   const path = url.pathname.replace(/\/+$/, '');
   return `${url.protocol}//${url.host}${path}`;
@@ -114,8 +123,8 @@ const protocolOnlySchema = z.object({ protocol: z.number() });
 
 /**
  * `GET /api/v1/server` on a normalized (or raw) address. Throws `InvalidServerUrlError`,
- * `OfflineError`, or `TernixError('unsupported_server')` for anything that is not a
- * Ternix server speaking protocol 1.
+ * `OfflineError`, `UnexpectedRedirectError`, or `TernixError('unsupported_server')` for
+ * anything that is not a Ternix server speaking protocol 1.
  */
 export async function probeServer(input: string, fetch: FetchLike): Promise<ServerInfoDto> {
   const serverUrl = normalizeServerUrl(input);
@@ -124,7 +133,11 @@ export async function probeServer(input: string, fetch: FetchLike): Promise<Serv
   try {
     raw = await http.request(routes.server, { auth: false, schema: z.unknown() });
   } catch (err) {
-    if (err instanceof TernixError && err.code !== 'offline') {
+    if (
+      err instanceof TernixError &&
+      err.code !== 'offline' &&
+      err.code !== 'unexpected_redirect'
+    ) {
       throw new TernixError(
         'unsupported_server',
         'This address does not look like a Ternix server',

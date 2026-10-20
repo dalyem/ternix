@@ -20,7 +20,9 @@ export type ClientErrorCode =
   | 'member_key_changed'
   | 'own_key_mismatch'
   | 'rotation_failed'
-  | 'conflict_unresolved';
+  | 'conflict_unresolved'
+  | 'unexpected_redirect'
+  | 'cancelled';
 
 /** Base class: every error the client throws has a stable `code`. */
 export class TernixError extends Error {
@@ -71,6 +73,29 @@ export class InvalidServerUrlError extends TernixError {
   }
 }
 
+/**
+ * The server answered with a redirect. The client never follows one: the body (with the auth
+ * key) would go to an address that was never checked, possibly over plain http.
+ */
+export class UnexpectedRedirectError extends TernixError {
+  override name = 'UnexpectedRedirectError';
+  constructor(readonly location: string | null) {
+    super(
+      'unexpected_redirect',
+      `The server address redirects${location ? ` to ${location}` : ' elsewhere'}. Ternix does ` +
+        'not follow redirects; enter the final address of the server instead.',
+    );
+  }
+}
+
+/** Lock, logout, close or another login happened while the operation was waiting. */
+export class CancelledError extends TernixError {
+  override name = 'CancelledError';
+  constructor(message = 'Cancelled because Ternix was locked, logged out or closed meanwhile') {
+    super('cancelled', message);
+  }
+}
+
 export class WrongPasswordError extends TernixError {
   override name = 'WrongPasswordError';
   constructor(message = 'The password is incorrect') {
@@ -107,7 +132,7 @@ export class MemberKeyChangedError extends TernixError {
   constructor(readonly change: KeyChangeDto) {
     super(
       'member_key_changed',
-      `The key of ${change.email} changed (pinned ${change.pinnedFingerprint}, server reports ` +
+      `The key of ${change.email || 'this member'} changed (pinned ${change.pinnedFingerprint}, server reports ` +
         `${change.serverFingerprint}). Compare the new fingerprint with them, then accept it.`,
     );
   }

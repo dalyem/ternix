@@ -185,8 +185,16 @@ export class VaultEngine {
   private readonly vaults = new Map<string, VaultState>();
   private readonly pulls = new Map<string, Coalescer>();
   private readonly refresher = new Coalescer(() => this.doRefresh());
-  private readonly rotations = new Map<string, Promise<VaultDto>>();
+  /**
+   * The running or queued rotation per vault, with the membership epoch it started at (null
+   * while queued: it will read the epoch when it starts).
+   */
+  private readonly rotations = new Map<string, { task: Promise<VaultDto>; epoch: number | null }>();
+  /** Per vault, bumped when this device removes a member. */
+  private readonly membershipEpochs = new Map<string, number>();
   private readonly lookups = new Map<string, { email: string; publicKey: string }>();
+  /** Emails of users seen in member lists and lookups, for key-change errors. */
+  private readonly emails = new Map<string, string>();
   private closed = false;
 
   constructor(private readonly deps: EngineDeps) {}
@@ -200,6 +208,7 @@ export class VaultEngine {
     this.vaults.clear();
     this.pulls.clear();
     this.lookups.clear();
+    this.emails.clear();
     this.deps.keyring.wipe();
   }
 
@@ -996,6 +1005,7 @@ export class VaultEngine {
   }
 
   private async memberDtos(members: Member[]): Promise<MemberDto[]> {
+    for (const m of members) this.emails.set(m.user_id, m.email);
     const observed = await this.observeMembers(members);
     return members.map((m, i) => this.toMemberDto(m, observed[i]!));
   }
@@ -1050,11 +1060,20 @@ export class VaultEngine {
     await this.deps.pins.pin(userId, publicKey, true);
   }
 
-  /** The user compared the pinned fingerprint out of band: lose the "unverified" mark. */
-  async markMemberVerified(userId: string): Promise<void> {
+  /**
+   * The user compared the fingerprint of `publicKey` out of band: mark the pin verified. Refuses
+   * (`member_key_changed`) when the pin is another key by now, so a pin that changed after the
+   * user looked is never the one marked.
+   */
+  async markMemberVerified(userId: string, publicKey: string): Promise<void> {
     this.assertOpen();
-    if (!(await this.deps.pins.markVerified(userId))) {
-      throw new TernixError('not_found', 'No key is pinned for this user yet');
+    if (!publicKeySchema.safeParse(publicKey).success) {
+      throw new TernixError('invalid_input', 'Not a valid public key');
+    }
+    const result = await this.deps.pins.markVerified(userId, publicKey);
+    if (!result) throw new TernixError('not_found', 'No key is pinned for this user yet');
+    if (result.status === 'mismatch') {
+      throw this.keyChanged(userId, this.emails.get(userId) ?? '', result);
     }
   }
 
@@ -1068,6 +1087,7 @@ export class VaultEngine {
     this.assertOpen();
     this.deps.pins.checkSelf(res.id, res.public_key);
     this.lookups.set(res.id, { email: res.email, publicKey: res.public_key });
+    this.emails.set(res.id, res.email);
     const pin = this.deps.pins.get(res.id);
     return {
       id: res.id,
@@ -1166,6 +1186,9 @@ export class VaultEngine {
     await this.deps.http.request(routes.removeMember, {
       params: { id: vaultId, user_id: userId },
     });
+    // A rotation already running may have listed the members before the removal (or even
+    // committed, with the removed user holding the new key): this one must not reuse it.
+    this.membershipEpochs.set(vaultId, (this.membershipEpochs.get(vaultId) ?? 0) + 1);
     try {
       await this.rotateVault(vaultId);
       return { rotated: true, rotationError: null };
@@ -1189,12 +1212,29 @@ export class VaultEngine {
    * Re-key a vault (owner): new key at `key_version + 1`, name re-sealed, the key wrapped
    * for exactly the current members, and every live item re-encrypted with its `base_seq`.
    * On `409` it refreshes members and items and retries, up to `MAX_ROTATION_ATTEMPTS`.
+   *
+   * A call joins a rotation in progress only if that rotation started after the last member
+   * removal on this device; otherwise it queues a new one behind it, which lists the members
+   * again.
    */
   rotateVault(vaultId: string): Promise<VaultDto> {
+    const required = this.membershipEpochs.get(vaultId) ?? 0;
     const running = this.rotations.get(vaultId);
-    if (running) return running;
-    const task = this.rotate(vaultId).finally(() => this.rotations.delete(vaultId));
-    this.rotations.set(vaultId, task);
+    if (running && (running.epoch === null || running.epoch >= required)) return running.task;
+    const previous = running?.task.then(
+      () => undefined,
+      () => undefined,
+    );
+    const task = (previous ?? Promise.resolve())
+      .then(() => {
+        entry.epoch = this.membershipEpochs.get(vaultId) ?? 0;
+        return this.rotate(vaultId);
+      })
+      .finally(() => {
+        if (this.rotations.get(vaultId) === entry) this.rotations.delete(vaultId);
+      });
+    const entry: { task: Promise<VaultDto>; epoch: number | null } = { task, epoch: null };
+    this.rotations.set(vaultId, entry);
     return task;
   }
 

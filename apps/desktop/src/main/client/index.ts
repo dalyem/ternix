@@ -60,6 +60,7 @@ import { CoalescingCacheStore, type CoalescingOptions } from './coalescing.js';
 import { TypedEmitter } from './emitter.js';
 import { VaultEngine } from './engine.js';
 import {
+  CancelledError,
   isApiError,
   KdfTooWeakError,
   TernixError,
@@ -193,11 +194,22 @@ export class TernixClient {
   private readonly cache: CoalescingCacheStore;
   private pins: { account: string; loading: Promise<PinStore> } | null = null;
   private session: StoredSession | null = null;
+  /**
+   * Bound to one session: replaced when a session starts, dropped at logout. Its requests
+   * carry that session's token and no other, so `this.http === http` also tells whether the
+   * session an operation started with is still the current one.
+   */
   private http: Http | null = null;
   private engine: VaultEngine | null = null;
   private realtime: Realtime | null = null;
   private currentState: ClientState = 'loggedOut';
   private initialised = false;
+  /**
+   * Bumped by lock, logout, close, login and register. A pending unlock, login or register
+   * that sees it change gives up (`CancelledError`) and wipes what it derived.
+   */
+  private lifecycle = 0;
+  private loggingOut: Promise<unknown> | null = null;
 
   constructor(private readonly options: TernixClientOptions) {
     this.fetchFn = options.fetch ?? ((input, init) => globalThis.fetch(input, init));
@@ -272,16 +284,19 @@ export class TernixClient {
 
   private useSession(session: StoredSession): void {
     this.session = session;
-    this.http = new Http({
+    const http: Http = new Http({
       baseUrl: session.serverUrl,
       fetch: this.fetchFn,
       timeoutMs: this.options.requestTimeoutMs,
-      getToken: () => this.session?.token ?? null,
+      // Only this session's token, and only while it is current and not expired.
+      getToken: () =>
+        this.http === http && this.session?.token === session.token ? session.token : null,
       // A late 401 from an earlier session must not end the current one.
       onUnauthorized: () => {
-        if (this.session?.token === session.token) this.expire('expired');
+        if (this.http === http) this.expire('expired');
       },
     });
+    this.http = http;
   }
 
   private async saveSession(): Promise<void> {
@@ -358,6 +373,7 @@ export class TernixClient {
    */
   async register(input: RegisterInput): Promise<AccountDto> {
     this.assertInit();
+    await this.settleLogout();
     this.assertCanLogIn();
     const serverUrl = normalizeServerUrl(input.serverUrl);
     const email = normalizeEmail(input.email);
@@ -366,6 +382,7 @@ export class TernixClient {
       fetch: this.fetchFn,
       timeoutMs: this.options.requestTimeoutMs,
     });
+    const live = this.beginLogin();
 
     const kdf = newKdfParams(this.options.kdfLimits);
     const { masterKey, authKey } = await this.deriveKeys(input.password, kdf);
@@ -373,6 +390,7 @@ export class TernixClient {
     const vaultKey = newVaultKey();
     const vaultId = randomUUID();
     try {
+      live.check();
       const encryptedPrivateKey = encryptPrivateKey(masterKey, keypair.privateKey);
       const publicKey = toB64(keypair.publicKey);
       const res = await http.request(routes.register, {
@@ -394,20 +412,26 @@ export class TernixClient {
         },
         schema: registerResponseSchema,
       });
+      // The account exists now; a cancelled register leaves it for a later login.
+      this.revokeIfCancelled(live, serverUrl, res.token);
       const pins = await this.pinStoreFor(serverUrl, res.user.id);
       await pins.pinSelf(publicKey);
       pins.checkSelf(res.user.id, res.user.public_key);
-      await this.startSession({
-        serverUrl,
-        email,
-        token: res.token,
-        deviceId: res.device_id,
-        user: res.user,
-        keys: { public_key: publicKey, encrypted_private_key: encryptedPrivateKey, kdf },
-      });
+      this.revokeIfCancelled(live, serverUrl, res.token);
+      await this.startSession(
+        {
+          serverUrl,
+          email,
+          token: res.token,
+          deviceId: res.device_id,
+          user: res.user,
+          keys: { public_key: publicKey, encrypted_private_key: encryptedPrivateKey, kdf },
+        },
+        live,
+      );
       const keyring = new Keyring(keypair.publicKey, keypair.privateKey);
       keyring.set(vaultId, 1, vaultKey);
-      await this.openVaults(keyring);
+      await this.openVaults(keyring, live.alive);
       await this.initialSync();
       return this.account!;
     } catch (err) {
@@ -426,6 +450,7 @@ export class TernixClient {
    */
   async login(input: LoginInput): Promise<AccountDto> {
     this.assertInit();
+    await this.settleLogout();
     this.assertCanLogIn();
     const serverUrl = normalizeServerUrl(input.serverUrl);
     const email = normalizeEmail(input.email);
@@ -434,15 +459,18 @@ export class TernixClient {
       fetch: this.fetchFn,
       timeoutMs: this.options.requestTimeoutMs,
     });
+    const live = this.beginLogin();
 
     const { kdf } = await http.request(routes.prelogin, {
       auth: false,
       body: { email },
       schema: preloginResponseSchema,
     });
+    live.check();
     if (!this.isKdfStrongEnough(kdf)) throw new KdfTooWeakError();
     const { masterKey, authKey } = await this.deriveKeys(input.password, kdf);
     try {
+      live.check();
       const res = await http
         .request(routes.login, {
           auth: false,
@@ -455,6 +483,7 @@ export class TernixClient {
           }
           throw err;
         });
+      this.revokeIfCancelled(live, serverUrl, res.token);
       if (!sameKdf(res.keys.kdf, kdf)) {
         throw new TernixError(
           'protocol_error',
@@ -480,19 +509,23 @@ export class TernixClient {
       }
       try {
         await (await this.pinStoreFor(serverUrl, res.user.id)).pinSelf(res.keys.public_key);
+        this.revokeIfCancelled(live, serverUrl, res.token);
+        await this.startSession(
+          {
+            serverUrl,
+            email,
+            token: res.token,
+            deviceId: res.device_id,
+            user: res.user,
+            keys: res.keys,
+          },
+          live,
+        );
       } catch (err) {
         privateKey.fill(0);
         throw err;
       }
-      await this.startSession({
-        serverUrl,
-        email,
-        token: res.token,
-        deviceId: res.device_id,
-        user: res.user,
-        keys: res.keys,
-      });
-      await this.openVaults(new Keyring(publicKey, privateKey));
+      await this.openVaults(new Keyring(publicKey, privateKey), live.alive);
       await this.initialSync();
       return this.account!;
     } finally {
@@ -507,7 +540,35 @@ export class TernixClient {
     }
   }
 
-  private async startSession(session: StoredSession): Promise<void> {
+  /** A login or register in progress: cancels any other pending one, and is cancelled in turn. */
+  private beginLogin(): { alive: () => boolean; check: () => void } {
+    const generation = ++this.lifecycle;
+    const alive = () => this.lifecycle === generation;
+    return {
+      alive,
+      check: () => {
+        if (!alive()) throw new CancelledError();
+      },
+    };
+  }
+
+  /** The server issued a token for a login that was cancelled since: revoke it, then throw. */
+  private revokeIfCancelled(live: { alive: () => boolean }, serverUrl: string, token: string) {
+    if (live.alive()) return;
+    new Http({ baseUrl: serverUrl, fetch: this.fetchFn, getToken: () => token })
+      .request(routes.logout, { expireOn401: false })
+      .catch(() => undefined);
+    throw new CancelledError();
+  }
+
+  private async settleLogout(): Promise<void> {
+    await this.loggingOut?.catch(() => undefined);
+  }
+
+  private async startSession(
+    session: StoredSession,
+    live: { alive: () => boolean },
+  ): Promise<void> {
     // Logging in to another account (after the old one expired) drops the old cache.
     const previous = this.session;
     const oldAccount = previous && accountKey(previous.serverUrl, previous.user.id);
@@ -515,6 +576,7 @@ export class TernixClient {
       await this.cache.clear(oldAccount);
       await this.forgetPins(oldAccount);
     }
+    this.revokeIfCancelled(live, session.serverUrl, session.token!);
     this.useSession(session);
     await this.saveSession();
   }
@@ -529,8 +591,16 @@ export class TernixClient {
       throw new TernixError('session_expired', 'The session has expired; log in again');
     }
     if (this.currentState === 'unlocked') return;
+    // A lock, logout or close during the KDF or the cache load wins over this unlock.
+    const generation = this.lifecycle;
+    const http = this.http;
+    const alive = () => this.lifecycle === generation && this.http === http;
     const { masterKey, authKey } = await this.deriveKeys(password, session.keys.kdf);
     authKey.fill(0);
+    if (!alive()) {
+      masterKey.fill(0);
+      throw new CancelledError();
+    }
     let privateKey: Uint8Array;
     try {
       privateKey = decryptPrivateKey(masterKey, session.keys.encrypted_private_key);
@@ -546,34 +616,52 @@ export class TernixClient {
     }
     try {
       await (await this.sessionPins(session)).pinSelf(toB64(publicKey));
+      if (!alive()) throw new CancelledError();
     } catch (err) {
       privateKey.fill(0);
       throw err;
     }
-    // Another unlock, a lock or a logout may have happened during the KDF.
-    if (this.session !== session || this.state === 'unlocked') {
+    // Another unlock finished first.
+    if (this.state === 'unlocked') {
       privateKey.fill(0);
       return;
     }
-    await this.openVaults(new Keyring(publicKey, privateKey));
+    await this.openVaults(new Keyring(publicKey, privateKey), alive);
   }
 
-  /** Build the engine from the cache, go `unlocked`, start realtime, sync in the background. */
-  private async openVaults(keyring: Keyring): Promise<void> {
-    const session = this.session!;
-    this.engine?.close();
-    const engine = new VaultEngine({
-      http: this.http!,
-      cache: this.cache,
-      account: accountKey(session.serverUrl, session.user.id),
-      userId: session.user.id,
-      keyring,
-      pins: await this.pinStoreFor(session.serverUrl, session.user.id),
-      now: this.now,
-      emit: (event, payload) => this.emitter.emit(event, payload),
-    });
-    this.engine = engine;
-    await engine.loadFromCache();
+  /**
+   * Build the engine from the cache, go `unlocked`, start realtime, sync in the background.
+   * Takes over `keyring`: wiped if this throws, or if `alive` turns false meanwhile
+   * (`CancelledError`).
+   */
+  private async openVaults(keyring: Keyring, alive: () => boolean): Promise<void> {
+    let engine: VaultEngine | null = null;
+    try {
+      const session = this.session!;
+      const pins = await this.pinStoreFor(session.serverUrl, session.user.id);
+      if (!alive()) throw new CancelledError();
+      this.engine?.close();
+      engine = new VaultEngine({
+        http: this.http!,
+        cache: this.cache,
+        account: accountKey(session.serverUrl, session.user.id),
+        userId: session.user.id,
+        keyring,
+        pins,
+        now: this.now,
+        emit: (event, payload) => this.emitter.emit(event, payload),
+      });
+      this.engine = engine;
+      await engine.loadFromCache().catch((err: unknown) => {
+        throw alive() ? err : new CancelledError();
+      });
+      if (!alive()) throw new CancelledError();
+    } catch (err) {
+      engine?.close();
+      if (engine && this.engine === engine) this.engine = null;
+      keyring.wipe();
+      throw err;
+    }
     this.setState('unlocked');
     this.emitter.emit('vaults-changed', undefined);
     this.startRealtime(engine);
@@ -593,12 +681,13 @@ export class TernixClient {
   private startRealtime(engine: VaultEngine): void {
     this.realtime?.stop();
     this.realtime = null;
-    if (this.options.realtime === false || !this.session) return;
+    const http = this.http;
+    if (this.options.realtime === false || !this.session || !http) return;
     const realtime = new Realtime(
       wsUrlFor(this.session.serverUrl),
       this.options.webSocketFactory ?? wsSocketFactory,
       {
-        getToken: () => this.session?.token ?? null,
+        getToken: () => http.currentToken(),
         onConnection: (state) => this.emitter.emit('connection', state),
         onReady: () => {
           engine.syncAll().catch((err: unknown) => engine.reportBackground(err));
@@ -619,6 +708,7 @@ export class TernixClient {
    * cache writes are stored (it never rejects: failures are emitted as `error` events).
    */
   lock(): Promise<void> {
+    this.lifecycle += 1;
     this.realtime?.stop();
     this.realtime = null;
     this.engine?.close();
@@ -654,16 +744,31 @@ export class TernixClient {
     this.emitter.emit('session-revoked', { reason });
   }
 
-  /** Revoke this device's token on the server (best effort), then forget the session and cache. */
+  /**
+   * Revoke this device's token on the server (best effort), then forget the session and cache.
+   * A pending unlock, login or register is cancelled; a new login waits for this to finish.
+   */
   async logout(): Promise<LogoutResultDto> {
     const session = this.requireSession();
+    this.lifecycle += 1;
+    const run = this.doLogout(session);
+    this.loggingOut = run;
+    try {
+      return await run;
+    } finally {
+      if (this.loggingOut === run) this.loggingOut = null;
+    }
+  }
+
+  private async doLogout(session: StoredSession): Promise<LogoutResultDto> {
+    const http = this.http;
     // Stop realtime first: the server's session.revoked for this logout is not news.
     this.realtime?.stop();
     this.realtime = null;
     let serverRevoked = false;
-    if (session.token && this.http) {
+    if (session.token && http) {
       try {
-        await this.http.request(routes.logout, { expireOn401: false });
+        await http.request(routes.logout, { expireOn401: false });
         serverRevoked = true;
       } catch {
         serverRevoked = false;
@@ -673,23 +778,28 @@ export class TernixClient {
     const account = accountKey(session.serverUrl, session.user.id);
     await this.cache.clear(account);
     await this.forgetPins(account);
-    await this.options.secretStore.delete(SESSION_KEY);
-    this.session = null;
-    this.http = null;
-    this.setState('loggedOut');
+    if (this.http === http) {
+      await this.options.secretStore.delete(SESSION_KEY);
+      this.session = null;
+      this.http = null;
+      this.setState('loggedOut');
+    }
     return { serverRevoked };
   }
 
   /** `GET /me`: refresh the user record. A `401` moves the client to `expired`. */
   async revalidate(): Promise<AccountDto> {
-    const { http } = this.requireOnline();
+    const { session, http } = this.requireOnline();
+    const current = () => {
+      if (this.http !== http || !this.session) throw new CancelledError();
+      return this.session;
+    };
     const { user } = await http.request(routes.me, { schema: meResponseSchema });
-    if (this.session) {
-      // The server must keep reporting the account key this device pinned.
-      (await this.sessionPins(this.session)).checkSelf(user.id, user.public_key);
-      this.session = { ...this.session, user };
-      await this.saveSession();
-    }
+    current();
+    // The server must keep reporting the account key this device pinned.
+    (await this.sessionPins(session)).checkSelf(user.id, user.public_key);
+    this.session = { ...current(), user };
+    await this.saveSession();
     return this.account!;
   }
 
@@ -699,48 +809,56 @@ export class TernixClient {
    */
   async changePassword(currentPassword: string, newPassword: string): Promise<void> {
     const { session, http } = this.requireOnline();
+    // Logout or another login during a KDF ends this: nothing is sent for another session.
+    const check = () => {
+      if (this.http !== http) throw new CancelledError();
+    };
     const current = await this.deriveKeys(currentPassword, session.keys.kdf);
-    let privateKey: Uint8Array;
+    let next: DerivedKeys | null = null;
+    let privateKey: Uint8Array | null = null;
     try {
-      privateKey = decryptPrivateKey(current.masterKey, session.keys.encrypted_private_key);
-    } catch {
-      current.authKey.fill(0);
-      throw new WrongPasswordError('The current password is incorrect');
-    } finally {
-      current.masterKey.fill(0);
-    }
-    const newKdf = newKdfParams(this.options.kdfLimits);
-    const next = await this.deriveKeys(newPassword, newKdf);
-    const newEncrypted = encryptPrivateKey(next.masterKey, privateKey);
-    privateKey.fill(0);
-    next.masterKey.fill(0);
-    try {
-      await http.request(routes.changePassword, {
-        body: {
-          current_auth_key: toB64(current.authKey),
-          new_auth_key: toB64(next.authKey),
-          new_kdf: newKdf,
-          new_encrypted_private_key: newEncrypted,
-        },
-        expireOn401: false,
-      });
-    } catch (err) {
-      if (isApiError(err, 'unauthorized')) {
-        // Either the current password is wrong or the session is gone; /me tells which.
-        await this.revalidate();
+      check();
+      try {
+        privateKey = decryptPrivateKey(current.masterKey, session.keys.encrypted_private_key);
+      } catch {
         throw new WrongPasswordError('The current password is incorrect');
       }
-      throw err;
+      const newKdf = newKdfParams(this.options.kdfLimits);
+      next = await this.deriveKeys(newPassword, newKdf);
+      check();
+      const newEncrypted = encryptPrivateKey(next.masterKey, privateKey);
+      try {
+        await http.request(routes.changePassword, {
+          body: {
+            current_auth_key: toB64(current.authKey),
+            new_auth_key: toB64(next.authKey),
+            new_kdf: newKdf,
+            new_encrypted_private_key: newEncrypted,
+          },
+          expireOn401: false,
+        });
+      } catch (err) {
+        if (isApiError(err, 'unauthorized')) {
+          // Either the current password is wrong or the session is gone; /me tells which.
+          await this.revalidate();
+          throw new WrongPasswordError('The current password is incorrect');
+        }
+        throw err;
+      }
+      // The server has the new password; keep offline unlock in step if the session is ours.
+      if (this.http === http && this.session) {
+        this.session = {
+          ...this.session,
+          keys: { ...this.session.keys, encrypted_private_key: newEncrypted, kdf: newKdf },
+        };
+        await this.saveSession();
+      }
     } finally {
+      current.masterKey.fill(0);
       current.authKey.fill(0);
-      next.authKey.fill(0);
-    }
-    if (this.session && this.session.user.id === session.user.id) {
-      this.session = {
-        ...this.session,
-        keys: { ...this.session.keys, encrypted_private_key: newEncrypted, kdf: newKdf },
-      };
-      await this.saveSession();
+      privateKey?.fill(0);
+      next?.masterKey.fill(0);
+      next?.authKey.fill(0);
     }
   }
 
@@ -873,9 +991,12 @@ export class TernixClient {
     return this.requireEngine().acceptMemberKey(userId, publicKey);
   }
 
-  /** After comparing the pinned fingerprint with the user out of band. */
-  markMemberVerified(userId: string): Promise<void> {
-    return this.requireEngine().markMemberVerified(userId);
+  /**
+   * After comparing the fingerprint of `publicKey` with the user out of band. Refuses with
+   * `member_key_changed` if the pinned key is no longer `publicKey`.
+   */
+  markMemberVerified(userId: string, publicKey: string): Promise<void> {
+    return this.requireEngine().markMemberVerified(userId, publicKey);
   }
 
   changeMemberRole(vaultId: string, userId: string, role: VaultRole): Promise<MemberDto> {
@@ -932,6 +1053,7 @@ export class TernixClient {
    * settles once pending cache writes are stored.
    */
   async close(): Promise<void> {
+    // lock() bumps the lifecycle, cancelling a pending unlock, login or register.
     const flushed = this.lock();
     this.emitter.removeAllListeners();
     await flushed;

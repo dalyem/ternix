@@ -14,7 +14,6 @@ describe('normalizeServerUrl', () => {
     // Tailscale MagicDNS names default to https (tailscale serve issues certificates).
     ['ternix.tail1234.ts.net', 'https://ternix.tail1234.ts.net'],
     ['  Ternix.Tail1234.TS.net/  ', 'https://ternix.tail1234.ts.net'],
-    ['http://ternix.tail1234.ts.net:8080', 'http://ternix.tail1234.ts.net:8080'],
     ['example.com', 'https://example.com'],
     ['HTTPS://Vault.Example.COM/', 'https://vault.example.com'],
     ['example.com:8443', 'https://example.com:8443'],
@@ -24,15 +23,13 @@ describe('normalizeServerUrl', () => {
     ['example.com/ternix//?next=1#top', 'https://example.com/ternix'],
     ['192.168.1.10', 'https://192.168.1.10'],
     ['https://[2001:db8::1]:8443/', 'https://[2001:db8::1]:8443'],
-    // Plain http where the link itself is protected or local.
+    ['https://100.101.102.103:8443', 'https://100.101.102.103:8443'],
+    ['https://ternix.tail1234.ts.net:8443/', 'https://ternix.tail1234.ts.net:8443'],
+    // Plain http only to this computer.
     ['http://localhost:8080/', 'http://localhost:8080'],
     ['http://127.0.0.1:8080', 'http://127.0.0.1:8080'],
     ['http://127.9.9.9', 'http://127.9.9.9'],
     ['http://[::1]:8080', 'http://[::1]:8080'],
-    ['http://100.101.102.103:8080', 'http://100.101.102.103:8080'],
-    ['http://100.64.0.1', 'http://100.64.0.1'],
-    ['http://100.127.255.254', 'http://100.127.255.254'],
-    ['http://[fd7a:115c:a1e0::1234]:8080', 'http://[fd7a:115c:a1e0::1234]:8080'],
   ];
 
   it.each(accepted)('accepts %j as %j', (input, expected) => {
@@ -41,6 +38,13 @@ describe('normalizeServerUrl', () => {
 
   const rejected: [string, RegExp][] = [
     ['http://example.com', /unencrypted/],
+    // Tailnet addresses too: 100.64.0.0/10 is also carrier-grade NAT space, and
+    // tailscale serve provides certificates.
+    ['http://ternix.tail1234.ts.net:8080', /https:\/\/<machine>\.<tailnet>\.ts\.net/],
+    ['http://100.101.102.103:8080', /Tailscale serve/],
+    ['http://100.64.0.1', /unencrypted/],
+    ['http://100.127.255.254', /unencrypted/],
+    ['http://[fd7a:115c:a1e0::1234]:8080', /unencrypted/],
     ['http://192.168.1.10:8080', /unencrypted/],
     ['http://100.128.0.1', /unencrypted/],
     ['http://100.63.255.255', /unencrypted/],
