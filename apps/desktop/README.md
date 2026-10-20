@@ -8,19 +8,20 @@ narrow, validated bridge.
 
 ## Layout
 
-| Path                          | What                                                                                                                        |
-| ----------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| `src/main/client`             | `TernixClient`: protocol client, vault engine, realtime sync (no Electron dependency)                                       |
-| `src/main/index.ts`           | Startup: client, SSH manager, IPC, window, auto-lock, quit                                                                  |
-| `src/main/app`                | Electron glue: `safeStorage` secret store, settings, Argon2 worker, window hardening, `ternix://` protocol, auto-lock, menu |
-| `src/main/ipc`                | The request table: zod schema per method (`schemas.ts`), dispatcher (`dispatch.ts`), handlers (`handlers.ts`)               |
-| `src/main/ssh`                | `SshManager`: one `SshSession` per terminal tab, host-key and keyboard-interactive prompts, forwards                        |
-| `src/preload`                 | The bridge: `window.ternix` with `invoke`, `onEvent`, `onTerminalData`                                                      |
-| `src/renderer`                | React UI: sign-in screens, vault views, editors, terminals, sharing, settings                                               |
-| `src/shared`                  | Types shared by main and renderer: client DTOs (`types.ts`), shell DTOs (`app.ts`), the IPC contract (`ipc.ts`)             |
-| `build`                       | Icon (`icon.png`, drawn by `generate-icon.mjs`), macOS entitlements                                                         |
-| `e2e`                         | Playwright test of the packaged app                                                                                         |
-| `electron-builder.config.mjs` | Packaging, fuses, signing                                                                                                   |
+| Path                          | What                                                                                                                                                           |
+| ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `src/main/client`             | `TernixClient`: protocol client, vault engine, realtime sync (no Electron dependency)                                                                          |
+| `src/main/index.ts`           | Startup: client, SSH manager, IPC, window, auto-lock, quit                                                                                                     |
+| `src/main/app`                | Electron glue: `safeStorage` secret store, settings, Argon2 worker, window hardening, `ternix://` protocol, auto-lock, menu, native trust dialogs (`trust.ts`) |
+| `src/main/ipc`                | The request table: zod schema per method (`schemas.ts`), dispatcher (`dispatch.ts`), handlers (`handlers.ts`), secret redaction and merging (`secrets.ts`)     |
+| `src/main/ssh`                | `SshManager`: one `SshSession` per terminal tab, host-key and keyboard-interactive prompts, forwards                                                           |
+| `src/preload`                 | The bridge: `window.ternix` with `invoke`, `onEvent`, `onTerminalData`                                                                                         |
+| `src/renderer`                | React UI: sign-in screens, vault views, editors, terminals, sharing, settings                                                                                  |
+| `src/shared`                  | Types shared by main and renderer: client DTOs (`types.ts`), shell DTOs (`app.ts`), the IPC contract (`ipc.ts`)                                                |
+| `build`                       | Icon (`icon.png`, drawn by `generate-icon.mjs`), macOS entitlements                                                                                            |
+| `e2e`                         | Playwright test of the packaged app                                                                                                                            |
+| `electron-builder.config.mjs` | Release packaging, fuses, signing (shared parts in `electron-builder.common.mjs`)                                                                              |
+| `electron-builder.e2e.mjs`    | The end-to-end test package only (`--linux --dir`, inspector fuse on); built by `scripts/package-e2e.mjs`                                                      |
 
 ## Commands
 
@@ -34,6 +35,7 @@ pnpm build        # electron-vite build into out/ (main, preload, worker, render
 pnpm dist:mac     # dmg + zip for arm64 and x64 (run on a Mac)
 pnpm dist:win     # nsis installers for x64 and arm64
 pnpm dist:dir     # unpacked app for the current OS, no installer
+pnpm dist:e2e     # the end-to-end test package (Linux only), dist-e2e/linux-unpacked
 pnpm typecheck    # main + preload (tsconfig.json), renderer (tsconfig.web.json), e2e
 pnpm lint
 pnpm test         # vitest: client tests, IPC validation, secret store, settings, auto-lock
@@ -52,20 +54,37 @@ typecheck test` covers everything that does not need the Electron binary).
 - **Argon2id off the main thread.** `deriveKeys` runs in a short-lived `worker_threads`
   worker (`src/main/app/deriveWorker.ts`, built as its own chunk by electron-vite's `?modulePath`),
   so unlock and login do not freeze the window.
-- **SSH.** Opening a host builds `resolveConnection(items, hostId)` over the decrypted items of
-  every vault, then one `SshSession` runs per terminal tab in main. Terminal bytes travel on a
-  channel per session (`ternix:term:<id>`, coalesced to a few messages per frame); keystrokes
-  come back through the `ssh.write` method. Host-key verification and keyboard-interactive
-  prompts round-trip to the renderer as dialogs. An unknown key shows its SHA256 fingerprint and,
-  when accepted, is saved as a `known_host` item in the personal vault. A changed key shows a
-  warning, defaults to disconnect, and is only accepted through the explicit "Replace stored key"
-  action. Port forwards are started and stopped per open terminal, with status. The agent
+- **SSH.** Opening a host builds `resolveConnection(items, hostId)` over a snapshot of the
+  decrypted items of every vault; the snapshot is dropped right after, and the connection's
+  hooks keep only the known hosts of its hops and the personal vault ID. One `SshSession` runs
+  per terminal tab in main. Terminal bytes travel on a channel per session (`ternix:term:<id>`,
+  coalesced to a few messages per frame); keystrokes come back through the `ssh.write` method.
+  Host keys are verified in a **native dialog that main opens** (`src/main/app/trust.ts`), not
+  in the renderer: an unknown key shows host:port, key type and SHA256 fingerprint and, when
+  accepted, is saved as a `known_host` item in the personal vault. A changed key shows both
+  fingerprints, defaults to Disconnect, and is only accepted with "Replace stored key and
+  connect" plus the "I know why the key changed" checkbox. Keyboard-interactive prompts go to
+  the renderer as dialogs and are denied after 5 minutes without an answer. Every prompt
+  belongs to one connection attempt: closing, failing or reconnecting the tab cancels it
+  (closing a native dialog with its `AbortSignal`), and main checks that the attempt is still
+  current before it saves a key or goes on. A connection whose shell cannot be opened is
+  closed. Port forwards are started and stopped per open terminal, with status. The agent
   socket comes from `defaultAgentPath(process.platform, process.env)`.
+- **Secrets in the renderer.** `items.all` and every write result carry payloads without
+  `password`, `passphrase` and `private_key`; `has_password`, `has_passphrase` and
+  `has_private_key` say whether a value is stored. An editor fetches one item's secrets with
+  `items.reveal` when the user clicks "Show". `items.put` merges: a secret field left out keeps
+  the stored value, `null` or `''` clears it (see `ItemDraftInput` in `src/shared/types.ts`).
+  `known_host` items cannot be created or changed through `items.put` (only deleted); main
+  writes them after the host-key dialog.
 - **Locking.** The vault locks on the auto-lock timeout (settings, default 15 minutes of system
   idle time via `powerMonitor.getSystemIdleTime`), when the computer suspends, when the screen
   locks, from "Lock now", and when the window is closed (macOS keeps the app running).
   Locking zeroes the client's keys (`client.lock()` is awaited, so the pending cache writes are
-  stored) and clears the vault data from the renderer. **Open SSH
+  stored) and clears the vault data from the renderer: on every way out of `unlocked` (lock,
+  logout, expiry, revocation) the store drops items and the open editor, and the vault views,
+  editors and settings forms unmount, taking revealed secrets and typed passwords with them.
+  Only the terminal panes stay mounted. **Open SSH
   sessions stay connected** (as in Termius): their output keeps arriving, and the lock screen
   is drawn over the terminals, whose scrollback stays in renderer memory until the tab is closed.
   Unanswered SSH prompts are denied. New connections need an unlocked vault.
@@ -73,19 +92,26 @@ typecheck test` covers everything that does not need the Electron binary).
   the SSH sessions are closed (2 s at most) and `client.close()` has stored the pending cache
   writes (5 s at most); then the app quits for real. A flag keeps the second request from
   looping.
-- **Server address.** `https://` is required, except plain `http://` for loopback. A Tailscale
+- **Server address.** It is chosen only while signed out: `server.probe` is refused in the
+  `locked` and `unlocked` states (a renderer could otherwise send vault data out in a URL), and
+  the client refuses `login`/`register` unless signed out. `https://` is required, except plain
+  `http://` for loopback. A Tailscale
   address (`*.ts.net`, 100.64.0.0/10) is no exception: use `tailscale serve` and
   `https://<machine>.<tailnet>.ts.net`. The setup screen says so, and shows a "Tailscale" badge
   next to the normalized URL (`server.probe` adds `tailnet` using the client's `isTailnetHost`).
   The client never follows a redirect; `unexpected_redirect` is shown as "The server answered
   with a redirect to <location>. Enter the final address instead."
 - **Member keys.** Members are shown with a pin badge: `verified` (the fingerprint was compared
-  out of band), `unverified` (trusted on first use; "Mark verified" asks to compare the
-  fingerprint, then calls `vaults.markMemberVerified` with the key that was shown) and
-  `key changed` (the server reports another key than the pinned one). A refused rotation, add or
-  verify (`member_key_changed`, with `ErrorDto.keyChange`) opens the key change dialog with both
-  fingerprints; "I verified the new fingerprint with <email>" calls `vaults.acceptMemberKey` and
-  runs the operation again, Cancel sends nothing. `own_key_mismatch` anywhere replaces the app
+  out of band), `unverified` (trusted on first use; "Mark verified" calls
+  `vaults.markMemberVerified`) and `key changed` (the server reports another key than the
+  pinned one). Adding a member, marking one verified and accepting a changed key are each
+  confirmed in a **native dialog main opens**, showing the email the server reported for the
+  user (main remembers it from `vaults.lookupUser`, `vaults.members` and `admin.users.list`, and
+  refuses users it has not seen) and the fingerprint of the exact key that will be pinned; the
+  default button is Cancel, and declining fails with `cancelled`, which the UI ignores. A
+  refused rotation, add or verify (`member_key_changed`, with `ErrorDto.keyChange`) opens the
+  renderer's key change dialog with both fingerprints; "I verified the new fingerprint with
+  <email>" calls `vaults.acceptMemberKey` (main asks again) and runs the operation again. `own_key_mismatch` anywhere replaces the app
   with a blocking screen that only offers sign out.
 - **Cancelled operations.** `cancelled` (an unlock, login, register or password change that
   lock, logout or quit superseded) never shows as an error. Login, register, unlock and sign
@@ -100,25 +126,50 @@ typecheck test` covers everything that does not need the Electron binary).
 
 The renderer is untrusted: anything it can do, an XSS in it could do. So:
 
-| Control                                                                                                                        | Where                                                                                      |
-| ------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------ |
-| `contextIsolation: true`, `sandbox: true`, `nodeIntegration: false`                                                            | `src/main/app/window.ts` (`webPreferences`); `app.enableSandbox()` in `src/main/index.ts`  |
-| Preload exposes three functions, never `ipcRenderer`                                                                           | `src/preload/index.ts`                                                                     |
-| Every IPC argument validated with zod in main, unknown keys refused                                                            | `src/main/ipc/schemas.ts`, `dispatch.ts`; sender, frame and page URL checked in `index.ts` |
-| CSP: `default-src 'none'`, `script-src 'self'`, no remote content, no eval                                                     | `<meta>` injected by `electron.vite.config.ts` into `index.html`                           |
-| Renderer served from `ternix://app/`, not `file://`                                                                            | `src/main/app/protocol.ts`; fuse `grantFileProtocolExtraPrivileges` off                    |
-| No navigation away, no `window.open`, no webviews                                                                              | `lockDownWebContents` in `window.ts`                                                       |
-| All permission requests and checks denied                                                                                      | `lockDownSession` in `window.ts`                                                           |
-| Single instance                                                                                                                | `requestSingleInstanceLock` in `index.ts`                                                  |
-| Opening a link from a terminal needs http(s) and a native confirmation                                                         | `shell.openLink` in `src/main/index.ts` (`openLink`)                                       |
-| Session on disk only through `safeStorage`; refuses when unavailable                                                           | `src/main/app/secretStore.ts`; login and register check it first                           |
-| Fuses: `runAsNode` off, `NODE_OPTIONS` off, `--inspect` off, `onlyLoadAppFromAsar` on, ASAR integrity on, cookie encryption on | `electron-builder.config.mjs` (`electronFuses`)                                            |
-| DevTools only in development                                                                                                   | `devTools: !app.isPackaged`                                                                |
+| Control                                                                                                                        | Where                                                                                       |
+| ------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------- |
+| `contextIsolation: true`, `sandbox: true`, `nodeIntegration: false`                                                            | `src/main/app/window.ts` (`webPreferences`); `app.enableSandbox()` in `src/main/index.ts`   |
+| Preload exposes three functions, never `ipcRenderer`                                                                           | `src/preload/index.ts`                                                                      |
+| Every IPC argument validated with zod in main, unknown keys refused                                                            | `src/main/ipc/schemas.ts`, `dispatch.ts`; sender, frame and page URL checked in `index.ts`  |
+| CSP: `default-src 'none'`, `script-src 'self'`, no remote content, no eval                                                     | `<meta>` injected by `electron.vite.config.ts` into `index.html`                            |
+| Renderer served from `ternix://app/`, not `file://`                                                                            | `src/main/app/protocol.ts`; fuse `grantFileProtocolExtraPrivileges` off                     |
+| No navigation away, no `window.open`, no webviews                                                                              | `lockDownWebContents` in `window.ts`                                                        |
+| All permission requests and checks denied                                                                                      | `lockDownSession` in `window.ts`                                                            |
+| Single instance                                                                                                                | `requestSingleInstanceLock` in `index.ts`                                                   |
+| Opening a link from a terminal needs http(s) and a native confirmation                                                         | `shell.openLink` in `src/main/index.ts` (`openLink`)                                        |
+| Host keys, adding members, accepting and verifying member keys: answered in main's native dialog, default deny; no IPC answer  | `src/main/app/trust.ts`, `ssh/manager.ts`, `ipc/handlers.ts`                                |
+| Item lists carry no secret fields; one item at a time through `items.reveal`; untouched secrets kept on edit                   | `src/main/ipc/secrets.ts`, `handlers.ts`                                                    |
+| `known_host` items written only by main after the host-key dialog                                                              | `items.put` in `handlers.ts`                                                                |
+| `server.probe` only while signed out                                                                                           | `handlers.ts`                                                                               |
+| Locking unmounts everything but the terminals and clears decrypted state                                                       | `src/renderer/src/screens/Shell.tsx`, `store.ts` (`clearData`)                              |
+| Session on disk only through `safeStorage`; refuses when unavailable                                                           | `src/main/app/secretStore.ts`; login and register check it first                            |
+| Fuses: `runAsNode` off, `NODE_OPTIONS` off, `--inspect` off, `onlyLoadAppFromAsar` on, ASAR integrity on, cookie encryption on | `electron-builder.common.mjs` (`releaseFuses`); read back in CI by `scripts/check-fuses.sh` |
+| DevTools only in development                                                                                                   | `devTools: !app.isPackaged`                                                                 |
 
 `style-src` allows inline styles because xterm.js writes a `<style>` element for its theme.
 On Linux without a keyring, `safeStorage` falls back to a hard-coded key (`basic_text`); the app
-treats that as unavailable. `TERNIX_ALLOW_BASIC_TEXT_SECRET_STORE=1` overrides this for
-development and CI only.
+treats that as unavailable. Only the end-to-end test build honours
+`TERNIX_ALLOW_BASIC_TEXT_SECRET_STORE=1`: the check sits behind `__TERNIX_E2E__`, a build-time
+constant (electron-vite `define`, true only with `TERNIX_E2E_BUILD=1`), so release bundles do
+not contain it, and the release packaging refuses a main bundle that does.
+
+### Residual risks
+
+These controls are defence in depth, not isolation of secret editing. Code running in a
+compromised renderer can still:
+
+- call `items.reveal` and read items' secrets one at a time (an editor needs them), and keep
+  them until it finds a way out (it has no network access of its own: CSP `connect-src 'none'`,
+  no navigation, no `server.probe` while signed in);
+- type into open terminals with `ssh.write`, and so run commands on hosts that are connected,
+  or start connections to saved hosts and quick-connect targets (a new host key still needs the
+  user's answer in main's dialog);
+- show misleading information next to a native dialog; the dialog's own text comes from main.
+
+The review recommended moving secret editing out of the renderer entirely (a separate,
+minimal window or native forms owned by main). That is out of scope for v1.
+`@ternix/ssh` keeps the resolved credentials inside its `ssh2` clients for the life of a
+session; the desktop app drops its own references once the session has signed in.
 
 ## Packaging
 
@@ -141,14 +192,20 @@ electron-builder converts it to `.icns` and `.ico` while packaging.
 
 CI: [`.github/workflows/desktop.yml`](../../.github/workflows/desktop.yml) builds the installers
 on `macos-latest` and `windows-latest` on pushes to `main`, on `v*` tags and on manual dispatch,
-and uploads them as artifacts.
+reads the fuses back from the packaged app (`scripts/check-fuses.sh`, which fails when
+`RunAsNode` or `EnableNodeCliInspectArguments` is enabled), and uploads the installers as
+artifacts. Actions are pinned to commit SHAs.
 
 ## End-to-end test
 
 `e2e/desktop.e2e.ts` drives the packaged app with Playwright's Electron support against a real
 `@ternix/server` and an SSH server: it enters the server address, registers, creates a host,
-connects, verifies the host key, runs `echo`, checks the saved `known_host`, locks and unlocks,
-restarts the app and unlocks again. It also covers sharing (the verified/unverified badges and
+checks that the renderer gets no secrets and cannot probe, connects, verifies the host key,
+runs `echo`, checks the saved `known_host`, locks and unlocks, checks that locking with a
+revealed private key in an open editor leaves no secret in the page, restarts the app and
+unlocks again. Native dialogs are answered through `e2e/support/dialogs.ts`, which replaces
+`dialog.showMessageBox` in the main process through the Node inspector (only the e2e package
+has that fuse on; the app has no hook for it). It also covers sharing (the verified/unverified badges and
 the mark-verified flow) and a malicious server: the test rewrites a member's `public_key` in
 the server's SQLite database and checks that removal and rotation open the key change dialog,
 send nothing until the new fingerprint is accepted, and then go through. By default the SSH server is an in-process `ssh2` server
@@ -158,12 +215,16 @@ to use a real OpenSSH `sshd`. Screenshots go to `e2e/artifacts/` (ignored by git
 ```sh
 pnpm run build:packages && pnpm --filter @ternix/server build
 cd apps/desktop
-pnpm exec electron-vite build
-TERNIX_E2E_BUILD=1 pnpm exec electron-builder --config electron-builder.config.mjs --linux --dir --publish never
-TERNIX_E2E_EXECUTABLE=$PWD/dist/linux-unpacked/ternix xvfb-run -a pnpm e2e
+TERNIX_E2E_BUILD=1 pnpm exec electron-vite build
+TERNIX_E2E_BUILD=1 node scripts/package-e2e.mjs
+TERNIX_ALLOW_BASIC_TEXT_SECRET_STORE=1 TERNIX_E2E_EXECUTABLE=$PWD/dist-e2e/linux-unpacked/ternix xvfb-run -a pnpm e2e
 ```
 
-`TERNIX_E2E_BUILD=1` flips one fuse (`enableNodeCliInspectArguments`) on, because Playwright
-attaches through the Node inspector; installers are never built that way. On Linux the sandbox
+The e2e package differs from a release in two ways: the `enableNodeCliInspectArguments` fuse
+is on, because Playwright attaches through the Node inspector, and the `basic_text` escape
+hatch is compiled in (CI machines have no keyring). `electron-builder.e2e.mjs` refuses any
+platform or target but `--linux --dir`, and `electron-builder.config.mjs` refuses to load
+while `TERNIX_E2E_BUILD` is set or to pack an e2e main bundle, so installers are never built
+that way. On Linux the sandbox
 helper `chrome-sandbox` must be setuid root (or user namespaces must be allowed) and the test
 should run as a normal user.

@@ -37,7 +37,13 @@ const idOf = (t: Registered): string => t.client.account!.user.id;
 
 function ipcFor(t: Registered) {
   const ssh = { cancelAllPrompts: vi.fn(), closeAll: vi.fn(async () => undefined) };
-  const handlers = createHandlers({ client: t.client, ssh } as unknown as HandlerDeps);
+  // The user approves every native trust dialog here; ipcSecurity.test.ts covers declining.
+  const messageBox = vi.fn(async () => ({ response: 1, checkboxChecked: false }));
+  const handlers = createHandlers({
+    client: t.client,
+    ssh,
+    messageBox,
+  } as unknown as HandlerDeps);
   const dispatch = createDispatcher(rpcSchemas, handlers);
   const call = async <K extends RpcMethodName>(method: K, arg?: RpcMethods[K]['in']) => {
     const result = await dispatch(method, arg);
@@ -211,6 +217,7 @@ describe('IPC lifecycle and errors', () => {
   it('flags tailnet addresses on probe without relaxing the https rule', async () => {
     const a = await registerUser(server, { realtime: false });
     const ipc = ipcFor(a);
+    await ipc.call('auth.logout'); // probing is for the signed-out setup screen only
     expect(await ipc.call('server.probe', { address: server.url })).toMatchObject({
       serverUrl: server.url,
       tailnet: false,

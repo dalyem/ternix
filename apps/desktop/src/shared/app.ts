@@ -71,23 +71,6 @@ export interface TerminalDto {
   forwards: ForwardDto[];
 }
 
-export interface HostKeyPromptDto {
-  kind: 'hostkey';
-  promptId: string;
-  sessionId: string;
-  hopLabel: string;
-  hopIndex: number;
-  hopTotal: number;
-  host: string;
-  port: number;
-  keyType: string;
-  /** `SHA256:...` as OpenSSH prints it. */
-  fingerprint: string;
-  /** `unknown`: first contact. `mismatch`: the host presents another key than the stored one. */
-  status: 'unknown' | 'mismatch';
-  stored?: { keyType: string; fingerprint: string };
-}
-
 export interface KeyboardPromptDto {
   kind: 'keyboard';
   promptId: string;
@@ -98,7 +81,11 @@ export interface KeyboardPromptDto {
   prompts: { prompt: string; echo: boolean }[];
 }
 
-export type PromptDto = HostKeyPromptDto | KeyboardPromptDto;
+/**
+ * Prompts the renderer answers. Host keys are not among them: main asks about those in a
+ * native dialog (see `main/app/trust.ts`).
+ */
+export type PromptDto = KeyboardPromptDto;
 
 /** `trust`: save an unknown key. `replace`: overwrite the stored key after a mismatch. */
 export type HostKeyDecision = 'trust' | 'replace' | 'reject';
@@ -119,6 +106,7 @@ export interface AppEvents {
   'client.error': ErrorDto;
   'ssh.status': TerminalDto;
   'ssh.prompt': PromptDto;
+  /** The prompt's connection attempt ended or it timed out: dismiss its dialog. */
   'ssh.prompt-cancelled': { promptId: string };
   'ssh.notice': NoticeDto;
   'settings.changed': AppSettings;

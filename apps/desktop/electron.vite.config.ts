@@ -55,8 +55,16 @@ function csp(): Plugin {
   };
 }
 
+/**
+ * `__TERNIX_E2E__` is true only for the end-to-end test bundle (`TERNIX_E2E_BUILD=1`); in a
+ * release bundle the code it guards is removed, and `electron-builder.config.mjs` refuses to
+ * package an e2e bundle.
+ */
+const e2eBuild = process.env['TERNIX_E2E_BUILD'] === '1';
+
 export default defineConfig({
   main: {
+    define: { __TERNIX_E2E__: JSON.stringify(e2eBuild) },
     build: {
       externalizeDeps: false,
       rollupOptions: { external: optionalNative, output: commonjsOutput },

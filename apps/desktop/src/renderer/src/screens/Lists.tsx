@@ -113,7 +113,7 @@ export function KeychainView() {
           sub={
             <>
               {i.payload.username}
-              {i.payload.password ? ' · password' : ''}
+              {i.payload.has_password ? ' · password' : ''}
               {i.payload.key_id ? ' · key' : ''}
             </>
           }
@@ -125,7 +125,7 @@ export function KeychainView() {
         <Row
           key={k.id}
           item={k}
-          sub={k.payload.passphrase ? 'passphrase protected' : 'no passphrase'}
+          sub={k.payload.has_passphrase ? 'passphrase protected' : 'no passphrase'}
           onOpen={() => openEditor({ type: 'ssh_key', item: k })}
         />
       ))}

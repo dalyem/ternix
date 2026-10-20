@@ -202,7 +202,12 @@ function Views() {
   );
 }
 
-/** The signed-in app. `locked` hides it but keeps terminals mounted, so sessions go on. */
+/**
+ * The signed-in app. While `locked` only the terminals stay mounted (hidden), so sessions and
+ * their scrollback go on; the vault views, editors and settings forms unmount, so nothing they
+ * held (revealed secrets, typed passwords) stays in the page. Every slot keeps its position, so
+ * locking never remounts `TerminalHost`.
+ */
 export function Shell({ locked }: { locked: boolean }) {
   return (
     <div
@@ -212,13 +217,13 @@ export function Shell({ locked }: { locked: boolean }) {
       // `inert` keeps focus and the accessibility tree out of the hidden UI.
       {...(locked ? { inert: true } : {})}
     >
-      <Sidebar />
+      {locked ? null : <Sidebar />}
       <main className="main">
-        <TabStrip />
-        <Views />
+        {locked ? null : <TabStrip />}
+        {locked ? null : <Views />}
         <TerminalHost />
       </main>
-      <ItemEditor />
+      {locked ? null : <ItemEditor />}
     </div>
   );
 }

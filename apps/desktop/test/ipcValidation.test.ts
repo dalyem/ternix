@@ -223,7 +223,15 @@ describe('rpc dispatch', () => {
       ['ssh.open', { hostId: uuid, cols: 120, rows: 40 }],
       ['ssh.quickConnect', { target: 'root@10.0.0.1:2222', cols: 80, rows: 24 }],
       ['ssh.answerKeyboard', { promptId: uuid, answers: null }],
-      ['ssh.answerHostKey', { promptId: uuid, decision: 'trust' }],
+      ['items.reveal', { vaultId: uuid, itemId: otherUuid }],
+      [
+        'items.put',
+        {
+          vaultId: uuid,
+          itemId: otherUuid,
+          draft: { type: 'host', label: 'h', address: 'a', password: null },
+        },
+      ],
       ['ssh.forward.start', { id: uuid, forwardId: otherUuid }],
     ];
     for (const [method, arg] of calls) {

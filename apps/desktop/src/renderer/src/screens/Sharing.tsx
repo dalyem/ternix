@@ -13,7 +13,6 @@ import { refreshData, toast, useStore } from '../store.js';
 import {
   Badge,
   Button,
-  Checkbox,
   ConfirmDialog,
   EmptyState,
   ErrorText,
@@ -333,7 +332,7 @@ function MemberRow({
 }) {
   const isOwner = vault.role === 'owner';
   const [removing, setRemoving] = useState(false);
-  const [verifying, setVerifying] = useState(false);
+  const verify = useAction();
   const [reviewing, setReviewing] = useState<KeyChangeDto | null>(null);
   const action = useAction();
   const canVerify = !member.isSelf && !member.verified && !member.keyChanged;
@@ -353,7 +352,30 @@ function MemberRow({
         ) : null}
         {canVerify ? (
           <div>
-            <Button onClick={() => setVerifying(true)}>Mark verified</Button>
+            <Button
+              busy={verify.busy}
+              title="Ternix shows the fingerprint to compare in a system dialog"
+              onClick={() =>
+                void verify.run(async () => {
+                  try {
+                    // Main asks the user to compare the fingerprint in a native dialog.
+                    await call('vaults.markMemberVerified', {
+                      userId: member.userId,
+                      publicKey: member.publicKey,
+                    });
+                    onChanged();
+                  } catch (err) {
+                    // The pinned key is another one by now: the key change dialog takes over.
+                    const change = keyChangeOf(err);
+                    if (!change) throw err;
+                    setReviewing(change);
+                  }
+                })
+              }
+            >
+              Mark verified
+            </Button>
+            <ErrorText error={verify.error} />
           </div>
         ) : null}
         {member.keyChanged && !member.isSelf ? (
@@ -372,38 +394,6 @@ function MemberRow({
               Review changed key
             </Button>
           </div>
-        ) : null}
-        {verifying ? (
-          <ConfirmDialog
-            title={`Mark ${member.name}'s key as verified?`}
-            message={
-              <>
-                <p>
-                  Ask {member.name} to read you their fingerprint over a call or in person (Sharing
-                  page, “Your fingerprint”). Mark it verified only if it matches this one:
-                </p>
-                <p>
-                  <Fingerprint value={member.fingerprint} />
-                </p>
-              </>
-            }
-            confirmLabel="It matches, mark verified"
-            onClose={() => setVerifying(false)}
-            onConfirm={async () => {
-              try {
-                await call('vaults.markMemberVerified', {
-                  userId: member.userId,
-                  publicKey: member.publicKey,
-                });
-                onChanged();
-              } catch (err) {
-                // The pinned key is another one by now: the key change dialog takes over.
-                const change = keyChangeOf(err);
-                if (!change) throw err;
-                setReviewing(change);
-              }
-            }}
-          />
         ) : null}
         {reviewing ? (
           <KeyChangeDialog
@@ -482,7 +472,6 @@ function MemberRow({
 function AddMember({ vault, onAdded }: { vault: VaultDto; onAdded: () => void }) {
   const [email, setEmail] = useState('');
   const [found, setFound] = useState<LookupUserDto | null>(null);
-  const [verified, setVerified] = useState(false);
   const [role, setRole] = useState<VaultRole>('viewer');
   const lookup = useAction();
   // `member_key_changed` while adding: the key the owner verified differs from the pin.
@@ -493,10 +482,7 @@ function AddMember({ vault, onAdded }: { vault: VaultDto; onAdded: () => void })
     return found;
   });
 
-  const reset = () => {
-    setFound(null);
-    setVerified(false);
-  };
+  const reset = () => setFound(null);
 
   return (
     <div className="card">
@@ -550,14 +536,9 @@ function AddMember({ vault, onAdded }: { vault: VaultDto; onAdded: () => void })
           ) : null}
           <Notice tone="warning">
             The server could swap in someone else's key. Ask {found.name} to read you their
-            fingerprint (Sharing page, “Your fingerprint”) over a call or in person, and make sure
-            it matches before you continue.
+            fingerprint (Sharing page, “Your fingerprint”) over a call or in person. Ternix shows it
+            again in a system dialog before anything is shared; confirm there only if it matches.
           </Notice>
-          <Checkbox
-            label={`I checked this fingerprint with ${found.name} through another channel.`}
-            checked={verified}
-            onChange={setVerified}
-          />
           <Select label="Role" value={role} onChange={setRole} options={ROLE_OPTIONS} />
           <ErrorText error={add.error} />
           {add.dialog}
@@ -565,7 +546,6 @@ function AddMember({ vault, onAdded }: { vault: VaultDto; onAdded: () => void })
             <Button
               variant="primary"
               busy={add.busy}
-              disabled={!verified}
               onClick={() =>
                 void add.run(async () => {
                   await call('vaults.addMember', {

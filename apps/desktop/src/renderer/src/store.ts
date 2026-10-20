@@ -6,7 +6,7 @@ import type {
   AccountDto,
   ClientState,
   ConnectionState,
-  ItemPayload,
+  ListedPayload,
   VaultDto,
 } from '../../shared/types.js';
 import { call, errorMessage, isCancelled, on, onOwnKeyMismatch } from './api.js';
@@ -14,11 +14,14 @@ import { call, errorMessage, isCancelled, on, onOwnKeyMismatch } from './api.js'
 export type NavView =
   'hosts' | 'keychain' | 'snippets' | 'forwards' | 'knownHosts' | 'sharing' | 'settings';
 
-/** A decrypted item together with where it lives. */
+/**
+ * A decrypted item together with where it lives. Secret fields are not here (see
+ * `ListedPayload`); an open editor fetches them with `items.reveal`.
+ */
 export interface ItemView {
   id: string;
   vaultId: string;
-  payload: ItemPayload;
+  payload: ListedPayload;
   updatedAt: string;
 }
 
@@ -213,6 +216,11 @@ export async function refreshData(): Promise<void> {
   }
 }
 
+/**
+ * Leaving `unlocked` (lock, logout, expiry, revocation): drop every decrypted payload and close
+ * the editor. The vault views, editors and forms unmount while locked (see `Shell`), which
+ * takes revealed secrets and typed passwords with them; only the terminals stay.
+ */
 function clearData(): void {
   setState({
     vaults: [],
@@ -221,6 +229,7 @@ function clearData(): void {
     itemById: new Map(),
     unreadable: 0,
     prompts: [],
+    editor: null,
   });
 }
 

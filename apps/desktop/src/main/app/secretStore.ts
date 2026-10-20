@@ -21,10 +21,16 @@ export interface SecretStorageStatus {
 const FILE_NAME = 'session.bin';
 
 /**
- * Escape hatch for Linux machines without a keyring (CI, containers). Not a supported
- * configuration: with `basic_text` the "encryption" is only obfuscation.
+ * Escape hatch for Linux machines without a keyring, honoured only by the end-to-end test
+ * build (`__TERNIX_E2E__`). With `basic_text` the "encryption" is only obfuscation, so a
+ * release build refuses it whatever the environment says.
  */
 export const ALLOW_BASIC_TEXT_ENV = 'TERNIX_ALLOW_BASIC_TEXT_SECRET_STORE';
+
+/** Whether the environment asks for the escape hatch (only consulted by the e2e build). */
+export function basicTextRequested(env: Record<string, string | undefined>): boolean {
+  return env[ALLOW_BASIC_TEXT_ENV] === '1';
+}
 
 export function secretStorageStatus(
   safe: SafeStorageLike,
@@ -39,7 +45,8 @@ export function secretStorageStatus(
     };
   }
   const backend = safe.getSelectedStorageBackend?.();
-  if (backend === 'basic_text' && env[ALLOW_BASIC_TEXT_ENV] !== '1') {
+  // The constant (not a parameter) guards the check, so a release bundle drops it entirely.
+  if (backend === 'basic_text' && !(__TERNIX_E2E__ && basicTextRequested(env))) {
     return {
       available: false,
       problem:

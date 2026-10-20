@@ -8,6 +8,7 @@ import {
   SafeStorageSecretStore,
   type SafeStorageLike,
 } from '../src/main/app/secretStore.js';
+import { setE2eBuild } from './setup.js';
 
 /** A reversible fake: not secure, but nothing in the ciphertext looks like the plaintext. */
 class FakeSafeStorage implements SafeStorageLike {
@@ -39,6 +40,7 @@ beforeEach(async () => {
   safe = new FakeSafeStorage();
 });
 afterEach(async () => {
+  setE2eBuild(false);
   await rm(dir, { recursive: true, force: true });
 });
 
@@ -80,7 +82,8 @@ describe('SafeStorageSecretStore', () => {
     expect(await store.get('session')).toBeUndefined();
   });
 
-  it('treats the Linux basic_text backend as unavailable unless explicitly allowed', async () => {
+  it('in the e2e build, treats basic_text as unavailable unless explicitly allowed', async () => {
+    setE2eBuild(true);
     safe.backend = 'basic_text';
     const refused = new SafeStorageSecretStore(dir, safe, {});
     expect(refused.status().available).toBe(false);
@@ -89,6 +92,14 @@ describe('SafeStorageSecretStore', () => {
     expect(allowed.status().available).toBe(true);
     await allowed.set('a', 1);
     expect(await allowed.get('a')).toBe(1);
+  });
+
+  it('in a release build, refuses basic_text even when the environment allows it', async () => {
+    expect(__TERNIX_E2E__).toBe(false);
+    safe.backend = 'basic_text';
+    const release = new SafeStorageSecretStore(dir, safe, { [ALLOW_BASIC_TEXT_ENV]: '1' });
+    expect(release.status().available).toBe(false);
+    await expect(release.set('a', 1)).rejects.toMatchObject({ code: 'secret_storage_unavailable' });
   });
 
   it('reads an undecryptable or corrupt file as empty', async () => {

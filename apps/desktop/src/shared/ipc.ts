@@ -1,11 +1,4 @@
-import type {
-  AppEvents,
-  AppInfo,
-  AppSettings,
-  HostKeyDecision,
-  ImportedFile,
-  TerminalDto,
-} from './app.js';
+import type { AppEvents, AppInfo, AppSettings, ImportedFile, TerminalDto } from './app.js';
 import type {
   AccountDto,
   ClientState,
@@ -14,7 +7,10 @@ import type {
   DeviceDto,
   ErrorDto,
   InviteDto,
-  ItemDraft,
+  ItemDraftInput,
+  ItemSecretsDto,
+  ListedVaultItemsDto,
+  ListedWriteResultDto,
   LogoutResultDto,
   LookupUserDto,
   MemberDto,
@@ -22,15 +18,19 @@ import type {
   ServerInfoDto,
   UserDto,
   VaultDto,
-  VaultItemsDto,
   VaultRole,
-  WriteResultDto,
 } from './types.js';
 
 /**
  * The contract between the renderer and the main process. The renderer is untrusted: it
  * can only call the methods listed here, and main validates every argument (see
  * `main/ipc/schemas.ts`, which must have a schema for each method).
+ *
+ * Trust decisions are not the renderer's to make. Accepting an SSH host key, adding a vault
+ * member, accepting a member's changed key and marking a member verified are confirmed in a
+ * native dialog that main opens itself, showing the facts (host, port, key type and
+ * fingerprint; or email and fingerprint). The renderer may start these actions, but cannot
+ * answer for the user; a dialog the user declines fails with `cancelled`.
  */
 
 /** The one request/response channel; the method name travels as an argument. */
@@ -66,6 +66,7 @@ export interface RpcMethods {
   'shell.openLink': Rpc<{ url: string }, void>;
 
   'client.snapshot': Rpc<void, ClientSnapshot>;
+  /** Only while signed out (`loggedOut` or `expired`); refused with `forbidden` otherwise. */
   'server.probe': Rpc<{ address: string }, ProbedServerDto>;
   'auth.register': Rpc<
     { serverUrl: string; email: string; name: string; password: string; inviteCode?: string },
@@ -93,23 +94,38 @@ export interface RpcMethods {
   'vaults.sync': Rpc<void, void>;
   'vaults.members': Rpc<{ vaultId: string }, MemberDto[]>;
   'vaults.lookupUser': Rpc<{ email: string }, LookupUserDto>;
+  /**
+   * Main asks the user to confirm the person's email and the fingerprint of
+   * `expectedPublicKey`. The user must have been looked up (or listed) first, so main knows
+   * the email the server reports for `userId`.
+   */
   'vaults.addMember': Rpc<
     { vaultId: string; userId: string; role: VaultRole; expectedPublicKey: string },
     MemberDto
   >;
-  /** After the user compared the fingerprint of `publicKey`: mark the pinned key verified. */
+  /** Main asks the user to confirm the fingerprint of `publicKey`, then marks the pin verified. */
   'vaults.markMemberVerified': Rpc<{ userId: string; publicKey: string }, void>;
-  /** After the user compared the new fingerprint: pin `publicKey` as the user's verified key. */
+  /** Main asks the user to confirm the new fingerprint, then pins `publicKey` as verified. */
   'vaults.acceptMemberKey': Rpc<{ userId: string; publicKey: string }, void>;
   'vaults.changeRole': Rpc<{ vaultId: string; userId: string; role: VaultRole }, MemberDto>;
   'vaults.removeMember': Rpc<{ vaultId: string; userId: string }, RemoveMemberResultDto>;
   'vaults.leave': Rpc<{ vaultId: string }, void>;
   'vaults.rotate': Rpc<{ vaultId: string }, VaultDto>;
 
-  /** Every readable vault's decrypted items. */
-  'items.all': Rpc<void, VaultItemsDto[]>;
-  'items.put': Rpc<{ vaultId: string; itemId?: string; draft: ItemDraft }, WriteResultDto>;
-  'items.delete': Rpc<{ vaultId: string; itemId: string }, WriteResultDto>;
+  /** Every readable vault's decrypted items, without secret fields (see `ListedPayload`). */
+  'items.all': Rpc<void, ListedVaultItemsDto[]>;
+  /** The secret fields of one item, for an open editor or a copy action. */
+  'items.reveal': Rpc<{ vaultId: string; itemId: string }, ItemSecretsDto>;
+  /**
+   * Create or update an item. Secret fields follow `ItemDraftInput`: absent keeps the stored
+   * value, `null` or `''` clears it. `known_host` items cannot be written here (main saves
+   * them after the user accepts a host key); deleting them is allowed.
+   */
+  'items.put': Rpc<
+    { vaultId: string; itemId?: string; draft: ItemDraftInput },
+    ListedWriteResultDto
+  >;
+  'items.delete': Rpc<{ vaultId: string; itemId: string }, ListedWriteResultDto>;
 
   'ssh.list': Rpc<void, TerminalDto[]>;
   'ssh.open': Rpc<{ hostId: string; cols: number; rows: number }, TerminalDto>;
@@ -123,7 +139,6 @@ export interface RpcMethods {
   'ssh.resize': Rpc<{ id: string; cols: number; rows: number }, void>;
   'ssh.reconnect': Rpc<{ id: string; cols: number; rows: number }, TerminalDto>;
   'ssh.close': Rpc<{ id: string }, void>;
-  'ssh.answerHostKey': Rpc<{ promptId: string; decision: HostKeyDecision }, void>;
   'ssh.answerKeyboard': Rpc<{ promptId: string; answers: string[] | null }, void>;
   'ssh.forward.start': Rpc<{ id: string; forwardId: string }, void>;
   'ssh.forward.stop': Rpc<{ id: string; forwardId: string }, void>;

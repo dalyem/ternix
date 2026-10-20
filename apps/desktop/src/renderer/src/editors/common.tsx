@@ -1,6 +1,6 @@
 import type { ItemType } from '@ternix/core/items';
-import { type ReactNode, useState } from 'react';
-import type { ItemDraft } from '../../../shared/types.js';
+import { type ReactNode, useId, useState } from 'react';
+import type { ItemDraftInput, SecretField } from '../../../shared/types.js';
 import { call } from '../api.js';
 import {
   byLabel,
@@ -25,7 +25,7 @@ export const ITEM_TYPE_LABEL: Record<ItemType, string> = {
 };
 
 /** Save an item and report a write the server rejected as stale. */
-export async function saveItem(vaultId: string, itemId: string | undefined, draft: ItemDraft) {
+export async function saveItem(vaultId: string, itemId: string | undefined, draft: ItemDraftInput) {
   const result = await call('items.put', {
     vaultId,
     ...(itemId ? { itemId } : {}),
@@ -54,7 +54,7 @@ export function EditorFrame({
   children: (ctx: { vaultId: string; readOnly: boolean }) => ReactNode;
   /** Returns a message when the form is not ready to save. */
   validate: () => string | null;
-  build: (vaultId: string) => ItemDraft;
+  build: (vaultId: string) => ItemDraftInput;
 }) {
   const vaults = useStore((s) => s.vaults);
   const vaultById = useStore((s) => s.vaultById);
@@ -260,4 +260,155 @@ export function parsePort(text: string): number | null {
   if (!/^\d+$/.test(text.trim())) return null;
   const port = Number(text);
   return port >= 1 && port <= 65535 ? port : null;
+}
+
+/**
+ * One secret field of an item (password, passphrase, private key). Lists do not carry
+ * secrets, so the field starts empty: left untouched it keeps the stored value, "Show" fetches
+ * it from main (`items.reveal`), typing replaces it and "Remove" clears it. The value lives in
+ * this editor's state only, which goes away when the editor closes or the vault locks.
+ */
+export interface SecretState {
+  value: string;
+  /** The stored item has a value for this field. */
+  stored: boolean;
+  /** The user typed, imported or removed: the draft carries `value` (or null). */
+  touched: boolean;
+  revealed: boolean;
+  set(value: string): void;
+  reveal(): Promise<void>;
+  remove(): void;
+  busy: boolean;
+  error: unknown;
+  /** For the draft: undefined keeps the stored value, null clears it. */
+  draftValue(normalize?: (value: string) => string): string | null | undefined;
+}
+
+export function useSecret(target: EditorTarget, field: SecretField): SecretState {
+  const item = target.item;
+  const stored = item
+    ? (item.payload as unknown as Record<string, unknown>)[`has_${field}`] === true
+    : false;
+  const [value, setValue] = useState('');
+  const [touched, setTouched] = useState(false);
+  const [revealed, setRevealed] = useState(false);
+  const action = useAction();
+  return {
+    value,
+    stored,
+    touched,
+    revealed,
+    busy: action.busy,
+    error: action.error,
+    set: (next) => {
+      setValue(next);
+      setTouched(true);
+    },
+    reveal: async () => {
+      if (!item || touched || revealed) return;
+      await action.run(async () => {
+        const secrets = await call('items.reveal', { vaultId: item.vaultId, itemId: item.id });
+        setValue(secrets[field] ?? '');
+        setRevealed(true);
+      });
+    },
+    remove: () => {
+      setValue('');
+      setTouched(true);
+    },
+    draftValue: (normalize = (v) => v) => {
+      if (!touched) return undefined;
+      return value === '' ? null : normalize(value);
+    },
+  };
+}
+
+/** Spread into a draft: `{field: value}` when the field changed, nothing when it is kept. */
+export function secretDraft<K extends SecretField>(
+  field: K,
+  value: string | null | undefined,
+): Partial<Record<K, string | null>> {
+  return value === undefined ? {} : ({ [field]: value } as Partial<Record<K, string | null>>);
+}
+
+export function SecretInput({
+  label,
+  secret,
+  readOnly,
+  multiline,
+  hint,
+  placeholder,
+  optional = true,
+}: {
+  label: string;
+  secret: SecretState;
+  readOnly: boolean;
+  /** A textarea (private keys) instead of a password input. */
+  multiline?: boolean;
+  hint?: ReactNode;
+  placeholder?: string;
+  /** Whether the user may remove the stored value. */
+  optional?: boolean;
+}) {
+  const id = useId();
+  const [visible, setVisible] = useState(false);
+  const keptPlaceholder =
+    secret.stored && !secret.touched && !secret.revealed
+      ? readOnly
+        ? 'Stored. Show to see it.'
+        : 'Stored. Leave empty to keep it, or type to replace it.'
+      : placeholder;
+  const show = async () => {
+    await secret.reveal();
+    setVisible(true);
+  };
+  return (
+    <div className="field">
+      <label htmlFor={id}>{label}</label>
+      <div className="input-row">
+        {multiline ? (
+          <textarea
+            id={id}
+            rows={8}
+            className="mono"
+            value={secret.value}
+            spellCheck={false}
+            disabled={readOnly}
+            placeholder={keptPlaceholder}
+            onChange={(e) => secret.set(e.target.value)}
+          />
+        ) : (
+          <input
+            id={id}
+            type={visible ? 'text' : 'password'}
+            value={secret.value}
+            disabled={readOnly}
+            autoComplete="off"
+            placeholder={keptPlaceholder}
+            onChange={(e) => secret.set(e.target.value)}
+          />
+        )}
+        {secret.stored && !secret.touched && !secret.revealed ? (
+          <Button variant="ghost" busy={secret.busy} onClick={() => void show()}>
+            Show
+          </Button>
+        ) : !multiline ? (
+          <Button variant="ghost" onClick={() => setVisible((v) => !v)}>
+            {visible ? 'Hide' : 'Show'}
+          </Button>
+        ) : null}
+        {optional && !readOnly && secret.stored && !(secret.touched && secret.value === '') ? (
+          <Button variant="ghost" onClick={secret.remove}>
+            Remove
+          </Button>
+        ) : null}
+      </div>
+      {secret.touched && secret.value === '' && secret.stored ? (
+        <div className="hint">The stored value is removed when you save.</div>
+      ) : hint ? (
+        <div className="hint">{hint}</div>
+      ) : null}
+      <ErrorText error={secret.error} />
+    </div>
+  );
 }

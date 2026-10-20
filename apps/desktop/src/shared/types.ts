@@ -202,3 +202,65 @@ export interface ErrorDto {
   /** Set for `unexpected_redirect` when the server said where it redirects to. */
   location?: string;
 }
+
+// Secrets in item payloads
+
+/**
+ * Item fields that hold secrets. List DTOs never carry them; the renderer reads them one item
+ * at a time through `items.reveal`, for an open editor.
+ */
+export type SecretField = 'password' | 'passphrase' | 'private_key';
+
+/** Which secret fields each item type has. */
+export const SECRET_FIELDS: Readonly<Record<ItemPayload['type'], readonly SecretField[]>> = {
+  group: [],
+  host: ['password'],
+  identity: ['password'],
+  ssh_key: ['private_key', 'passphrase'],
+  snippet: [],
+  port_forward: [],
+  known_host: [],
+};
+
+/**
+ * A payload without its secret fields; `has_<field>` says whether the stored item has a
+ * non-empty value there (`has_password`, `has_passphrase`, `has_private_key`).
+ */
+export type ListedPayload = ItemPayload extends infer T
+  ? T extends unknown
+    ? Omit<T, SecretField> & { [K in Extract<keyof T, SecretField> as `has_${K}`]: boolean }
+    : never
+  : never;
+
+/** An item as lists show it: `payload` is redacted. */
+export interface ListedItemDto extends Omit<ItemDto, 'payload'> {
+  payload: ListedPayload;
+}
+
+export interface ListedVaultItemsDto {
+  vaultId: string;
+  items: ListedItemDto[];
+  unreadable: UnreadableItemDto[];
+}
+
+/** `WriteResultDto` with the redacted item. */
+export interface ListedWriteResultDto {
+  id: string;
+  status: 'saved' | 'dropped';
+  item: ListedItemDto | null;
+}
+
+/** The secret fields of one item that have a value (`items.reveal`). */
+export type ItemSecretsDto = Partial<Record<SecretField, string>>;
+
+/**
+ * An item draft as the renderer sends it to `items.put`. Secret fields are tri-state:
+ * absent keeps the value stored in the item being updated (nothing for a new item, or when
+ * the stored item has another type), a non-empty string sets it, and `null` or `''` clears
+ * it. Clearing a required field (`ssh_key.private_key`) is refused.
+ */
+export type ItemDraftInput = ItemDraft extends infer T
+  ? T extends unknown
+    ? Omit<T, SecretField> & { [K in Extract<keyof T, SecretField>]?: string | null }
+    : never
+  : never;

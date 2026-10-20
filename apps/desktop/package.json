@@ -16,6 +16,7 @@
     "dist:dir": "corepack pnpm run build:deps && electron-vite build && electron-builder --config electron-builder.config.mjs --dir --publish never",
     "dist:mac": "corepack pnpm run build:deps && electron-vite build && electron-builder --config electron-builder.config.mjs --mac --publish never",
     "dist:win": "corepack pnpm run build:deps && electron-vite build && electron-builder --config electron-builder.config.mjs --win --publish never",
+    "dist:e2e": "corepack pnpm run build:deps && TERNIX_E2E_BUILD=1 electron-vite build && TERNIX_E2E_BUILD=1 node scripts/package-e2e.mjs",
     "e2e": "playwright test --config e2e/playwright.config.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.web.json --noEmit && tsc -p tsconfig.e2e.json --noEmit",
     "lint": "eslint .",

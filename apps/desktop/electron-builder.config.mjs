@@ -1,8 +1,4 @@
-// electron-builder configuration for the Ternix desktop app.
-//
-// The app is fully bundled by electron-vite (main, preload, worker and renderer in `out/`),
-// so the package contains `out/` and package.json and no node_modules: nothing to resolve
-// through pnpm's symlinked workspace layout, and no native modules to rebuild.
+// electron-builder configuration for the Ternix desktop app: the release installers.
 //
 // Signing and notarization are driven by environment variables and skipped when unset:
 //   macOS   CSC_LINK, CSC_KEY_PASSWORD; notarization also APPLE_ID, APPLE_APP_SPECIFIC_PASSWORD,
@@ -10,39 +6,40 @@
 //   Windows WIN_CSC_LINK, WIN_CSC_KEY_PASSWORD
 // Without them the build is unsigned (set CSC_IDENTITY_AUTO_DISCOVERY=false on a Mac that has
 // a signing identity in its keychain that you do not want used).
+//
+// The end-to-end test package (inspector fuse on, `basic_text` escape hatch compiled in) has
+// its own config, `electron-builder.e2e.mjs`, which only builds `--linux --dir`. This one
+// refuses to run in that environment, and refuses a bundle built for it.
+
+import { join } from 'node:path';
+import { common, E2E_ENV, isE2eBundle, linux, releaseFuses } from './electron-builder.common.mjs';
+
+if (process.env[E2E_ENV]) {
+  throw new Error(
+    `${E2E_ENV} is set: release packaging refuses the end-to-end build. ` +
+      'Use `pnpm dist:e2e` for the test package.',
+  );
+}
+
+const MAIN_BUNDLE = join(import.meta.dirname, 'out', 'main');
 
 const notarize = ['APPLE_ID', 'APPLE_APP_SPECIFIC_PASSWORD', 'APPLE_TEAM_ID'].every(
   (name) => (process.env[name] ?? '') !== '',
 );
 
-// Playwright drives Electron through the Node inspector, which the release build turns off.
-// The end-to-end test builds a variant with this one fuse on (TERNIX_E2E_BUILD=1); installers
-// are never built that way.
-const e2eBuild = process.env.TERNIX_E2E_BUILD === '1';
-
 /** @type {import('electron-builder').Configuration} */
 export default {
-  appId: 'dev.ternix.desktop',
-  productName: 'Ternix',
-  copyright: 'Copyright © Ternix contributors',
-  directories: { output: 'dist', buildResources: 'build' },
-  // electron-builder always starts from `**/*`; the leading exclusion makes this a whitelist.
-  files: ['!**/*', 'out/**/*', 'package.json', '!**/*.map'],
-  asar: true,
-  npmRebuild: false,
-  artifactName: '${productName}-${version}-${os}-${arch}.${ext}',
+  ...common,
 
-  // Binary hardening (flipped in the Electron binary at package time).
-  electronFuses: {
-    runAsNode: false,
-    enableNodeOptionsEnvironmentVariable: false,
-    enableNodeCliInspectArguments: e2eBuild,
-    enableCookieEncryption: true,
-    onlyLoadAppFromAsar: true,
-    enableEmbeddedAsarIntegrityValidation: true,
-    grantFileProtocolExtraPrivileges: false,
-    // Flipping fuses breaks the ad-hoc signature Apple Silicon needs; redo it (uses `codesign`).
-    resetAdHocDarwinSignature: process.platform === 'darwin',
+  electronFuses: releaseFuses,
+
+  // `out/` may still hold an e2e bundle from an earlier `TERNIX_E2E_BUILD=1 electron-vite build`.
+  beforePack: async () => {
+    if (isE2eBundle(MAIN_BUNDLE)) {
+      throw new Error(
+        'out/main was built for the end-to-end test (TERNIX_E2E_BUILD=1). Run `electron-vite build` again without it.',
+      );
+    }
   },
 
   mac: {
@@ -70,10 +67,5 @@ export default {
     deleteAppDataOnUninstall: false,
   },
 
-  // Linux is not a shipped target; `--linux --dir` is the packaging smoke test.
-  linux: {
-    target: [{ target: 'dir' }],
-    executableName: 'ternix',
-    category: 'Network',
-  },
+  linux,
 };

@@ -31,9 +31,9 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
 
@@ -71,8 +71,20 @@ jobs:
           WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
         run: pnpm exec electron-builder --config electron-builder.config.mjs ${{ matrix.target }} --publish never
 
+      # Read the fuses back from what was packaged: RunAsNode and the Node inspector must be off.
+      - name: Check the packaged fuses
+        working-directory: apps/desktop
+        run: |
+          shopt -s nullglob
+          apps=(dist/mac*/Ternix.app dist/win*-unpacked/Ternix.exe)
+          if [ "${#apps[@]}" -eq 0 ]; then
+            echo "no packaged app found in dist/" >&2
+            exit 1
+          fi
+          bash scripts/check-fuses.sh "${apps[@]}"
+
       - name: Upload installers
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ternix-desktop-${{ runner.os }}
           if-no-files-found: error

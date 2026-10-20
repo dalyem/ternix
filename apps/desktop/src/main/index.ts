@@ -26,9 +26,10 @@ import { deriveKeysInWorker } from './app/derive.js';
 import { AppError } from './app/errors.js';
 import { installMenu } from './app/menu.js';
 import { handleAppScheme, registerAppScheme } from './app/protocol.js';
-import { ALLOW_BASIC_TEXT_ENV, SafeStorageSecretStore } from './app/secretStore.js';
+import { basicTextRequested, SafeStorageSecretStore } from './app/secretStore.js';
 import { isAppUrl } from './app/security.js';
 import { SettingsStore } from './app/settings.js';
+import { confirmHostKey, type MessageBox } from './app/trust.js';
 import {
   appUrls,
   createMainWindow,
@@ -83,8 +84,9 @@ function trustSystemCertificates(): void {
   }
 }
 
-// Linux without a keyring: only on explicit request, and only for development and CI.
-if (process.platform === 'linux' && process.env[ALLOW_BASIC_TEXT_ENV] === '1') {
+// Linux without a keyring: only in the end-to-end test build (`__TERNIX_E2E__`), on explicit
+// request. Release builds do not contain this branch.
+if (__TERNIX_E2E__ && process.platform === 'linux' && basicTextRequested(process.env)) {
   safeStorage.setUsePlainTextEncryption(true);
 }
 
@@ -98,6 +100,14 @@ function activeContents() {
 function emit<K extends AppEventName>(name: K, payload: AppEvents[K]): void {
   activeContents()?.send(EVENT_CHANNEL, name, payload);
 }
+
+/** A native message box on the app window; without a window the answer is the deny button. */
+const messageBox: MessageBox = async (request) => {
+  const win = mainWindow;
+  if (!win || win.isDestroyed()) return { response: request.cancelId, checkboxChecked: false };
+  const { response, checkboxChecked } = await dialog.showMessageBox(win, request);
+  return { response, checkboxChecked };
+};
 
 async function start(): Promise<void> {
   const userData = app.getPath('userData');
@@ -126,6 +136,7 @@ async function start(): Promise<void> {
       return contents !== null;
     },
     hasWindow: () => activeContents() !== null,
+    confirmHostKey: (facts, signal) => confirmHostKey(messageBox, facts, signal),
     agentPath: defaultAgentPath(process.platform, process.env),
   });
 
@@ -186,6 +197,7 @@ async function start(): Promise<void> {
       if (answer.response === 0) await openExternalLink(url);
     },
     onSettingsChanged: () => emit('settings.changed', settings.get()),
+    messageBox,
   });
   const dispatch = createDispatcher(rpcSchemas, handlers);
 

@@ -10,7 +10,7 @@ import {
 } from '@ternix/core/items';
 import { publicKeySchema, uuidSchema, vaultRoleSchema } from '@ternix/core/protocol';
 import type { RpcMethodName, RpcMethods } from '../../shared/ipc.js';
-import type { ItemDraft } from '../../shared/types.js';
+import type { ItemDraft, ItemDraftInput } from '../../shared/types.js';
 import { settingsPatchSchema } from '../app/settings.js';
 
 /**
@@ -46,6 +46,25 @@ export const itemDraftSchema: ZodType<ItemDraft, ZodTypeDef, unknown> = z.discri
     knownHostPayloadSchema.omit({ updated_at: true }),
   ],
 );
+
+/**
+ * What `items.put` accepts: a draft whose secret fields may also be absent (keep the stored
+ * value) or null (clear it); see `ItemDraftInput`. Main merges and then checks the result
+ * against `itemDraftSchema`. `known_host` passes here and is refused by the handler.
+ */
+const secretInput = z.string().nullable().optional();
+export const itemDraftInputSchema: ZodType<ItemDraftInput, ZodTypeDef, unknown> =
+  z.discriminatedUnion('type', [
+    groupPayloadSchema.omit({ updated_at: true }),
+    hostPayloadSchema.omit({ updated_at: true }).extend({ password: secretInput }),
+    identityPayloadSchema.omit({ updated_at: true }).extend({ password: secretInput }),
+    sshKeyPayloadSchema
+      .omit({ updated_at: true })
+      .extend({ private_key: secretInput, passphrase: secretInput }),
+    snippetPayloadSchema.omit({ updated_at: true }),
+    portForwardPayloadSchema.omit({ updated_at: true }),
+    knownHostPayloadSchema.omit({ updated_at: true }),
+  ]);
 
 type Schemas = {
   [K in RpcMethodName]: ZodType<RpcMethods[K]['in'], ZodTypeDef, unknown>;
@@ -117,7 +136,8 @@ export const rpcSchemas: Schemas = {
   'vaults.rotate': obj({ vaultId: id }),
 
   'items.all': none,
-  'items.put': obj({ vaultId: id, itemId: id.optional(), draft: itemDraftSchema }),
+  'items.reveal': obj({ vaultId: id, itemId: id }),
+  'items.put': obj({ vaultId: id, itemId: id.optional(), draft: itemDraftInputSchema }),
   'items.delete': obj({ vaultId: id, itemId: id }),
 
   'ssh.list': none,
@@ -132,7 +152,6 @@ export const rpcSchemas: Schemas = {
   'ssh.resize': obj({ id, ...terminalSize }),
   'ssh.reconnect': obj({ id, ...terminalSize }),
   'ssh.close': obj({ id }),
-  'ssh.answerHostKey': obj({ promptId: id, decision: z.enum(['trust', 'replace', 'reject']) }),
   'ssh.answerKeyboard': obj({
     promptId: id,
     answers: z.array(text(4096)).max(32).nullable(),

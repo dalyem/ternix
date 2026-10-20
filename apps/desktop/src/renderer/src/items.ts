@@ -1,11 +1,11 @@
-import type { ItemPayload } from '@ternix/core/items';
-import type { VaultDto } from '../../shared/types.js';
+import type { ListedPayload, VaultDto } from '../../shared/types.js';
 import type { ItemView } from './store.js';
 
-export type PayloadOf<T extends ItemPayload['type']> = Extract<ItemPayload, { type: T }>;
-export type ItemOf<T extends ItemPayload['type']> = ItemView & { payload: PayloadOf<T> };
+/** An item payload as the renderer has it: secret fields replaced by `has_*` flags. */
+export type PayloadOf<T extends ListedPayload['type']> = Extract<ListedPayload, { type: T }>;
+export type ItemOf<T extends ListedPayload['type']> = ItemView & { payload: PayloadOf<T> };
 
-export function itemsOfType<T extends ItemPayload['type']>(
+export function itemsOfType<T extends ListedPayload['type']>(
   items: readonly ItemView[],
   type: T,
 ): ItemOf<T>[] {
@@ -17,7 +17,7 @@ export function byLabel<T extends ItemView>(a: T, b: T): number {
   return labelOf(a.payload).localeCompare(labelOf(b.payload)) || a.id.localeCompare(b.id);
 }
 
-export function labelOf(payload: ItemPayload): string {
+export function labelOf(payload: ListedPayload): string {
   return payload.type === 'known_host' ? `${payload.host}:${payload.port}` : payload.label;
 }
 

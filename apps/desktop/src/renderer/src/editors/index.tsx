@@ -5,7 +5,17 @@ import { groupDefaultPort } from '../../../shared/groups.js';
 import type { PayloadOf } from '../items.js';
 import { type EditorTarget, useStore } from '../store.js';
 import { Button, Checkbox, Select, TextArea, TextField, Notice } from '../ui.js';
-import { EditorFrame, ItemSelect, optional, optionalId, parsePort, parseTags } from './common.js';
+import {
+  EditorFrame,
+  ItemSelect,
+  optional,
+  optionalId,
+  parsePort,
+  parseTags,
+  SecretInput,
+  secretDraft,
+  useSecret,
+} from './common.js';
 
 const COLORS = ['', '#e5484d', '#f5a524', '#46a758', '#3e63dd', '#8e4ec6', '#12a594'];
 
@@ -51,8 +61,7 @@ function HostEditor({ target }: { target: EditorTarget }) {
   const [portTouched, setPortTouched] = useState(false);
   const [portFromGroup, setPortFromGroup] = useState(h === undefined && port !== '22');
   const [username, setUsername] = useState(h?.username ?? '');
-  const [password, setPassword] = useState(h?.password ?? '');
-  const [showPassword, setShowPassword] = useState(false);
+  const password = useSecret(target, 'password');
   const [identityId, setIdentityId] = useState(h?.identity_id ?? '');
   const [keyId, setKeyId] = useState(h?.key_id ?? '');
   const [jumpId, setJumpId] = useState(h?.jump_host_id ?? '');
@@ -87,7 +96,7 @@ function HostEditor({ target }: { target: EditorTarget }) {
         address: address.trim(),
         port: parsePort(port) ?? 22,
         ...(optional(username) ? { username: username.trim() } : {}),
-        ...(password !== '' ? { password } : {}),
+        ...secretDraft('password', password.draftValue()),
         ...(optionalId(identityId) ? { identity_id: identityId } : {}),
         ...(optionalId(keyId) ? { key_id: keyId } : {}),
         ...(optionalId(groupId) ? { group_id: groupId } : {}),
@@ -138,22 +147,7 @@ function HostEditor({ target }: { target: EditorTarget }) {
               hint="Leave empty to use the identity's or the group's."
               spellCheck={false}
             />
-            <div className="field">
-              <label htmlFor="host-password">Password</label>
-              <div className="input-row">
-                <input
-                  id="host-password"
-                  type={showPassword ? 'text' : 'password'}
-                  value={password}
-                  disabled={readOnly}
-                  autoComplete="off"
-                  onChange={(e) => setPassword(e.target.value)}
-                />
-                <Button variant="ghost" onClick={() => setShowPassword((v) => !v)}>
-                  {showPassword ? 'Hide' : 'Show'}
-                </Button>
-              </div>
-            </div>
+            <SecretInput label="Password" secret={password} readOnly={readOnly} />
           </div>
           <div className="grid-2">
             <ItemSelect
@@ -360,7 +354,7 @@ function IdentityEditor({ target }: { target: EditorTarget }) {
   const i = existing(target, 'identity');
   const [label, setLabel] = useState(i?.label ?? '');
   const [username, setUsername] = useState(i?.username ?? '');
-  const [password, setPassword] = useState(i?.password ?? '');
+  const password = useSecret(target, 'password');
   const [keyId, setKeyId] = useState(i?.key_id ?? '');
   return (
     <EditorFrame
@@ -373,7 +367,7 @@ function IdentityEditor({ target }: { target: EditorTarget }) {
         type: 'identity',
         label: label.trim(),
         username: username.trim(),
-        ...(password !== '' ? { password } : {}),
+        ...secretDraft('password', password.draftValue()),
         ...(optionalId(keyId) ? { key_id: keyId } : {}),
       })}
     >
@@ -393,14 +387,7 @@ function IdentityEditor({ target }: { target: EditorTarget }) {
             disabled={readOnly}
             spellCheck={false}
           />
-          <TextField
-            label="Password"
-            type="password"
-            value={password}
-            onChange={setPassword}
-            disabled={readOnly}
-            autoComplete="off"
-          />
+          <SecretInput label="Password" secret={password} readOnly={readOnly} />
           <ItemSelect
             label="SSH key"
             type="ssh_key"
@@ -418,18 +405,20 @@ function IdentityEditor({ target }: { target: EditorTarget }) {
 function KeyEditor({ target }: { target: EditorTarget }) {
   const k = existing(target, 'ssh_key');
   const [label, setLabel] = useState(k?.label ?? '');
-  const [privateKey, setPrivateKey] = useState(k?.private_key ?? '');
-  const [passphrase, setPassphrase] = useState(k?.passphrase ?? '');
+  const privateKey = useSecret(target, 'private_key');
+  const passphrase = useSecret(target, 'passphrase');
   const [publicKey, setPublicKey] = useState(k?.public_key ?? '');
   const [importError, setImportError] = useState<string | null>(null);
-  const looksLikeKey = /-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(privateKey);
+  const looksLikeKey = /-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(privateKey.value);
+  // A stored key the user did not touch is kept; a new or replaced one must be pasted.
+  const hasKey = privateKey.touched || !privateKey.stored ? privateKey.value.trim() !== '' : true;
 
   async function importFile() {
     setImportError(null);
     try {
       const file = await call('dialog.importKey');
       if (!file) return;
-      setPrivateKey(file.content.trim() + '\n');
+      privateKey.set(file.content.trim() + '\n');
       if (label.trim() === '') setLabel(file.fileName.replace(/\.(pem|key)$/i, ''));
     } catch (err) {
       setImportError(err instanceof Error ? err.message : String(err));
@@ -441,17 +430,16 @@ function KeyEditor({ target }: { target: EditorTarget }) {
       target={target}
       title={k ? 'Edit SSH key' : 'New SSH key'}
       validate={() =>
-        label.trim() === ''
-          ? 'Enter a label'
-          : privateKey.trim() === ''
-            ? 'Paste or import a private key'
-            : null
+        label.trim() === '' ? 'Enter a label' : !hasKey ? 'Paste or import a private key' : null
       }
       build={() => ({
         type: 'ssh_key',
         label: label.trim(),
-        private_key: privateKey.trim() + '\n',
-        ...(passphrase !== '' ? { passphrase } : {}),
+        ...secretDraft(
+          'private_key',
+          privateKey.draftValue((v) => v.trim() + '\n'),
+        ),
+        ...secretDraft('passphrase', passphrase.draftValue()),
         ...(optional(publicKey) ? { public_key: publicKey.trim() } : {}),
       })}
     >
@@ -464,16 +452,15 @@ function KeyEditor({ target }: { target: EditorTarget }) {
             disabled={readOnly}
             autoFocus
           />
-          <TextArea
+          <SecretInput
             label="Private key"
-            value={privateKey}
-            onChange={setPrivateKey}
-            disabled={readOnly}
-            mono
-            rows={8}
+            secret={privateKey}
+            readOnly={readOnly}
+            multiline
+            optional={false}
             placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"
             hint={
-              privateKey !== '' && !looksLikeKey ? (
+              privateKey.value !== '' && !looksLikeKey ? (
                 <span className="warn">This does not look like a PEM/OpenSSH private key.</span>
               ) : undefined
             }
@@ -484,13 +471,10 @@ function KeyEditor({ target }: { target: EditorTarget }) {
               {importError ? <span className="error-text">{importError}</span> : null}
             </div>
           ) : null}
-          <TextField
+          <SecretInput
             label="Passphrase"
-            type="password"
-            value={passphrase}
-            onChange={setPassphrase}
-            disabled={readOnly}
-            autoComplete="off"
+            secret={passphrase}
+            readOnly={readOnly}
             hint="Only if the key is encrypted."
           />
           <TextField

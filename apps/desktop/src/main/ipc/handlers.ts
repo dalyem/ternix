@@ -1,12 +1,17 @@
+import { fingerprint, fromB64 } from '@ternix/core/crypto';
 import type { AppInfo, ImportedFile } from '../../shared/app.js';
 import type { ClientSnapshot } from '../../shared/ipc.js';
-import type { VaultItemsDto } from '../../shared/types.js';
+import type { ListedVaultItemsDto } from '../../shared/types.js';
 import type { TernixClient } from '../client/index.js';
 import { isTailnetHost } from '../client/serverUrl.js';
+import { AppError } from '../app/errors.js';
 import type { SafeStorageSecretStore } from '../app/secretStore.js';
 import type { SettingsStore } from '../app/settings.js';
+import { confirmMember, type MemberAction, type MessageBox } from '../app/trust.js';
 import type { SshManager } from '../ssh/manager.js';
 import type { Handlers } from './dispatch.js';
+import { itemDraftSchema } from './schemas.js';
+import { mergeSecrets, redactItems, redactWrite, secretsOf } from './secrets.js';
 
 export interface HandlerDeps {
   client: TernixClient;
@@ -20,6 +25,19 @@ export interface HandlerDeps {
   /** Confirm with the user, then open in the default browser. */
   openLink(url: string): Promise<void>;
   onSettingsChanged(): void;
+  /** Native message box on the app window, for the trust decisions in `app/trust.ts`. */
+  messageBox: MessageBox;
+}
+
+/** The user declined a native confirmation: nothing was changed. */
+const declined = () => new AppError('cancelled', 'Not confirmed; nothing was changed.');
+
+function fingerprintOf(publicKey: string): string {
+  try {
+    return fingerprint(fromB64(publicKey));
+  } catch {
+    throw new AppError('invalid_input', 'That is not a public key.');
+  }
 }
 
 /** The method table: what each IPC request does. Arguments are already validated. */
@@ -30,14 +48,35 @@ export function createHandlers(deps: HandlerDeps): Handlers {
     connection: client.connection,
     account: client.account,
   });
-  const allItems = (): VaultItemsDto[] =>
+  const allItems = (): ListedVaultItemsDto[] =>
     client.listVaults().map((vault) => {
       try {
-        return client.listItems(vault.id);
+        return redactItems(client.listItems(vault.id));
       } catch {
         return { vaultId: vault.id, items: [], unreadable: [] };
       }
     });
+
+  // Email and name of every user the server reported to this account (lookups, member and user
+  // lists): what the trust dialogs show, instead of anything the renderer says about the user.
+  const people = new Map<string, { email: string; name: string }>();
+  const personKey = (userId: string) => `${client.account?.user.id ?? ''}:${userId}`;
+  const remember = <T extends { email: string; name: string }>(userId: string, who: T): T => {
+    people.set(personKey(userId), { email: who.email, name: who.name });
+    return who;
+  };
+  const askAboutMember = async (userId: string, publicKey: string, action: MemberAction) => {
+    const who = people.get(personKey(userId));
+    if (!who) {
+      throw new AppError('invalid_input', 'Look the person up again before trusting their key.');
+    }
+    const fp = fingerprintOf(publicKey);
+    if (!(await confirmMember(deps.messageBox, { ...who, fingerprint: fp }, action))) {
+      throw declined();
+    }
+  };
+  /** Fingerprint of the key this device pinned for `userId`, when a member list showed it. */
+  const pinnedFingerprints = new Map<string, string>();
 
   return {
     'app.info': async () => deps.appInfo(),
@@ -53,6 +92,11 @@ export function createHandlers(deps: HandlerDeps): Handlers {
 
     'client.snapshot': async () => snapshot(),
     'server.probe': async ({ address }) => {
+      // An unlocked (or locked) renderer must not reach arbitrary URLs: the path alone could
+      // carry vault data out. The server address is only chosen while signed out.
+      if (client.state !== 'loggedOut' && client.state !== 'expired') {
+        throw new AppError('forbidden', 'Sign out before connecting to another server.');
+      }
       const info = await client.probeServer(address);
       return { ...info, tailnet: isTailnetHost(new URL(info.serverUrl).hostname) };
     },
@@ -82,7 +126,8 @@ export function createHandlers(deps: HandlerDeps): Handlers {
     'admin.invites.list': () => client.listInvites(),
     'admin.invites.create': (input) => client.createInvite(input),
     'admin.invites.delete': ({ code }) => client.deleteInvite(code),
-    'admin.users.list': () => client.listUsers(),
+    'admin.users.list': async () =>
+      (await client.listUsers()).map((user) => remember(user.id, user)),
     'admin.users.delete': ({ userId }) => client.deleteUser(userId),
 
     'vaults.list': async () => client.listVaults(),
@@ -90,13 +135,44 @@ export function createHandlers(deps: HandlerDeps): Handlers {
     'vaults.rename': ({ vaultId, name }) => client.renameVault(vaultId, name),
     'vaults.delete': ({ vaultId }) => client.deleteVault(vaultId),
     'vaults.sync': () => client.sync(),
-    'vaults.members': ({ vaultId }) => client.listMembers(vaultId),
-    'vaults.lookupUser': ({ email }) => client.lookupUser(email),
-    'vaults.addMember': ({ vaultId, userId, role, expectedPublicKey }) =>
-      client.addMember(vaultId, userId, role, expectedPublicKey),
-    'vaults.markMemberVerified': ({ userId, publicKey }) =>
-      client.markMemberVerified(userId, publicKey),
-    'vaults.acceptMemberKey': ({ userId, publicKey }) => client.acceptMemberKey(userId, publicKey),
+    'vaults.members': async ({ vaultId }) => {
+      const members = await client.listMembers(vaultId);
+      for (const m of members) {
+        remember(m.userId, m);
+        pinnedFingerprints.set(personKey(m.userId), m.pinnedFingerprint);
+      }
+      return members;
+    },
+    'vaults.lookupUser': async ({ email }) => {
+      const found = await client.lookupUser(email);
+      if (found.pinnedFingerprint !== null) {
+        pinnedFingerprints.set(personKey(found.id), found.pinnedFingerprint);
+      }
+      return remember(found.id, found);
+    },
+    'vaults.addMember': async ({ vaultId, userId, role, expectedPublicKey }) => {
+      const vault = client.getVault(vaultId);
+      await askAboutMember(userId, expectedPublicKey, {
+        kind: 'add',
+        vaultName: vault.name ?? 'this vault',
+        role,
+      });
+      return client.addMember(vaultId, userId, role, expectedPublicKey);
+    },
+    'vaults.markMemberVerified': async ({ userId, publicKey }) => {
+      await askAboutMember(userId, publicKey, { kind: 'verify' });
+      return client.markMemberVerified(userId, publicKey);
+    },
+    'vaults.acceptMemberKey': async ({ userId, publicKey }) => {
+      const pinned = pinnedFingerprints.get(personKey(userId));
+      await askAboutMember(userId, publicKey, {
+        kind: 'accept',
+        ...(pinned !== undefined && pinned !== fingerprintOf(publicKey)
+          ? { pinnedFingerprint: pinned }
+          : {}),
+      });
+      return client.acceptMemberKey(userId, publicKey);
+    },
     'vaults.changeRole': ({ vaultId, userId, role }) =>
       client.changeMemberRole(vaultId, userId, role),
     'vaults.removeMember': ({ vaultId, userId }) => client.removeMember(vaultId, userId),
@@ -104,8 +180,30 @@ export function createHandlers(deps: HandlerDeps): Handlers {
     'vaults.rotate': ({ vaultId }) => client.rotateVault(vaultId),
 
     'items.all': async () => allItems(),
-    'items.put': ({ vaultId, itemId, draft }) => client.putItem(vaultId, itemId, draft),
-    'items.delete': ({ vaultId, itemId }) => client.deleteItem(vaultId, itemId),
+    'items.reveal': async ({ vaultId, itemId }) => {
+      const item = client.getItem(vaultId, itemId);
+      if (!item) throw new AppError('not_found', 'That item no longer exists.');
+      return secretsOf(item.payload);
+    },
+    'items.put': async ({ vaultId, itemId, draft }) => {
+      const stored = itemId ? client.getItem(vaultId, itemId) : null;
+      // Known hosts are written by main only, after the user accepted the key in its dialog.
+      if (draft.type === 'known_host' || stored?.payload.type === 'known_host') {
+        throw new AppError('forbidden', 'Known hosts are saved when you accept a host key.');
+      }
+      const parsed = itemDraftSchema.safeParse(mergeSecrets(draft, stored?.payload));
+      if (!parsed.success) {
+        const issue = parsed.error.issues[0];
+        const where = issue && issue.path.length > 0 ? ` (${issue.path.join('.')})` : '';
+        throw new AppError(
+          'invalid_input',
+          `Invalid item${where}: ${issue?.message ?? 'bad input'}`,
+        );
+      }
+      return redactWrite(await client.putItem(vaultId, itemId, parsed.data));
+    },
+    'items.delete': async ({ vaultId, itemId }) =>
+      redactWrite(await client.deleteItem(vaultId, itemId)),
 
     'ssh.list': async () => ssh.list(),
     'ssh.open': async ({ hostId, cols, rows }) => ssh.open(hostId, cols, rows),
@@ -116,7 +214,6 @@ export function createHandlers(deps: HandlerDeps): Handlers {
     'ssh.resize': async ({ id, cols, rows }) => ssh.resize(id, cols, rows),
     'ssh.reconnect': async ({ id, cols, rows }) => ssh.reconnect(id, cols, rows),
     'ssh.close': ({ id }) => ssh.close(id),
-    'ssh.answerHostKey': async ({ promptId, decision }) => ssh.answerHostKey(promptId, decision),
     'ssh.answerKeyboard': async ({ promptId, answers }) => ssh.answerKeyboard(promptId, answers),
     'ssh.forward.start': ({ id, forwardId }) => ssh.startForward(id, forwardId),
     'ssh.forward.stop': ({ id, forwardId }) => ssh.stopForward(id, forwardId),

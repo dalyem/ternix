@@ -1,10 +1,9 @@
 import { randomUUID } from 'node:crypto';
-import { hostPayloadSchema, type ItemPayload } from '@ternix/core/items';
+import { hostPayloadSchema, type ItemPayload, type KnownHostPayload } from '@ternix/core/items';
 import {
   type CloseReason,
   type HostKeyInfo,
   type KeyboardInteractiveRequest,
-  knownHostItems,
   knownHostPayload,
   type PortForwardSpec,
   resolveConnection,
@@ -20,13 +19,13 @@ import type {
   AppEvents,
   ForwardDto,
   HostKeyDecision,
-  HostKeyPromptDto,
   KeyboardPromptDto,
   TerminalClosedDto,
   TerminalDto,
 } from '../../shared/app.js';
 import type { ItemDraft } from '../../shared/types.js';
 import { AppError } from '../app/errors.js';
+import type { HostKeyFacts } from '../app/trust.js';
 import type { ItemSnapshot } from './items.js';
 import { parseQuickTarget } from './quick.js';
 
@@ -39,8 +38,31 @@ export interface SshManagerDeps {
   sendTerminal(id: string, data: Uint8Array): boolean;
   /** Whether a window exists to answer prompts. */
   hasWindow(): boolean;
+  /**
+   * Ask the user about a host key that is not trusted yet, in a dialog main owns (never the
+   * renderer). Aborting `signal` closes the dialog; the answer is then ignored.
+   */
+  confirmHostKey(facts: HostKeyFacts, signal: AbortSignal): Promise<HostKeyDecision>;
   agentPath: string | undefined;
   createSession?: (options: SessionOptions) => SshSession;
+  /** How long a keyboard-interactive prompt waits before it is denied. Default 5 minutes. */
+  keyboardTimeoutMs?: number;
+}
+
+/** A stored `known_host` item for one of the hops of a connection. */
+interface KnownHostRecord {
+  vaultId: string;
+  itemId: string;
+  payload: KnownHostPayload;
+}
+
+/**
+ * What the hooks of one connection attempt may use after `resolveConnection`: the known hosts
+ * of its hops and where to save a new one. Never the whole decrypted vault.
+ */
+interface TrustContext {
+  knownHosts: KnownHostRecord[];
+  personalVaultId: string | null;
 }
 
 type Source =
@@ -71,16 +93,26 @@ interface Terminal {
   rows: number;
 }
 
+/** A question waiting for the user, bound to the connection attempt that asked it. */
 type Pending =
-  | { kind: 'hostkey'; terminalId: string; resolve: (decision: HostKeyDecision) => void }
+  | {
+      kind: 'hostkey';
+      terminalId: string;
+      attempt: number;
+      /** Closes the native dialog; the attempt sees `reject`. */
+      cancel: () => void;
+    }
   | {
       kind: 'keyboard';
       terminalId: string;
+      attempt: number;
       count: number;
+      timer: NodeJS.Timeout;
       resolve: (answers: string[] | null) => void;
     };
 
 const OUTPUT_FLUSH_MS = 8;
+const KEYBOARD_TIMEOUT_MS = 5 * 60_000;
 const OUTPUT_FLUSH_BYTES = 64 * 1024;
 
 const errMessage = (err: unknown): string => (err instanceof Error ? err.message : String(err));
@@ -217,13 +249,13 @@ export class SshManager {
 
   // Prompts
 
-  answerHostKey(promptId: string, decision: HostKeyDecision): void {
-    const pending = this.takePrompt(promptId, 'hostkey');
-    pending.resolve(decision);
-  }
-
   answerKeyboard(promptId: string, answers: string[] | null): void {
-    const pending = this.takePrompt(promptId, 'keyboard');
+    const pending = this.prompts.get(promptId);
+    if (!pending || pending.kind !== 'keyboard') {
+      throw new AppError('invalid_input', 'That prompt is no longer waiting for an answer');
+    }
+    this.prompts.delete(promptId);
+    clearTimeout(pending.timer);
     if (answers !== null && answers.length !== pending.count) {
       pending.resolve(null);
       throw new AppError('invalid_input', 'The number of answers does not match the prompts');
@@ -231,43 +263,35 @@ export class SshManager {
     pending.resolve(answers);
   }
 
-  private takePrompt<K extends Pending['kind']>(
-    promptId: string,
-    kind: K,
-  ): Extract<Pending, { kind: K }> {
-    const pending = this.prompts.get(promptId);
-    if (!pending || pending.kind !== kind) {
-      throw new AppError('invalid_input', 'That prompt is no longer waiting for an answer');
-    }
-    this.prompts.delete(promptId);
-    return pending as Extract<Pending, { kind: K }>;
-  }
-
   /** Deny every unanswered prompt (the vault locked, the window closed, the user logged out). */
   cancelAllPrompts(): void {
     for (const id of [...this.prompts.keys()]) this.cancelPrompt(id);
   }
 
+  /** Deny the prompts of a terminal's attempts: it failed, closed, or connects again. */
   private cancelPrompts(terminalId: string): void {
-    for (const [id, p] of this.prompts) if (p.terminalId === terminalId) this.cancelPrompt(id);
+    for (const [id, p] of [...this.prompts]) if (p.terminalId === terminalId) this.cancelPrompt(id);
   }
 
   private cancelPrompt(promptId: string): void {
     const pending = this.prompts.get(promptId);
     if (!pending) return;
     this.prompts.delete(promptId);
-    if (pending.kind === 'hostkey') pending.resolve('reject');
-    else pending.resolve(null);
+    if (pending.kind === 'hostkey') {
+      pending.cancel();
+      return;
+    }
+    clearTimeout(pending.timer);
+    pending.resolve(null);
     this.deps.emit('ssh.prompt-cancelled', { promptId });
   }
 
-  private askHostKey(t: Terminal, info: HostKeyInfo): Promise<HostKeyDecision> {
+  /** Main's own dialog decides; the renderer only sees the tab's `verifying-host-key` state. */
+  private askHostKey(t: Terminal, attempt: number, info: HostKeyInfo): Promise<HostKeyDecision> {
     if (info.status === 'trusted' || !this.deps.hasWindow()) return Promise.resolve('reject');
     const promptId = randomUUID();
-    const prompt: HostKeyPromptDto = {
-      kind: 'hostkey',
-      promptId,
-      sessionId: t.id,
+    const abort = new AbortController();
+    const facts: HostKeyFacts = {
       hopLabel: info.hop.label,
       hopIndex: info.hop.index,
       hopTotal: info.hop.total,
@@ -281,12 +305,31 @@ export class SshManager {
         : {}),
     };
     return new Promise((resolve) => {
-      this.prompts.set(promptId, { kind: 'hostkey', terminalId: t.id, resolve });
-      this.deps.emit('ssh.prompt', prompt);
+      let settled = false;
+      const settle = (decision: HostKeyDecision) => {
+        if (settled) return;
+        settled = true;
+        this.prompts.delete(promptId);
+        resolve(abort.signal.aborted ? 'reject' : decision);
+      };
+      this.prompts.set(promptId, {
+        kind: 'hostkey',
+        terminalId: t.id,
+        attempt,
+        cancel: () => {
+          abort.abort();
+          settle('reject');
+        },
+      });
+      this.deps.confirmHostKey(facts, abort.signal).then(settle, () => settle('reject'));
     });
   }
 
-  private askKeyboard(t: Terminal, request: KeyboardInteractiveRequest): Promise<string[]> {
+  private askKeyboard(
+    t: Terminal,
+    attempt: number,
+    request: KeyboardInteractiveRequest,
+  ): Promise<string[]> {
     if (!this.deps.hasWindow()) return Promise.reject(new Error('No window to ask'));
     const promptId = randomUUID();
     const prompt: KeyboardPromptDto = {
@@ -299,10 +342,18 @@ export class SshManager {
       prompts: request.prompts.map((p) => ({ prompt: p.prompt, echo: p.echo })),
     };
     return new Promise((resolve, reject) => {
+      // Nobody answering is a no: the hop's own timers are paused while the user is asked.
+      const timer = setTimeout(
+        () => this.cancelPrompt(promptId),
+        this.deps.keyboardTimeoutMs ?? KEYBOARD_TIMEOUT_MS,
+      );
+      timer.unref?.();
       this.prompts.set(promptId, {
         kind: 'keyboard',
         terminalId: t.id,
+        attempt,
         count: request.prompts.length,
+        timer,
         resolve: (answers) => (answers ? resolve(answers) : reject(new Error('Cancelled'))),
       });
       this.deps.emit('ssh.prompt', prompt);
@@ -313,7 +364,7 @@ export class SshManager {
   private async rememberHostKey(
     info: HostKeyInfo,
     decision: HostKeyDecision,
-    snapshot: ItemSnapshot,
+    trust: TrustContext,
   ): Promise<void> {
     const { updated_at: _ignored, ...draft } = knownHostPayload({
       host: info.host,
@@ -323,10 +374,9 @@ export class SshManager {
     });
     if (info.status === 'mismatch' && decision === 'replace' && info.stored) {
       const stored = info.stored;
-      for (const record of snapshot.records.values()) {
+      for (const record of trust.knownHosts) {
         const p = record.payload;
         if (
-          p.type === 'known_host' &&
           p.host.toLowerCase() === info.host.toLowerCase() &&
           p.port === info.port &&
           p.key_type === stored.keyType &&
@@ -341,8 +391,8 @@ export class SshManager {
         }
       }
     }
-    if (!snapshot.personalVaultId) throw new Error('No personal vault to save the host key in');
-    await this.deps.putItem(snapshot.personalVaultId, undefined, draft as ItemDraft);
+    if (!trust.personalVaultId) throw new Error('No personal vault to save the host key in');
+    await this.deps.putItem(trust.personalVaultId, undefined, draft as ItemDraft);
   }
 
   // Connection
@@ -363,11 +413,11 @@ export class SshManager {
     void previous?.close();
     const current = () => t.attempt === attempt && this.terminals.has(t.id);
 
-    let snapshot: ItemSnapshot;
-    let settings: ResolvedConnection;
+    // Credentials stay in `settings` only until the session has signed in.
+    let settings: ResolvedConnection | undefined;
+    let trust: TrustContext;
     try {
-      snapshot = this.deps.snapshot();
-      settings = this.resolve(t, snapshot);
+      ({ settings, trust } = this.prepare(t));
     } catch (err) {
       if (current()) this.fail(t, err);
       return;
@@ -393,7 +443,7 @@ export class SshManager {
     );
 
     const options: SessionOptions = {
-      knownHosts: knownHostItems(snapshot.lookup.values()),
+      knownHosts: trust.knownHosts.map((r) => r.payload),
       ...(this.deps.agentPath ? { agentPath: this.deps.agentPath } : {}),
     };
     const session = (this.deps.createSession ?? ((o) => new SshSession(o)))(options);
@@ -402,6 +452,7 @@ export class SshManager {
       if (!current() || t.session !== session) return;
       if (status.state === 'idle') return;
       if (status.state === 'closed') {
+        this.cancelPrompts(t.id);
         t.state = 'closed';
         t.hop = undefined;
         t.closed ??= toClosed(status.reason);
@@ -427,15 +478,17 @@ export class SshManager {
     });
     this.publish(t);
 
+    const live = () => current() && t.session === session;
     const hooks: SessionHooks = {
       verifyHostKey: async (info) => {
         if (info.status === 'trusted') return true;
-        const decision = await this.askHostKey(t, info);
-        if (decision === 'reject') return false;
+        const decision = await this.askHostKey(t, attempt, info);
+        // The tab may have closed or reconnected while the dialog was open.
+        if (!live() || decision === 'reject') return false;
         // A changed key is only accepted by the explicit "replace" answer.
         if (info.status === 'mismatch' && decision !== 'replace') return false;
         try {
-          await this.rememberHostKey(info, decision, snapshot);
+          await this.rememberHostKey(info, decision, trust);
         } catch (err) {
           this.deps.emit('ssh.notice', {
             sessionId: t.id,
@@ -443,20 +496,26 @@ export class SshManager {
             message: `The host key was accepted but could not be saved (${errMessage(err)}); you will be asked again next time.`,
           });
         }
-        return true;
+        return live();
       },
-      keyboardInteractive: (request) => this.askKeyboard(t, request),
+      keyboardInteractive: (request) => this.askKeyboard(t, attempt, request),
       onBanner: (message) => this.sendBanner(t, message),
       onWarning: (message) =>
         this.deps.emit('ssh.notice', { sessionId: t.id, level: 'warning', message }),
     };
 
     try {
-      await session.connect(settings, hooks);
-      if (!current() || t.session !== session) return;
+      const signingIn = session.connect(settings, hooks);
+      settings = undefined;
+      await signingIn;
+      if (!live()) {
+        void session.close();
+        return;
+      }
       const shell = await session.openShell({ cols: t.cols, rows: t.rows });
-      if (!current() || t.session !== session) {
+      if (!live()) {
         shell.close();
+        void session.close();
         return;
       }
       t.shell = shell;
@@ -475,8 +534,36 @@ export class SshManager {
       this.pump(t);
       this.publish(t);
     } catch (err) {
-      if (current() && t.session === session) this.fail(t, err);
+      // Signed in but no shell (or any other late failure): end this attempt's connection,
+      // its prompts and its output before the tab reads closed.
+      void session.close();
+      if (!live()) return;
+      this.cancelPrompts(t.id);
+      this.flushOutput(t);
+      this.dropOutput(t);
+      this.fail(t, err);
     }
+  }
+
+  /**
+   * Resolve the connection from a snapshot of every decrypted item, and keep only what the
+   * attempt needs later: the known hosts of its hops and the personal vault. The snapshot
+   * itself is dropped when this returns.
+   */
+  private prepare(t: Terminal): { settings: ResolvedConnection; trust: TrustContext } {
+    const snapshot = this.deps.snapshot();
+    const settings = this.resolve(t, snapshot);
+    const hops = new Set(
+      [...settings.jumpChain, settings].map((h) => `${h.address.toLowerCase()}:${h.port}`),
+    );
+    const knownHosts: KnownHostRecord[] = [];
+    for (const record of snapshot.records.values()) {
+      const p = record.payload;
+      if (p.type === 'known_host' && hops.has(`${p.host.toLowerCase()}:${p.port}`)) {
+        knownHosts.push({ vaultId: record.vaultId, itemId: record.itemId, payload: p });
+      }
+    }
+    return { settings, trust: { knownHosts, personalVaultId: snapshot.personalVaultId } };
   }
 
   private resolve(t: Terminal, snapshot: ItemSnapshot): ResolvedConnection {
@@ -500,6 +587,7 @@ export class SshManager {
   }
 
   private fail(t: Terminal, err: unknown): void {
+    this.cancelPrompts(t.id);
     const code = (err as { code?: unknown } | null)?.code;
     t.state = 'closed';
     t.hop = undefined;
