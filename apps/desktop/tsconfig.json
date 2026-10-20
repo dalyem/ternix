@@ -2,7 +2,14 @@
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
     "noEmit": true,
-    "types": ["node"]
+    "types": ["node", "electron-vite/node"]
   },
-  "include": ["src", "test", "vitest.config.ts"]
+  "include": [
+    "src/main",
+    "src/preload",
+    "src/shared",
+    "test",
+    "vitest.config.ts",
+    "electron.vite.config.ts"
+  ]
 }

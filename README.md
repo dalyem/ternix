@@ -15,7 +15,7 @@ with the schemas in `packages/core`.
 | `packages/core` | `@ternix/core`: zod protocol schemas, item payloads, libsodium crypto |
 | `packages/ssh`  | `@ternix/ssh`: resolves vault items into live `ssh2` sessions         |
 | `apps/server`   | Sync server (Node), imports `@ternix/core`                            |
-| `apps/desktop`  | Electron desktop client, imports `@ternix/core`                       |
+| `apps/desktop`  | Electron desktop app (macOS, Windows): UI, sync client, SSH terminals |
 | `docs/`         | Protocol reference                                                    |
 
 ## Using `@ternix/core`

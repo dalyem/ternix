@@ -1,0 +1,646 @@
+import type { ItemType } from '@ternix/core/items';
+import { useMemo, useState } from 'react';
+import { call } from '../api.js';
+import type { PayloadOf } from '../items.js';
+import { type EditorTarget, useStore } from '../store.js';
+import { Button, Checkbox, Select, TextArea, TextField, Notice } from '../ui.js';
+import { EditorFrame, ItemSelect, optional, optionalId, parsePort, parseTags } from './common.js';
+
+const COLORS = ['', '#e5484d', '#f5a524', '#46a758', '#3e63dd', '#8e4ec6', '#12a594'];
+
+/** The payload being edited, when it is of the expected type. */
+function existing<T extends ItemType>(target: EditorTarget, type: T): PayloadOf<T> | undefined {
+  const payload = target.item?.payload;
+  return payload?.type === type ? (payload as PayloadOf<T>) : undefined;
+}
+
+/** Opens the editor the store asks for. */
+export function ItemEditor() {
+  const target = useStore((s) => s.editor);
+  if (!target) return null;
+  // Remount for each target so form state never leaks between items.
+  const key = `${target.type}:${target.item?.id ?? 'new'}`;
+  switch (target.type) {
+    case 'host':
+      return <HostEditor key={key} target={target} />;
+    case 'group':
+      return <GroupEditor key={key} target={target} />;
+    case 'identity':
+      return <IdentityEditor key={key} target={target} />;
+    case 'ssh_key':
+      return <KeyEditor key={key} target={target} />;
+    case 'snippet':
+      return <SnippetEditor key={key} target={target} />;
+    case 'port_forward':
+      return <ForwardEditor key={key} target={target} />;
+    default:
+      return null;
+  }
+}
+
+function HostEditor({ target }: { target: EditorTarget }) {
+  const h = existing(target, 'host');
+  const [label, setLabel] = useState(h?.label ?? target.preset?.['label'] ?? '');
+  const [address, setAddress] = useState(h?.address ?? '');
+  const [port, setPort] = useState(String(h?.port ?? 22));
+  const [username, setUsername] = useState(h?.username ?? '');
+  const [password, setPassword] = useState(h?.password ?? '');
+  const [showPassword, setShowPassword] = useState(false);
+  const [identityId, setIdentityId] = useState(h?.identity_id ?? '');
+  const [keyId, setKeyId] = useState(h?.key_id ?? '');
+  const [groupId, setGroupId] = useState(h?.group_id ?? target.preset?.['group_id'] ?? '');
+  const [jumpId, setJumpId] = useState(h?.jump_host_id ?? '');
+  const [snippetId, setSnippetId] = useState(h?.startup_snippet_id ?? '');
+  const [keepalive, setKeepalive] = useState(
+    h?.keepalive_interval !== undefined ? String(h.keepalive_interval) : '',
+  );
+  const [agent, setAgent] = useState(h?.agent_forwarding ?? false);
+  const [color, setColor] = useState(h?.color ?? '');
+  const [tags, setTags] = useState((h?.tags ?? []).join(', '));
+  const [notes, setNotes] = useState(h?.notes ?? '');
+  const exclude = useMemo(() => new Set(target.item ? [target.item.id] : []), [target.item]);
+
+  return (
+    <EditorFrame
+      target={target}
+      title={h ? 'Edit host' : 'New host'}
+      validate={() =>
+        label.trim() === ''
+          ? 'Enter a label'
+          : address.trim() === ''
+            ? 'Enter an address'
+            : parsePort(port) === null
+              ? 'The port must be 1 to 65535'
+              : keepalive !== '' && !/^\d+$/.test(keepalive)
+                ? 'Keepalive must be a number of seconds'
+                : null
+      }
+      build={() => ({
+        type: 'host',
+        label: label.trim(),
+        address: address.trim(),
+        port: parsePort(port) ?? 22,
+        ...(optional(username) ? { username: username.trim() } : {}),
+        ...(password !== '' ? { password } : {}),
+        ...(optionalId(identityId) ? { identity_id: identityId } : {}),
+        ...(optionalId(keyId) ? { key_id: keyId } : {}),
+        ...(optionalId(groupId) ? { group_id: groupId } : {}),
+        ...(optionalId(jumpId) ? { jump_host_id: jumpId } : {}),
+        tags: parseTags(tags),
+        ...(optionalId(snippetId) ? { startup_snippet_id: snippetId } : {}),
+        ...(keepalive !== '' ? { keepalive_interval: Number(keepalive) } : {}),
+        agent_forwarding: agent,
+        ...(color ? { color } : {}),
+        ...(optional(notes) ? { notes } : {}),
+      })}
+    >
+      {({ vaultId, readOnly }) => (
+        <>
+          <TextField
+            label="Label"
+            value={label}
+            onChange={setLabel}
+            disabled={readOnly}
+            autoFocus
+          />
+          <div className="grid-2">
+            <TextField
+              label="Address"
+              value={address}
+              onChange={setAddress}
+              disabled={readOnly}
+              placeholder="hostname or IP"
+              spellCheck={false}
+            />
+            <TextField
+              label="Port"
+              value={port}
+              onChange={setPort}
+              disabled={readOnly}
+              inputMode="numeric"
+            />
+          </div>
+          <div className="grid-2">
+            <TextField
+              label="Username"
+              value={username}
+              onChange={setUsername}
+              disabled={readOnly}
+              hint="Leave empty to use the identity's or the group's."
+              spellCheck={false}
+            />
+            <div className="field">
+              <label htmlFor="host-password">Password</label>
+              <div className="input-row">
+                <input
+                  id="host-password"
+                  type={showPassword ? 'text' : 'password'}
+                  value={password}
+                  disabled={readOnly}
+                  autoComplete="off"
+                  onChange={(e) => setPassword(e.target.value)}
+                />
+                <Button variant="ghost" onClick={() => setShowPassword((v) => !v)}>
+                  {showPassword ? 'Hide' : 'Show'}
+                </Button>
+              </div>
+            </div>
+          </div>
+          <div className="grid-2">
+            <ItemSelect
+              label="Identity"
+              type="identity"
+              value={identityId}
+              onChange={setIdentityId}
+              targetVaultId={vaultId}
+              disabled={readOnly}
+            />
+            <ItemSelect
+              label="SSH key"
+              type="ssh_key"
+              value={keyId}
+              onChange={setKeyId}
+              targetVaultId={vaultId}
+              disabled={readOnly}
+            />
+          </div>
+          <div className="grid-2">
+            <ItemSelect
+              label="Group"
+              type="group"
+              value={groupId}
+              onChange={setGroupId}
+              targetVaultId={vaultId}
+              disabled={readOnly}
+            />
+            <ItemSelect
+              label="Jump host"
+              type="host"
+              value={jumpId}
+              onChange={setJumpId}
+              targetVaultId={vaultId}
+              exclude={exclude}
+              disabled={readOnly}
+            />
+          </div>
+          <ItemSelect
+            label="Startup snippet"
+            type="snippet"
+            value={snippetId}
+            onChange={setSnippetId}
+            targetVaultId={vaultId}
+            disabled={readOnly}
+          />
+          <TextField
+            label="Tags"
+            value={tags}
+            onChange={setTags}
+            disabled={readOnly}
+            hint="Comma separated"
+          />
+          <div className="grid-2">
+            <TextField
+              label="Keepalive (seconds)"
+              value={keepalive}
+              onChange={setKeepalive}
+              disabled={readOnly}
+              placeholder="off"
+              inputMode="numeric"
+            />
+            <div className="field">
+              <label>Color</label>
+              <div className="swatches">
+                {COLORS.map((c) => (
+                  <button
+                    key={c || 'none'}
+                    type="button"
+                    className={`swatch ${color === c ? 'selected' : ''}`}
+                    style={{ background: c || 'transparent' }}
+                    aria-label={c ? `Color ${c}` : 'No color'}
+                    disabled={readOnly}
+                    onClick={() => setColor(c)}
+                  />
+                ))}
+              </div>
+            </div>
+          </div>
+          <Checkbox
+            label="Forward my SSH agent to this host"
+            checked={agent}
+            onChange={setAgent}
+            disabled={readOnly}
+          />
+          <TextArea label="Notes" value={notes} onChange={setNotes} disabled={readOnly} rows={3} />
+        </>
+      )}
+    </EditorFrame>
+  );
+}
+
+function GroupEditor({ target }: { target: EditorTarget }) {
+  const g = existing(target, 'group');
+  const items = useStore((s) => s.items);
+  const [label, setLabel] = useState(g?.label ?? '');
+  const [parentId, setParentId] = useState(g?.parent_id ?? target.preset?.['parent_id'] ?? '');
+  const [username, setUsername] = useState(g?.username ?? '');
+  const [port, setPort] = useState(g?.port !== undefined ? String(g.port) : '');
+  const [identityId, setIdentityId] = useState(g?.identity_id ?? '');
+  // A group cannot move under itself or one of its own subgroups.
+  const exclude = useMemo(() => {
+    const out = new Set<string>();
+    if (!target.item) return out;
+    out.add(target.item.id);
+    for (let grew = true; grew;) {
+      grew = false;
+      for (const i of items) {
+        if (
+          i.payload.type === 'group' &&
+          i.payload.parent_id &&
+          out.has(i.payload.parent_id) &&
+          !out.has(i.id)
+        ) {
+          out.add(i.id);
+          grew = true;
+        }
+      }
+    }
+    return out;
+  }, [items, target.item]);
+
+  return (
+    <EditorFrame
+      target={target}
+      title={g ? 'Edit group' : 'New group'}
+      validate={() =>
+        label.trim() === ''
+          ? 'Enter a label'
+          : port !== '' && parsePort(port) === null
+            ? 'The port must be 1 to 65535'
+            : null
+      }
+      build={() => ({
+        type: 'group',
+        label: label.trim(),
+        ...(optionalId(parentId) ? { parent_id: parentId } : {}),
+        ...(optional(username) ? { username: username.trim() } : {}),
+        ...(port !== '' ? { port: parsePort(port) ?? 22 } : {}),
+        ...(optionalId(identityId) ? { identity_id: identityId } : {}),
+      })}
+    >
+      {({ vaultId, readOnly }) => (
+        <>
+          <TextField
+            label="Label"
+            value={label}
+            onChange={setLabel}
+            disabled={readOnly}
+            autoFocus
+          />
+          <ItemSelect
+            label="Inside group"
+            type="group"
+            value={parentId}
+            onChange={setParentId}
+            targetVaultId={vaultId}
+            exclude={exclude}
+            disabled={readOnly}
+            noneLabel="Top level"
+          />
+          <Notice>
+            Hosts in this group use these defaults for anything they do not set themselves.
+          </Notice>
+          <div className="grid-2">
+            <TextField
+              label="Default username"
+              value={username}
+              onChange={setUsername}
+              disabled={readOnly}
+            />
+            <TextField
+              label="Default port"
+              value={port}
+              onChange={setPort}
+              disabled={readOnly}
+              inputMode="numeric"
+            />
+          </div>
+          <ItemSelect
+            label="Default identity"
+            type="identity"
+            value={identityId}
+            onChange={setIdentityId}
+            targetVaultId={vaultId}
+            disabled={readOnly}
+          />
+        </>
+      )}
+    </EditorFrame>
+  );
+}
+
+function IdentityEditor({ target }: { target: EditorTarget }) {
+  const i = existing(target, 'identity');
+  const [label, setLabel] = useState(i?.label ?? '');
+  const [username, setUsername] = useState(i?.username ?? '');
+  const [password, setPassword] = useState(i?.password ?? '');
+  const [keyId, setKeyId] = useState(i?.key_id ?? '');
+  return (
+    <EditorFrame
+      target={target}
+      title={i ? 'Edit identity' : 'New identity'}
+      validate={() =>
+        label.trim() === '' ? 'Enter a label' : username.trim() === '' ? 'Enter a username' : null
+      }
+      build={() => ({
+        type: 'identity',
+        label: label.trim(),
+        username: username.trim(),
+        ...(password !== '' ? { password } : {}),
+        ...(optionalId(keyId) ? { key_id: keyId } : {}),
+      })}
+    >
+      {({ vaultId, readOnly }) => (
+        <>
+          <TextField
+            label="Label"
+            value={label}
+            onChange={setLabel}
+            disabled={readOnly}
+            autoFocus
+          />
+          <TextField
+            label="Username"
+            value={username}
+            onChange={setUsername}
+            disabled={readOnly}
+            spellCheck={false}
+          />
+          <TextField
+            label="Password"
+            type="password"
+            value={password}
+            onChange={setPassword}
+            disabled={readOnly}
+            autoComplete="off"
+          />
+          <ItemSelect
+            label="SSH key"
+            type="ssh_key"
+            value={keyId}
+            onChange={setKeyId}
+            targetVaultId={vaultId}
+            disabled={readOnly}
+          />
+        </>
+      )}
+    </EditorFrame>
+  );
+}
+
+function KeyEditor({ target }: { target: EditorTarget }) {
+  const k = existing(target, 'ssh_key');
+  const [label, setLabel] = useState(k?.label ?? '');
+  const [privateKey, setPrivateKey] = useState(k?.private_key ?? '');
+  const [passphrase, setPassphrase] = useState(k?.passphrase ?? '');
+  const [publicKey, setPublicKey] = useState(k?.public_key ?? '');
+  const [importError, setImportError] = useState<string | null>(null);
+  const looksLikeKey = /-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(privateKey);
+
+  async function importFile() {
+    setImportError(null);
+    try {
+      const file = await call('dialog.importKey');
+      if (!file) return;
+      setPrivateKey(file.content.trim() + '\n');
+      if (label.trim() === '') setLabel(file.fileName.replace(/\.(pem|key)$/i, ''));
+    } catch (err) {
+      setImportError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  return (
+    <EditorFrame
+      target={target}
+      title={k ? 'Edit SSH key' : 'New SSH key'}
+      validate={() =>
+        label.trim() === ''
+          ? 'Enter a label'
+          : privateKey.trim() === ''
+            ? 'Paste or import a private key'
+            : null
+      }
+      build={() => ({
+        type: 'ssh_key',
+        label: label.trim(),
+        private_key: privateKey.trim() + '\n',
+        ...(passphrase !== '' ? { passphrase } : {}),
+        ...(optional(publicKey) ? { public_key: publicKey.trim() } : {}),
+      })}
+    >
+      {({ readOnly }) => (
+        <>
+          <TextField
+            label="Label"
+            value={label}
+            onChange={setLabel}
+            disabled={readOnly}
+            autoFocus
+          />
+          <TextArea
+            label="Private key"
+            value={privateKey}
+            onChange={setPrivateKey}
+            disabled={readOnly}
+            mono
+            rows={8}
+            placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"
+            hint={
+              privateKey !== '' && !looksLikeKey ? (
+                <span className="warn">This does not look like a PEM/OpenSSH private key.</span>
+              ) : undefined
+            }
+          />
+          {!readOnly ? (
+            <div className="row">
+              <Button onClick={() => void importFile()}>Import from file…</Button>
+              {importError ? <span className="error-text">{importError}</span> : null}
+            </div>
+          ) : null}
+          <TextField
+            label="Passphrase"
+            type="password"
+            value={passphrase}
+            onChange={setPassphrase}
+            disabled={readOnly}
+            autoComplete="off"
+            hint="Only if the key is encrypted."
+          />
+          <TextField
+            label="Public key (optional)"
+            value={publicKey}
+            onChange={setPublicKey}
+            disabled={readOnly}
+            spellCheck={false}
+          />
+        </>
+      )}
+    </EditorFrame>
+  );
+}
+
+function SnippetEditor({ target }: { target: EditorTarget }) {
+  const s = existing(target, 'snippet');
+  const [label, setLabel] = useState(s?.label ?? '');
+  const [script, setScript] = useState(s?.script ?? '');
+  const [tags, setTags] = useState((s?.tags ?? []).join(', '));
+  return (
+    <EditorFrame
+      target={target}
+      title={s ? 'Edit snippet' : 'New snippet'}
+      validate={() => (label.trim() === '' ? 'Enter a label' : null)}
+      build={() => ({ type: 'snippet', label: label.trim(), script, tags: parseTags(tags) })}
+    >
+      {({ readOnly }) => (
+        <>
+          <TextField
+            label="Label"
+            value={label}
+            onChange={setLabel}
+            disabled={readOnly}
+            autoFocus
+          />
+          <TextArea
+            label="Script"
+            value={script}
+            onChange={setScript}
+            disabled={readOnly}
+            mono
+            rows={8}
+          />
+          <TextField
+            label="Tags"
+            value={tags}
+            onChange={setTags}
+            disabled={readOnly}
+            hint="Comma separated"
+          />
+        </>
+      )}
+    </EditorFrame>
+  );
+}
+
+function ForwardEditor({ target }: { target: EditorTarget }) {
+  const f = existing(target, 'port_forward');
+  const [label, setLabel] = useState(f?.label ?? '');
+  const [hostId, setHostId] = useState(f?.host_id ?? target.preset?.['host_id'] ?? '');
+  const [kind, setKind] = useState<PayloadOf<'port_forward'>['kind']>(f?.kind ?? 'local');
+  const [bindAddress, setBindAddress] = useState(f?.bind_address ?? '127.0.0.1');
+  const [bindPort, setBindPort] = useState(f ? String(f.bind_port) : '');
+  const [destHost, setDestHost] = useState(f?.dest_host ?? '');
+  const [destPort, setDestPort] = useState(f?.dest_port !== undefined ? String(f.dest_port) : '');
+  const needsDest = kind !== 'dynamic';
+  const bindOk = /^\d+$/.test(bindPort) && Number(bindPort) <= 65535;
+  return (
+    <EditorFrame
+      target={target}
+      title={f ? 'Edit port forward' : 'New port forward'}
+      validate={() =>
+        label.trim() === ''
+          ? 'Enter a label'
+          : hostId === ''
+            ? 'Choose a host'
+            : !bindOk
+              ? 'The listen port must be 0 to 65535'
+              : bindAddress.trim() === ''
+                ? 'Enter a listen address'
+                : needsDest && (destHost.trim() === '' || parsePort(destPort) === null)
+                  ? 'Enter the destination host and port'
+                  : null
+      }
+      build={() => ({
+        type: 'port_forward',
+        label: label.trim(),
+        host_id: hostId,
+        kind,
+        bind_address: bindAddress.trim(),
+        bind_port: Number(bindPort),
+        ...(needsDest ? { dest_host: destHost.trim(), dest_port: parsePort(destPort) ?? 1 } : {}),
+      })}
+    >
+      {({ vaultId, readOnly }) => (
+        <>
+          <TextField
+            label="Label"
+            value={label}
+            onChange={setLabel}
+            disabled={readOnly}
+            autoFocus
+          />
+          <ItemSelect
+            label="Host"
+            type="host"
+            value={hostId}
+            onChange={setHostId}
+            targetVaultId={vaultId}
+            disabled={readOnly}
+            noneLabel="Choose a host"
+          />
+          <Select
+            label="Type"
+            value={kind}
+            onChange={setKind}
+            disabled={readOnly}
+            options={[
+              {
+                value: 'local',
+                label: 'Local: a port here reaches a destination through the host',
+              },
+              {
+                value: 'remote',
+                label: 'Remote: a port on the host reaches a destination from here',
+              },
+              { value: 'dynamic', label: 'Dynamic: a SOCKS5 proxy on this computer' },
+            ]}
+          />
+          <div className="grid-2">
+            <TextField
+              label="Listen address"
+              value={bindAddress}
+              onChange={setBindAddress}
+              disabled={readOnly}
+              spellCheck={false}
+              hint={kind === 'remote' ? 'On the remote host.' : 'On this computer.'}
+            />
+            <TextField
+              label="Listen port"
+              value={bindPort}
+              onChange={setBindPort}
+              disabled={readOnly}
+              inputMode="numeric"
+              hint="0 lets the system choose."
+            />
+          </div>
+          {needsDest ? (
+            <div className="grid-2">
+              <TextField
+                label="Destination host"
+                value={destHost}
+                onChange={setDestHost}
+                disabled={readOnly}
+                spellCheck={false}
+              />
+              <TextField
+                label="Destination port"
+                value={destPort}
+                onChange={setDestPort}
+                disabled={readOnly}
+                inputMode="numeric"
+              />
+            </div>
+          ) : null}
+        </>
+      )}
+    </EditorFrame>
+  );
+}
