@@ -10,9 +10,10 @@
   },
   "scripts": {
     "build:core": "corepack pnpm --filter @ternix/core build",
+    "build:packages": "corepack pnpm run build:core && corepack pnpm --filter @ternix/ssh build",
     "lint": "eslint . && prettier --check .",
-    "typecheck": "corepack pnpm run build:core && corepack pnpm --filter \"./packages/*\" --filter \"./apps/*\" run typecheck",
-    "test": "corepack pnpm run build:core && corepack pnpm --filter \"./packages/*\" --filter \"./apps/*\" run test",
+    "typecheck": "corepack pnpm run build:packages && corepack pnpm --filter \"./packages/*\" --filter \"./apps/*\" run typecheck",
+    "test": "corepack pnpm run build:packages && corepack pnpm --filter \"./packages/*\" --filter \"./apps/*\" run test",
     "format": "prettier --write ."
   },
   "devDependencies": {

@@ -13,6 +13,7 @@ with the schemas in `packages/core`.
 | Path            | What                                                                  |
 | --------------- | --------------------------------------------------------------------- |
 | `packages/core` | `@ternix/core`: zod protocol schemas, item payloads, libsodium crypto |
+| `packages/ssh`  | `@ternix/ssh`: resolves vault items into live `ssh2` sessions         |
 | `apps/server`   | Sync server (Node), imports `@ternix/core`                            |
 | `apps/desktop`  | Electron desktop client, imports `@ternix/core`                       |
 | `docs/`         | Protocol reference                                                    |
@@ -26,7 +27,7 @@ point there, so build it before anything that imports it runs or typechecks:
 pnpm build:core
 ```
 
-The root `typecheck` and `test` scripts do this first. Subpath imports are available:
+The root `typecheck` and `test` scripts do this first (`pnpm build:packages` also builds `@ternix/ssh`). Subpath imports are available:
 `@ternix/core/protocol` and `@ternix/core/items` need no libsodium; `@ternix/core/crypto`
 needs `await ready()` once at startup.
 
