@@ -5,9 +5,12 @@
   "runtime": {
     "image": "node:22-bookworm-slim"
   },
-  "install": "corepack pnpm install --frozen-lockfile",
+  "install": "corepack pnpm install --frozen-lockfile --ignore-scripts",
   "dev": "corepack pnpm --filter @ternix/server dev",
   "port": 8080,
+  "env": {
+    "TERNIX_DATA_DIR": "/tmp/ternix-dev-data"
+  },
   "health": {
     "path": "/api/v1/server"
   },

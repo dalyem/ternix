@@ -1,0 +1,7 @@
+# Automatic HTTPS for the Ternix server. {$TERNIX_DOMAIN} comes from the environment
+# (docker-compose.yml passes it through). WebSocket upgrades on /api/v1/ws are proxied
+# without extra configuration.
+{$TERNIX_DOMAIN} {
+	header Strict-Transport-Security "max-age=31536000"
+	reverse_proxy ternix:8080
+}
