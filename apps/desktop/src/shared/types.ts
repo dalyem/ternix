@@ -1,0 +1,177 @@
+import type { ItemPayload, ItemPayloadInput } from '@ternix/core/items';
+import type { RegistrationMode, UserRole, VaultKind, VaultRole } from '@ternix/core/protocol';
+
+/**
+ * Plain, serializable shapes the sync client returns. They cross Electron IPC to the
+ * renderer, so: no classes, no `Uint8Array`, no functions. Field names are camelCase;
+ * item payloads keep the protocol's snake_case.
+ */
+
+export type { ItemPayload, ItemPayloadInput, RegistrationMode, UserRole, VaultKind, VaultRole };
+
+/** `loggedOut`: no session. `locked`: session, keys not in memory. `expired`: token gone. */
+export type ClientState = 'loggedOut' | 'locked' | 'unlocked' | 'expired';
+export type ConnectionState = 'offline' | 'connecting' | 'online';
+
+export interface ServerInfoDto {
+  serverUrl: string;
+  name: string;
+  version: string;
+  registration: RegistrationMode;
+  protocol: number;
+}
+
+export interface UserDto {
+  id: string;
+  email: string;
+  name: string;
+  role: UserRole;
+  publicKey: string;
+  fingerprint: string;
+  createdAt: string;
+}
+
+export interface AccountDto {
+  serverUrl: string;
+  email: string;
+  deviceId: string;
+  user: UserDto;
+}
+
+export interface DeviceDto {
+  id: string;
+  name: string;
+  platform: string;
+  createdAt: string;
+  lastSeenAt: string | null;
+  current: boolean;
+}
+
+/** A user found by email, with the fingerprint to compare out of band before sharing. */
+export interface LookupUserDto {
+  id: string;
+  email: string;
+  name: string;
+  publicKey: string;
+  fingerprint: string;
+}
+
+export interface InviteDto {
+  code: string;
+  email: string | null;
+  expiresAt: string;
+  createdAt: string;
+  usedAt: string | null;
+}
+
+export interface CreatedInviteDto {
+  code: string;
+  expiresAt: string;
+}
+
+/**
+ * A vault the account can see. `name` is null and `error` set when the vault key or name
+ * could not be opened (for example a wrapped key this account cannot unwrap).
+ */
+export interface VaultDto {
+  id: string;
+  kind: VaultKind;
+  role: VaultRole;
+  name: string | null;
+  keyVersion: number;
+  memberCount: number;
+  itemCount: number;
+  error: string | null;
+}
+
+export interface MemberDto {
+  userId: string;
+  email: string;
+  name: string;
+  role: VaultRole;
+  publicKey: string;
+  fingerprint: string;
+  addedAt: string;
+  isSelf: boolean;
+}
+
+export interface ItemDto {
+  id: string;
+  vaultId: string;
+  seq: number;
+  keyVersion: number;
+  /** Server time of the last write. */
+  updatedAt: string;
+  updatedBy: string;
+  payload: ItemPayload;
+}
+
+/** An item the client holds but cannot decrypt or parse (reported, never fatal). */
+export interface UnreadableItemDto {
+  id: string;
+  vaultId: string;
+  seq: number;
+  keyVersion: number;
+  error: string;
+}
+
+export interface VaultItemsDto {
+  vaultId: string;
+  items: ItemDto[];
+  unreadable: UnreadableItemDto[];
+}
+
+/**
+ * A payload as callers write it: `updated_at` is set by the client at write time and
+ * `schema` defaults to 1.
+ */
+export type ItemDraft = ItemPayloadInput extends infer T
+  ? T extends unknown
+    ? Omit<T, 'updated_at' | 'schema'> & { schema?: 1 }
+    : never
+  : never;
+
+/**
+ * Outcome of one write under the protocol's conflict rule (section 6). `saved`: the server
+ * has the local change. `dropped`: the server had a newer version, which is kept; `item` is
+ * that version, or null when it is a tombstone (or the delete went through).
+ */
+export interface WriteResultDto {
+  id: string;
+  status: 'saved' | 'dropped';
+  item: ItemDto | null;
+}
+
+export type BatchOpInput =
+  { op: 'put'; id?: string; payload: ItemDraft } | { op: 'delete'; id: string };
+
+export interface BatchFailureDto {
+  id: string;
+  code: string;
+  message: string;
+}
+
+export interface BatchResultDto {
+  results: WriteResultDto[];
+  failed: BatchFailureDto[];
+}
+
+export interface RemoveMemberResultDto {
+  /** True when the vault key was rotated after the removal (owner removing someone else). */
+  rotated: boolean;
+  /** Set when the removal succeeded but the automatic rotation did not. */
+  rotationError: ErrorDto | null;
+}
+
+export interface LogoutResultDto {
+  /** False when the server could not be reached or the token was already gone. */
+  serverRevoked: boolean;
+}
+
+/** Every error the client throws carries a `code`; this is its IPC-safe form. */
+export interface ErrorDto {
+  name: string;
+  code: string;
+  message: string;
+  status?: number;
+}

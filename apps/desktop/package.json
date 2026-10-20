@@ -1,0 +1,26 @@
+{
+  "name": "@ternix/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Ternix desktop client (Electron); the sync client lives in src/main/client",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@ternix/core": "workspace:^",
+    "ws": "^8.22.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "@types/ws": "^8.18.2",
+    "typescript": "~5.9.3",
+    "vitest": "^3.2.7"
+  }
+}
