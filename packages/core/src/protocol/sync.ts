@@ -1,7 +1,9 @@
 import { z } from 'zod';
 import { apiErrorSchema } from './errors.js';
+import { MAX_BATCH_OPS } from './limits.js';
 import {
   envelopeSchema,
+  itemCiphertextSchema,
   keyVersionSchema,
   seqSchema,
   timestampSchema,
@@ -40,7 +42,6 @@ export type TombstoneItem = z.infer<typeof tombstoneItemSchema>;
 /** Hard limits from the protocol. */
 export const MAX_LIST_LIMIT = 1000;
 export const DEFAULT_LIST_LIMIT = 500;
-export const MAX_BATCH_OPS = 500;
 
 // GET /api/v1/vaults/:id/items?since=&limit=
 
@@ -63,7 +64,7 @@ export type ListItemsResponse = z.infer<typeof listItemsResponseSchema>;
 export const baseSeqSchema = seqSchema.nullable();
 
 export const putItemRequestSchema = z.object({
-  ciphertext: envelopeSchema,
+  ciphertext: itemCiphertextSchema,
   key_version: keyVersionSchema,
   base_seq: baseSeqSchema,
 });
@@ -90,7 +91,7 @@ export type DeleteItemQuery = z.infer<typeof deleteItemQuerySchema>;
 export const batchPutOpSchema = z.object({
   op: z.literal('put'),
   id: uuidSchema,
-  ciphertext: envelopeSchema,
+  ciphertext: itemCiphertextSchema,
   key_version: keyVersionSchema,
   base_seq: baseSeqSchema,
 });

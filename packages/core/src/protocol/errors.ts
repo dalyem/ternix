@@ -11,6 +11,8 @@ export const ERROR_CODES = [
   'invalid_invite',
   'email_taken',
   'key_version_mismatch',
+  'payload_too_large',
+  'vault_full',
   'internal',
 ] as const;
 
@@ -43,5 +45,7 @@ export const ERROR_STATUS: Record<ErrorCode, number> = {
   invalid_invite: 400,
   email_taken: 409,
   key_version_mismatch: 409,
+  payload_too_large: 413,
+  vault_full: 409,
   internal: 500,
 };

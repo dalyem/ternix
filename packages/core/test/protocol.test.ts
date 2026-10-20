@@ -1,7 +1,14 @@
 import { beforeAll, describe, expect, it } from 'vitest';
+import type { z } from 'zod';
 import {
   ERROR_CODES,
   ERROR_STATUS,
+  MAX_BATCH_BODY_BYTES,
+  MAX_BATCH_OPS,
+  MAX_ITEM_CIPHERTEXT_LENGTH,
+  MAX_LIVE_ITEMS_PER_VAULT,
+  MAX_ROTATE_BODY_BYTES,
+  PAYLOAD_TOO_LARGE_ISSUE,
   addMemberRequestSchema,
   batchRequestSchema,
   batchResultSchema,
@@ -15,6 +22,7 @@ import {
   envelopeSchema,
   errorEnvelopeSchema,
   generateAccountKeypair,
+  itemCiphertextSchema,
   itemConflictResponseSchema,
   itemSchema,
   kdfParamsSchema,
@@ -30,9 +38,11 @@ import {
   registerRequestSchema,
   rotateRequestSchema,
   routes,
+  rotateConflictResponseSchema,
   seal,
   serverInfoSchema,
   toB64,
+  updateVaultRequestSchema,
   userSchema,
   uuidSchema,
   vaultSchema,
@@ -114,12 +124,16 @@ describe('errors', () => {
       'invalid_invite',
       'email_taken',
       'key_version_mismatch',
+      'payload_too_large',
+      'vault_full',
       'internal',
     ]);
     for (const code of ERROR_CODES) expect(ERROR_STATUS[code]).toBeGreaterThanOrEqual(400);
     expect(ERROR_STATUS.unauthorized).toBe(401);
     expect(ERROR_STATUS.not_found).toBe(404);
     expect(ERROR_STATUS.conflict).toBe(409);
+    expect(ERROR_STATUS.payload_too_large).toBe(413);
+    expect(ERROR_STATUS.vault_full).toBe(409);
   });
 
   it('validates the envelope', () => {
@@ -233,12 +247,35 @@ describe('vaults', () => {
       key_version: 2,
       name_enc: envelope,
       members: [{ user_id: USER_ID, wrapped_key: wrappedKey }],
-      items: [{ id: ITEM_ID, ciphertext: envelope }],
+      items: [{ id: ITEM_ID, ciphertext: envelope, base_seq: 7 }],
     };
     ok(rotateRequestSchema, rotate);
     ok(rotateRequestSchema, { ...rotate, items: [] });
     bad(rotateRequestSchema, { ...rotate, key_version: 1 });
-    bad(rotateRequestSchema, { ...rotate, items: [{ id: ITEM_ID }] });
+    bad(rotateRequestSchema, { ...rotate, items: [{ id: ITEM_ID, ciphertext: envelope }] });
+    bad(rotateRequestSchema, {
+      ...rotate,
+      items: [{ id: ITEM_ID, ciphertext: envelope, base_seq: null }],
+    });
+    bad(rotateRequestSchema, {
+      ...rotate,
+      items: [{ id: ITEM_ID, ciphertext: envelope, base_seq: -1 }],
+    });
+    ok(rotateConflictResponseSchema, {
+      error: { code: 'conflict', message: 'stale' },
+      expected: { user_ids: [USER_ID], item_ids: [ITEM_ID] },
+      stale_item_ids: [ITEM_ID],
+    });
+    bad(rotateConflictResponseSchema, {
+      error: { code: 'conflict', message: 'stale' },
+      expected: { user_ids: [USER_ID], item_ids: [ITEM_ID] },
+    });
+  });
+
+  it('rename needs the key version the name is sealed with', () => {
+    ok(updateVaultRequestSchema, { name_enc: envelope, key_version: 2 });
+    bad(updateVaultRequestSchema, { name_enc: envelope });
+    bad(updateVaultRequestSchema, { name_enc: envelope, key_version: 0 });
   });
 });
 
@@ -398,5 +435,82 @@ describe('routes', () => {
     expect(buildPath(routes.lookupUser.path, undefined, { email: 'a+b@example.com' })).toBe(
       '/api/v1/users/lookup?email=a%2Bb%40example.com',
     );
+  });
+});
+
+describe('size limits', () => {
+  const tooLong = () => 'v1.' + 'A'.repeat(Math.ceil(MAX_ITEM_CIPHERTEXT_LENGTH / 4) * 4);
+  const largest = () => 'v1.' + 'A'.repeat(Math.floor((MAX_ITEM_CIPHERTEXT_LENGTH - 3) / 4) * 4);
+
+  /** The issue a server maps to `413 payload_too_large`. */
+  const tooLarge = (schema: z.ZodTypeAny, value: unknown) => {
+    const result = schema.safeParse(value);
+    return (
+      !result.success &&
+      result.error.issues.some(
+        (i) => i.code === 'custom' && i.params?.code === PAYLOAD_TOO_LARGE_ISSUE,
+      )
+    );
+  };
+
+  it('caps item ciphertexts in put, batch and rotate', () => {
+    expect(largest().length).toBeLessThanOrEqual(MAX_ITEM_CIPHERTEXT_LENGTH);
+    expect(tooLong().length).toBeGreaterThan(MAX_ITEM_CIPHERTEXT_LENGTH);
+    ok(itemCiphertextSchema, largest());
+    ok(putItemRequestSchema, { ciphertext: largest(), key_version: 1, base_seq: null });
+
+    const put = { ciphertext: tooLong(), key_version: 1, base_seq: null };
+    expect(tooLarge(putItemRequestSchema, put)).toBe(true);
+    const op = { op: 'put', id: ITEM_ID, ...put };
+    expect(tooLarge(batchRequestSchema, { ops: [op] })).toBe(true);
+    const rotate = {
+      key_version: 2,
+      name_enc: envelope,
+      members: [],
+      items: [{ id: ITEM_ID, ciphertext: tooLong(), base_seq: 1 }],
+    };
+    expect(tooLarge(rotateRequestSchema, rotate)).toBe(true);
+
+    // Not an envelope at all is a plain 400, not a size problem.
+    expect(tooLarge(putItemRequestSchema, { ...put, ciphertext: 'x' })).toBe(false);
+  });
+
+  it('caps the live items a rotation can carry', () => {
+    const item = { id: ITEM_ID, ciphertext: envelope, base_seq: 1 };
+    const rotate = (n: number) => ({
+      key_version: 2,
+      name_enc: envelope,
+      members: [],
+      items: Array.from({ length: n }, () => item),
+    });
+    ok(rotateRequestSchema, rotate(MAX_LIVE_ITEMS_PER_VAULT));
+    bad(rotateRequestSchema, rotate(MAX_LIVE_ITEMS_PER_VAULT + 1));
+  });
+
+  it('sizes the body limits so a full vault can still be rotated and a full batch sent', () => {
+    const bytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value));
+
+    // Worst case: maximal ciphertext, a seq as wide as a JS integer can be.
+    const rotateItem = {
+      id: ITEM_ID,
+      ciphertext: 'v1.' + 'A'.repeat(MAX_ITEM_CIPHERTEXT_LENGTH - 3),
+      base_seq: Number.MAX_SAFE_INTEGER,
+    };
+    const fullRotation = (bytes(rotateItem) + 1) * MAX_LIVE_ITEMS_PER_VAULT;
+    const member = { user_id: USER_ID, wrapped_key: wrappedKey };
+    const MIB = 1024 * 1024;
+    // Room left for at least 100,000 members and the vault name.
+    expect(fullRotation + (bytes(member) + 1) * 100_000 + 4096).toBeLessThan(MAX_ROTATE_BODY_BYTES);
+    expect(fullRotation).toBeGreaterThan(100 * MIB); // the limit is not accidentally generous
+    expect(MAX_ROTATE_BODY_BYTES).toBeLessThanOrEqual(200 * MIB);
+
+    const putOp = {
+      op: 'put',
+      id: ITEM_ID,
+      ciphertext: rotateItem.ciphertext,
+      key_version: Number.MAX_SAFE_INTEGER,
+      base_seq: Number.MAX_SAFE_INTEGER,
+    };
+    expect((bytes(putOp) + 1) * MAX_BATCH_OPS + 64).toBeLessThan(MAX_BATCH_BODY_BYTES);
   });
 });

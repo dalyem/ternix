@@ -1,6 +1,6 @@
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { createInviteRequestSchema } from '@ternix/core/protocol';
-import { authenticator } from '../auth.js';
+import { requireSession } from '../auth.js';
 import type { AppContext } from '../context.js';
 import { badRequest, conflict, forbidden, notFound } from '../errors.js';
 import { toUser } from '../store.js';
@@ -11,10 +11,12 @@ export async function adminRoutes(app: FastifyInstance, ctx: AppContext): Promis
   const { config, store, hub } = ctx;
 
   await app.register(async (admin) => {
-    admin.addHook('onRequest', authenticator(ctx));
-    admin.addHook('onRequest', async (req) => {
+    requireSession(admin, ctx);
+    const requireAdmin = async (req: FastifyRequest) => {
       if (req.auth.user.role !== 'admin') throw forbidden('Admin role required');
-    });
+    };
+    admin.addHook('onRequest', requireAdmin);
+    admin.addHook('preHandler', requireAdmin);
 
     admin.post('/api/v1/admin/invites', async (req, reply) => {
       const body = parse(createInviteRequestSchema, req.body ?? {});

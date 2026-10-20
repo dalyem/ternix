@@ -10,12 +10,15 @@ import {
   registerRequestSchema,
   type KdfParams,
 } from '@ternix/core/protocol';
-import { authenticator } from '../auth.js';
+import { bearerToken, requireSession } from '../auth.js';
 import type { AppContext } from '../context.js';
-import { ApiError, badRequest, notFound, unauthorized } from '../errors.js';
+import { ApiError, badRequest, conflict, notFound, unauthorized } from '../errors.js';
 import { kdfOf, toUser, type UserRow } from '../store.js';
 import { hashToken, newToken } from '../tokens.js';
 import { parse, uuidParam } from '../validate.js';
+
+type PasswordChange =
+  { status: 'ok'; revoked: string[] } | { status: 'wrong_password' } | { status: 'conflict' };
 
 function isConstraint(err: unknown, column: string): boolean {
   return (
@@ -168,7 +171,7 @@ export async function authRoutes(app: FastifyInstance, ctx: AppContext): Promise
   // Authenticated
 
   await app.register(async (authed) => {
-    authed.addHook('onRequest', authenticator(ctx));
+    requireSession(authed, ctx);
 
     authed.post('/api/v1/auth/logout', async (req, reply) => {
       store.deleteDevice(req.auth.deviceId, req.auth.user.id);
@@ -181,22 +184,41 @@ export async function authRoutes(app: FastifyInstance, ctx: AppContext): Promise
     authed.post('/api/v1/me/password', { config: authRateLimit }, async (req, reply) => {
       const body = parse(changePasswordRequestSchema, req.body);
       assertKdf(body.new_kdf);
-      const { user, deviceId } = req.auth;
-      const limiterKey = `password:${user.id}`;
+      const limiterKey = `password:${req.auth.user.id}`;
       if (loginLimiter.blocked(limiterKey)) {
         throw new ApiError('rate_limited', 'Too many failed attempts; try later');
       }
-      if (!hasher.verify(user.auth_hash, body.current_auth_key)) {
+      // The session and the user row are read again inside the transaction, and the update
+      // only applies to the hash that was verified, so a revocation or a password change that
+      // landed while this request was in flight cannot be overwritten.
+      const tokenHash = hashToken(bearerToken(req) ?? '');
+      const outcome = store.transaction((): PasswordChange => {
+        const session = store.findSession(tokenHash);
+        if (!session) throw unauthorized();
+        const { user } = session;
+        if (!hasher.verify(user.auth_hash, body.current_auth_key)) {
+          return { status: 'wrong_password' };
+        }
+        const newHash = hasher.hash(body.new_auth_key);
+        const changed = store.updatePassword(
+          user.id,
+          user.auth_hash,
+          newHash,
+          body.new_kdf,
+          body.new_encrypted_private_key,
+        );
+        if (!changed) return { status: 'conflict' };
+        return { status: 'ok', revoked: store.deleteOtherDevices(user.id, session.device_id) };
+      });
+      if (outcome.status === 'wrong_password') {
         loginLimiter.fail(limiterKey);
         throw unauthorized('Current password is incorrect');
       }
+      if (outcome.status === 'conflict') {
+        throw conflict('The password changed while this request was in flight; try again');
+      }
       loginLimiter.clear(limiterKey);
-      const newHash = hasher.hash(body.new_auth_key);
-      const revoked = store.transaction(() => {
-        store.updatePassword(user.id, newHash, body.new_kdf, body.new_encrypted_private_key);
-        return store.deleteOtherDevices(user.id, deviceId);
-      });
-      hub.revokeDevices(revoked);
+      hub.revokeDevices(outcome.revoked);
       return reply.code(204).send();
     });
 

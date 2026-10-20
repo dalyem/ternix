@@ -1,6 +1,8 @@
 /* eslint-disable @typescript-eslint/no-explicit-any -- response bodies are checked field by field in tests */
 import { randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
+import { connect, type AddressInfo } from 'node:net';
+import { once } from 'node:events';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { FastifyInstance } from 'fastify';
@@ -239,6 +241,59 @@ export class Client {
       },
     });
   }
+}
+
+export interface HeldRequest {
+  /** Send the withheld body, wait for the response. */
+  finish(): Promise<{ status: number; body: any }>;
+}
+
+/**
+ * Send a request's headers over a real socket and hold the body back, so the server's
+ * `onRequest` hooks have run before the body (and the handler) arrive. Lets a test change
+ * server state in the middle of a request.
+ */
+export async function holdRequest(
+  app: FastifyInstance,
+  method: 'POST' | 'DELETE',
+  url: string,
+  token: string,
+  body: unknown,
+  settleMs = 200,
+): Promise<HeldRequest> {
+  if (!app.server.listening) await app.listen({ host: '127.0.0.1', port: 0 });
+  const { port } = app.server.address() as AddressInfo;
+  const payload = JSON.stringify(body);
+  const socket = connect({ host: '127.0.0.1', port });
+  await once(socket, 'connect');
+  const chunks: Buffer[] = [];
+  const response = new Promise<string>((resolve, reject) => {
+    socket.on('data', (chunk: Buffer) => chunks.push(chunk));
+    socket.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    socket.on('error', reject);
+  });
+  socket.write(
+    [
+      `${method} ${url} HTTP/1.1`,
+      'Host: 127.0.0.1',
+      `Authorization: Bearer ${token}`,
+      'Content-Type: application/json',
+      `Content-Length: ${Buffer.byteLength(payload)}`,
+      'Connection: close',
+      '',
+      '',
+    ].join('\r\n'),
+  );
+  await new Promise((resolve) => setTimeout(resolve, settleMs));
+  return {
+    async finish() {
+      socket.write(payload);
+      const raw = await response;
+      const status = Number(/^HTTP\/1\.1 (\d{3})/.exec(raw)?.[1]);
+      const text = raw.slice(raw.indexOf('\r\n\r\n') + 4);
+      return { status, body: text ? JSON.parse(text) : undefined };
+    },
+  };
 }
 
 let counter = 0;

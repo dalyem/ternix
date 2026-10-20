@@ -2,16 +2,15 @@ import type { FastifyInstance } from 'fastify';
 import {
   addMemberRequestSchema,
   createVaultRequestSchema,
+  MAX_ROTATE_BODY_BYTES,
   rotateRequestSchema,
   updateMemberRequestSchema,
   updateVaultRequestSchema,
 } from '@ternix/core/protocol';
-import { authenticator } from '../auth.js';
+import { requireSession } from '../auth.js';
 import type { AppContext } from '../context.js';
 import { ApiError, conflict, forbidden, notFound } from '../errors.js';
 import { parse, requireVault, uuidParam } from '../validate.js';
-
-const MIB = 1024 * 1024;
 
 export async function vaultRoutes(app: FastifyInstance, ctx: AppContext): Promise<void> {
   const { store, hub } = ctx;
@@ -20,7 +19,7 @@ export async function vaultRoutes(app: FastifyInstance, ctx: AppContext): Promis
     hub.notifyUsers(userIds, { type: 'vaults.changed' });
 
   await app.register(async (authed) => {
-    authed.addHook('onRequest', authenticator(ctx));
+    requireSession(authed, ctx);
 
     authed.get('/api/v1/vaults', async (req) => ({
       vaults: store.listVaultsForUser(req.auth.user.id),
@@ -51,7 +50,12 @@ export async function vaultRoutes(app: FastifyInstance, ctx: AppContext): Promis
         'owner',
       );
       const body = parse(updateVaultRequestSchema, req.body);
-      store.updateVaultName(vault.id, body.name_enc);
+      if (!store.renameVault(vault.id, body.name_enc, body.key_version)) {
+        throw new ApiError(
+          'key_version_mismatch',
+          `Vault key_version is ${vault.key_version}; the name must be sealed with it`,
+        );
+      }
       notifyVaults(store.memberUserIds(vault.id));
       return store.getVaultForUser(vault.id, req.auth.user.id);
     });
@@ -141,7 +145,7 @@ export async function vaultRoutes(app: FastifyInstance, ctx: AppContext): Promis
 
     // Key rotation
 
-    authed.post('/api/v1/vaults/:id/rotate', { bodyLimit: 20 * MIB }, async (req) => {
+    authed.post('/api/v1/vaults/:id/rotate', { bodyLimit: MAX_ROTATE_BODY_BYTES }, async (req) => {
       const userId = req.auth.user.id;
       const { vault } = requireVault(store, userId, (req.params as { id: string }).id, 'owner');
       const body = parse(rotateRequestSchema, req.body);
@@ -153,9 +157,10 @@ export async function vaultRoutes(app: FastifyInstance, ctx: AppContext): Promis
             `Vault key_version is ${vault.key_version}; rotate to ${vault.key_version + 1}`,
           );
         }
-        throw conflict('Member or item set does not match the server; refresh and retry', {
-          expected: outcome.expected,
-        });
+        throw conflict(
+          'Member or item set does not match the server, or an item changed; refresh and retry',
+          { expected: outcome.expected, stale_item_ids: outcome.staleItemIds },
+        );
       }
       const members = store.memberUserIds(vault.id);
       notifyVaults(members);

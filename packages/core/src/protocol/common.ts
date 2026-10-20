@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { B64_RE, b64Pattern } from '../b64.js';
+import { MAX_ITEM_CIPHERTEXT_LENGTH, PAYLOAD_TOO_LARGE_ISSUE } from './limits.js';
 
 /** Protocol version reported by `GET /api/v1/server`. */
 export const PROTOCOL_VERSION = 1;
@@ -37,6 +38,15 @@ export const envelopeSchema = z
       s.startsWith('v1.') && s.length >= 3 + MIN_ENVELOPE_B64_LENGTH && B64_RE.test(s.slice(3)),
     'expected a v1 envelope (v1.<base64>)',
   );
+
+/** An envelope of at most `MAX_ITEM_CIPHERTEXT_LENGTH` characters; longer is `payload_too_large`. */
+export const itemCiphertextSchema = envelopeSchema.refine(
+  (s) => s.length <= MAX_ITEM_CIPHERTEXT_LENGTH,
+  {
+    message: `ciphertext is longer than ${MAX_ITEM_CIPHERTEXT_LENGTH} characters`,
+    params: { code: PAYLOAD_TOO_LARGE_ISSUE },
+  },
+);
 
 /** Lowercased and trimmed, then validated as an email address. */
 export function normalizeEmail(email: string): string {

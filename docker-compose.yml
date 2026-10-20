@@ -1,7 +1,9 @@
 # Ternix sync server.
 #
-#   docker compose up -d --build                  # plain HTTP on 127.0.0.1:8080
-#   docker compose --profile tls up -d --build    # plus Caddy with automatic HTTPS
+#   docker compose up -d --build        # plain HTTP on 127.0.0.1:8080
+#
+# For automatic HTTPS add docker-compose.tls.yml, which brings Caddy:
+#   docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d --build
 #
 # Settings come from the environment or a `.env` file next to this one; see
 # apps/server/README.md for every variable.
@@ -27,26 +29,5 @@ services:
       # clear text. Set TERNIX_BIND=0.0.0.0 only on a trusted network (LAN, Tailscale).
       - '${TERNIX_BIND:-127.0.0.1}:${TERNIX_PORT:-8080}:8080'
 
-  # Optional TLS front end. Needs TERNIX_DOMAIN (a DNS name pointing at this host) and
-  # TERNIX_TRUST_PROXY=true so rate limits see real client addresses.
-  caddy:
-    profiles: ['tls']
-    image: caddy:2-alpine
-    restart: unless-stopped
-    depends_on:
-      - ternix
-    environment:
-      TERNIX_DOMAIN: ${TERNIX_DOMAIN:?set TERNIX_DOMAIN to the public host name}
-    ports:
-      - '80:80'
-      - '443:443'
-      - '443:443/udp'
-    volumes:
-      - ./apps/server/deploy/Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy-data:/data
-      - caddy-config:/config
-
 volumes:
   ternix-data:
-  caddy-data:
-  caddy-config:

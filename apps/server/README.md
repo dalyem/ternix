@@ -28,8 +28,13 @@ cat > .env <<'ENV'
 TERNIX_DOMAIN=ternix.example.com
 TERNIX_TRUST_PROXY=true
 ENV
-docker compose --profile tls up -d --build
+docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d --build
 ```
+
+`docker-compose.tls.yml` is an override that adds the Caddy service; it is a separate file
+rather than a Compose profile so that a plain `docker compose up` never needs `TERNIX_DOMAIN`.
+Add the same two `-f` flags to later `docker compose` commands (`down`, `logs`, `pull`) so they
+see Caddy too.
 
 Caddy (`apps/server/deploy/Caddyfile`) gets and renews the certificate and proxies HTTP and
 the WebSocket to the `ternix` service. Set `TERNIX_TRUST_PROXY=true` so rate limits see the
@@ -55,7 +60,8 @@ All settings are environment variables. Put them in `.env` next to `docker-compo
 | `TERNIX_LOG_LEVEL`    | `info`    | pino level. Tokens, auth keys and ciphertext bodies are never logged; request URLs are logged without their query string.                                                                                                                                                                                  |
 
 Compose also reads `TERNIX_BIND` (host address for the published port, default `127.0.0.1`),
-`TERNIX_PORT` (host port, default `8080`) and `TERNIX_DOMAIN` (Caddy only).
+`TERNIX_PORT` (host port, default `8080`) and `TERNIX_DOMAIN` (`docker-compose.tls.yml` only,
+required there).
 
 ## First admin
 
@@ -120,6 +126,10 @@ password still loses that account's keys; there is no recovery.
   sees deletes.
 - Login verifies a libsodium `crypto_pwhash_str` of the client's auth key (Argon2id, 3 passes,
   64 MiB) in-process; each login briefly blocks the event loop. Rate limits bound the cost.
+- Item ciphertexts are capped at 32 KiB and a vault holds at most 5000 live items, so the
+  rotation of even a full vault fits in one request (about 157 MiB, body limit 200 MiB).
+  Parsing such a body takes several times its size in memory. See `docs/protocol.md`
+  section 8.
 - `GET /api/v1/server` is the health endpoint.
 
 ## Development

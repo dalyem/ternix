@@ -1,7 +1,9 @@
 import { z } from 'zod';
 import { apiErrorSchema } from './errors.js';
+import { MAX_LIVE_ITEMS_PER_VAULT } from './limits.js';
 import {
   envelopeSchema,
+  itemCiphertextSchema,
   keyVersionSchema,
   publicKeySchema,
   seqSchema,
@@ -39,8 +41,14 @@ export const createVaultRequestSchema = z.object({
 });
 export type CreateVaultRequest = z.infer<typeof createVaultRequestSchema>;
 
-/** PATCH /api/v1/vaults/:id (owner). */
-export const updateVaultRequestSchema = z.object({ name_enc: envelopeSchema });
+/**
+ * PATCH /api/v1/vaults/:id (owner). `name_enc` is sealed with the key of `key_version`; if
+ * the vault has been rotated since, the answer is `409 key_version_mismatch`.
+ */
+export const updateVaultRequestSchema = z.object({
+  name_enc: envelopeSchema,
+  key_version: keyVersionSchema,
+});
 export type UpdateVaultRequest = z.infer<typeof updateVaultRequestSchema>;
 
 // Members
@@ -73,19 +81,27 @@ export type UpdateMemberRequest = z.infer<typeof updateMemberRequestSchema>;
 
 // Key rotation
 
-/** POST /api/v1/vaults/:id/rotate (owner). Sets must match the server's exactly. */
+/**
+ * POST /api/v1/vaults/:id/rotate (owner). Sets must match the server's exactly, and each
+ * item's `base_seq` is the `seq` it was re-encrypted from: if any item changed since, the
+ * rotation is refused so no concurrent edit is overwritten.
+ */
 export const rotateRequestSchema = z.object({
   /** Current `key_version` plus one (so at least 2). */
   key_version: keyVersionSchema.min(2),
   name_enc: envelopeSchema,
   members: z.array(z.object({ user_id: uuidSchema, wrapped_key: wrappedKeySchema })),
-  items: z.array(z.object({ id: uuidSchema, ciphertext: envelopeSchema })),
+  items: z
+    .array(z.object({ id: uuidSchema, ciphertext: itemCiphertextSchema, base_seq: seqSchema }))
+    .max(MAX_LIVE_ITEMS_PER_VAULT),
 });
 export type RotateRequest = z.infer<typeof rotateRequestSchema>;
 
 /**
- * `409 conflict` from rotate when the member or item sets differ: carries the IDs the
- * server expected so the client can refresh and retry.
+ * `409 conflict` from rotate when the member or item sets differ or an item changed since
+ * its `base_seq`: carries the IDs the server expects (`expected`) and the requested items
+ * that exist but have a different `seq` (`stale_item_ids`), so the client can refresh and
+ * retry. Nothing was written.
  */
 export const rotateConflictResponseSchema = z.object({
   error: apiErrorSchema,
@@ -93,5 +109,6 @@ export const rotateConflictResponseSchema = z.object({
     user_ids: z.array(uuidSchema),
     item_ids: z.array(uuidSchema),
   }),
+  stale_item_ids: z.array(uuidSchema),
 });
 export type RotateConflictResponse = z.infer<typeof rotateConflictResponseSchema>;

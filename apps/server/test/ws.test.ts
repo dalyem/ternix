@@ -225,7 +225,7 @@ describe('websocket', () => {
     sa.messages.length = 0;
     const key = alice.keyFor(vault);
     await alice.req('PATCH', `/api/v1/vaults/${vault}`, {
-      body: { name_enc: encryptVaultName(key, vault, 'again') },
+      body: { name_enc: encryptVaultName(key, vault, 'again'), key_version: 1 },
     });
     await sa.next(isType('vaults.changed'));
 

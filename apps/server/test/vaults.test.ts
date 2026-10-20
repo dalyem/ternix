@@ -15,6 +15,8 @@ import {
   listItemsResponseSchema,
   listMembersResponseSchema,
   listVaultsResponseSchema,
+  MAX_ITEM_CIPHERTEXT_LENGTH,
+  MAX_LIVE_ITEMS_PER_VAULT,
   memberSchema,
   rotateConflictResponseSchema,
   vaultSchema,
@@ -146,7 +148,11 @@ describe('vaults, sharing, sync and rotation', () => {
     for (const [method, path, body] of [
       ['GET', `/api/v1/vaults/${vault}/items`, undefined],
       ['GET', `/api/v1/vaults/${vault}/members`, undefined],
-      ['PATCH', `/api/v1/vaults/${vault}`, { name_enc: alice.encrypt(vault, id, 'x') }],
+      [
+        'PATCH',
+        `/api/v1/vaults/${vault}`,
+        { name_enc: alice.encrypt(vault, id, 'x'), key_version: 1 },
+      ],
       ['DELETE', `/api/v1/vaults/${vault}`, undefined],
       ['POST', `/api/v1/vaults/${vault}/items/batch`, { ops: [] }],
       ['PUT', `/api/v1/vaults/${vault}/items/${id}`, {}],
@@ -477,6 +483,7 @@ describe('vaults, sharing, sync and rotation', () => {
       items: liveItems.map((i) => ({
         id: i.id,
         ciphertext: alice.encrypt(vault, i.id, labels.get(i.id)!, 2),
+        base_seq: i.seq,
       })),
       ...over,
     });
@@ -491,6 +498,7 @@ describe('vaults, sharing, sync and rotation', () => {
     expect(detail.error.code).toBe('conflict');
     expect(detail.expected.user_ids.sort()).toEqual([alice.id, carol.id].sort());
     expect(detail.expected.item_ids.sort()).toEqual(liveItems.map((i) => i.id).sort());
+    expect(detail.stale_item_ids).toEqual([]);
 
     const extraMember = await alice.req('POST', url, {
       body: rotation({
@@ -508,6 +516,7 @@ describe('vaults, sharing, sync and rotation', () => {
     const tombItems = tombstones.map((t) => ({
       id: t.id,
       ciphertext: alice.encrypt(vault, t.id, 'x', 2),
+      base_seq: t.seq,
     }));
     if (tombItems.length > 0) {
       const withTomb = await alice.req('POST', url, {
@@ -580,7 +589,7 @@ describe('vaults, sharing, sync and rotation', () => {
     await alice.addMember(v, carol, 'viewer');
     const key = alice.keyFor(v);
     const renamed = await alice.req('PATCH', `/api/v1/vaults/${v}`, {
-      body: { name_enc: encryptVaultName(key, v, 'Renamed') },
+      body: { name_enc: encryptVaultName(key, v, 'Renamed'), key_version: 1 },
     });
     expect(renamed.status).toBe(200);
     await carol.syncKeys();
@@ -639,6 +648,257 @@ describe('vaults, sharing, sync and rotation', () => {
       body: { ciphertext: big, key_version: 2, base_seq: null },
     });
     expect(tooBig.status).toBe(413);
-    expect(errorEnvelopeSchema.parse(tooBig.body).error.code).toBe('bad_request');
+    expect(errorEnvelopeSchema.parse(tooBig.body).error.code).toBe('payload_too_large');
+  });
+  describe('rotation, rename and limits on fresh vaults', () => {
+    const vaultOf = async (who: Client, id: string) =>
+      listVaultsResponseSchema
+        .parse((await who.req('GET', '/api/v1/vaults')).body)
+        .vaults.find((v) => v.id === id)!;
+    const itemsOf = async (who: Client, id: string) =>
+      listItemsResponseSchema.parse(
+        (await who.req('GET', `/api/v1/vaults/${id}/items`, { query: { limit: 1000 } })).body,
+      ).items;
+    const liveCount = (id: string) =>
+      (
+        s.db
+          .prepare('SELECT COUNT(*) AS n FROM items WHERE vault_id = ? AND deleted = 0')
+          .get(id) as { n: number }
+      ).n;
+
+    /** Insert live items straight into the database, as if they had been written one by one. */
+    function seedLiveItems(vaultId: string, count: number): { id: string; seq: number }[] {
+      const first =
+        (s.db.prepare("SELECT value FROM counters WHERE name = 'seq'").get() as { value: number })
+          .value + 1;
+      const placeholder = 'v1.' + 'A'.repeat(76);
+      const insert = s.db.prepare(
+        `INSERT INTO items (vault_id, id, seq, deleted, ciphertext, key_version, updated_at, updated_by)
+         VALUES (?, ?, ?, 0, ?, 1, ?, ?)`,
+      );
+      const seeded = Array.from({ length: count }, (_, i) => ({
+        id: randomUUID(),
+        seq: first + i,
+      }));
+      s.db.transaction(() => {
+        for (const item of seeded) {
+          insert.run(vaultId, item.id, item.seq, placeholder, new Date().toISOString(), alice.id);
+        }
+        s.db.prepare("UPDATE counters SET value = ? WHERE name = 'seq'").run(first + count - 1);
+      })();
+      return seeded;
+    }
+
+    it('refuses a rotation built from items that were edited meanwhile, and writes nothing', async () => {
+      const v = await alice.createVault('Race');
+      expect((await alice.addMember(v, carol, 'editor')).status).toBe(201);
+      await carol.syncKeys();
+      const [one, two] = [randomUUID(), randomUUID()];
+      const first = itemResponseSchema.parse((await alice.putItem(v, one, 'one', null)).body).item;
+      const second = itemResponseSchema.parse((await alice.putItem(v, two, 'two', null)).body).item;
+
+      // The owner snapshots both items to re-encrypt them; meanwhile the editor changes the first.
+      const newKey = newVaultKey();
+      alice.setKey(v, 2, newKey);
+      const rotation = (snapshot: { id: string; seq: number }[], labels: string[]) => ({
+        key_version: 2,
+        name_enc: encryptVaultName(newKey, v, 'Race (rotated)'),
+        members: [alice, carol].map((m) => ({
+          user_id: m.id,
+          wrapped_key: wrapVaultKey(newKey, m.keypair.publicKey),
+        })),
+        items: snapshot.map((item, i) => ({
+          id: item.id,
+          ciphertext: alice.encrypt(v, item.id, labels[i]!, 2),
+          base_seq: item.seq,
+        })),
+      });
+      const edited = itemResponseSchema.parse(
+        (await carol.putItem(v, one, 'one edited', first.seq)).body,
+      ).item;
+
+      const url = `/api/v1/vaults/${v}/rotate`;
+      const stale = await alice.req('POST', url, {
+        body: rotation([first, second], ['one', 'two']),
+      });
+      expect(stale.status).toBe(409);
+      const detail = rotateConflictResponseSchema.parse(stale.body);
+      expect(detail.error.code).toBe('conflict');
+      expect(detail.stale_item_ids).toEqual([one]);
+      expect(detail.expected.item_ids.sort()).toEqual([one, two].sort());
+
+      // Nothing was written: the old key, the editor's change and the other item are intact.
+      expect((await vaultOf(alice, v)).key_version).toBe(1);
+      const after = await itemsOf(alice, v);
+      const afterOne = after.find((i) => i.id === one)!;
+      const afterTwo = after.find((i) => i.id === two)!;
+      expect(afterOne).toMatchObject({ seq: edited.seq, key_version: 1 });
+      expect(alice.decrypt(afterOne)).toBe('one edited');
+      expect(afterTwo).toMatchObject({ seq: second.seq, key_version: 1 });
+
+      // A rotation rebuilt from the fresh state goes through and keeps the edit.
+      const ok = await alice.req('POST', url, {
+        body: rotation([afterOne, afterTwo], ['one edited', 'two']),
+      });
+      expect(ok.status).toBe(200);
+      const rotated = await itemsOf(alice, v);
+      expect(rotated.map((i) => i.key_version)).toEqual([2, 2]);
+      expect(rotated.map((i) => alice.decrypt(i)).sort()).toEqual(['one edited', 'two']);
+    });
+
+    it('refuses to rename a vault with a key version that has been rotated away', async () => {
+      const v = await alice.createVault('Rename');
+      const oldKey = alice.keyFor(v);
+      const newKey = newVaultKey();
+      alice.setKey(v, 2, newKey);
+      const rotated = await alice.req('POST', `/api/v1/vaults/${v}/rotate`, {
+        body: {
+          key_version: 2,
+          name_enc: encryptVaultName(newKey, v, 'After rotation'),
+          members: [
+            { user_id: alice.id, wrapped_key: wrapVaultKey(newKey, alice.keypair.publicKey) },
+          ],
+          items: [],
+        },
+      });
+      expect(rotated.status).toBe(200);
+
+      const url = `/api/v1/vaults/${v}`;
+      const stale = await alice.req('PATCH', url, {
+        body: { name_enc: encryptVaultName(oldKey, v, 'Stale'), key_version: 1 },
+      });
+      expect(stale.status).toBe(409);
+      expect(errorEnvelopeSchema.parse(stale.body).error.code).toBe('key_version_mismatch');
+      expect(alice.decryptName(await vaultOf(alice, v))).toBe('After rotation');
+
+      const missing = await alice.req('PATCH', url, {
+        body: { name_enc: encryptVaultName(newKey, v, 'No version') },
+      });
+      expect(missing.status).toBe(400);
+
+      const fresh = await alice.req('PATCH', url, {
+        body: { name_enc: encryptVaultName(newKey, v, 'Fresh'), key_version: 2 },
+      });
+      expect(fresh.status).toBe(200);
+      expect(alice.decryptName(await vaultOf(alice, v))).toBe('Fresh');
+    });
+
+    it('rejects item ciphertexts over the size limit with 413 payload_too_large', async () => {
+      const v = await alice.createVault('Sizes');
+      const body = (b64: number) => 'v1.' + 'A'.repeat(b64);
+      const largest = body(Math.floor((MAX_ITEM_CIPHERTEXT_LENGTH - 3) / 4) * 4);
+      const tooLong = body(Math.floor((MAX_ITEM_CIPHERTEXT_LENGTH - 3) / 4) * 4 + 4);
+      expect(largest.length).toBeLessThanOrEqual(MAX_ITEM_CIPHERTEXT_LENGTH);
+      expect(tooLong.length).toBeGreaterThan(MAX_ITEM_CIPHERTEXT_LENGTH);
+
+      const put = (id: string, ciphertext: string) =>
+        alice.req('PUT', `/api/v1/vaults/${v}/items/${id}`, {
+          body: { ciphertext, key_version: 1, base_seq: null },
+        });
+      expect((await put(randomUUID(), largest)).status).toBe(200);
+      const refused = await put(randomUUID(), tooLong);
+      expect(refused.status).toBe(413);
+      expect(errorEnvelopeSchema.parse(refused.body).error.code).toBe('payload_too_large');
+      expect(liveCount(v)).toBe(1);
+
+      // A batch with one oversized put is refused whole.
+      const okId = randomUUID();
+      const batch = await alice.req('POST', `/api/v1/vaults/${v}/items/batch`, {
+        body: {
+          ops: [
+            { op: 'put', id: okId, ciphertext: largest, key_version: 1, base_seq: null },
+            { op: 'put', id: randomUUID(), ciphertext: tooLong, key_version: 1, base_seq: null },
+          ],
+        },
+      });
+      expect(batch.status).toBe(413);
+      expect(errorEnvelopeSchema.parse(batch.body).error.code).toBe('payload_too_large');
+      expect(liveCount(v)).toBe(1);
+
+      // So is a rotation that carries one.
+      const key = newVaultKey();
+      const rotate = await alice.req('POST', `/api/v1/vaults/${v}/rotate`, {
+        body: {
+          key_version: 2,
+          name_enc: encryptVaultName(key, v, 'x'),
+          members: [{ user_id: alice.id, wrapped_key: wrapVaultKey(key, alice.keypair.publicKey) }],
+          items: [{ id: randomUUID(), ciphertext: tooLong, base_seq: 0 }],
+        },
+      });
+      expect(rotate.status).toBe(413);
+      expect((await vaultOf(alice, v)).key_version).toBe(1);
+    });
+
+    it('stops creating items at the live-item limit with 409 vault_full, and still rotates', async () => {
+      const v = await alice.createVault('Full');
+      const seeded = seedLiveItems(v, MAX_LIVE_ITEMS_PER_VAULT);
+      expect(liveCount(v)).toBe(MAX_LIVE_ITEMS_PER_VAULT);
+
+      const refused = await alice.putItem(v, randomUUID(), 'one too many', null);
+      expect(refused.status).toBe(409);
+      expect(errorEnvelopeSchema.parse(refused.body).error.code).toBe('vault_full');
+      expect(liveCount(v)).toBe(MAX_LIVE_ITEMS_PER_VAULT);
+
+      // In a batch the create fails on its own and the edit of an existing item still applies.
+      const extraId = randomUUID();
+      const batch = await alice.req('POST', `/api/v1/vaults/${v}/items/batch`, {
+        body: {
+          ops: [
+            {
+              op: 'put',
+              id: extraId,
+              ciphertext: alice.encrypt(v, extraId, 'extra'),
+              key_version: 1,
+              base_seq: null,
+            },
+            {
+              op: 'put',
+              id: seeded[1]!.id,
+              ciphertext: alice.encrypt(v, seeded[1]!.id, 'edit'),
+              key_version: 1,
+              base_seq: seeded[1]!.seq,
+            },
+          ],
+        },
+      });
+      expect(batch.status).toBe(200);
+      const [created, edited] = batchResponseSchema.parse(batch.body).results;
+      expect(created?.status === 'error' && created.error.code).toBe('vault_full');
+      expect(edited?.status).toBe('ok');
+      expect(liveCount(v)).toBe(MAX_LIVE_ITEMS_PER_VAULT);
+
+      // Deleting frees a slot, which one create takes; a tombstone cannot be revived past it.
+      const removed = await alice.req('DELETE', `/api/v1/vaults/${v}/items/${seeded[2]!.id}`, {
+        query: { base_seq: seeded[2]!.seq },
+      });
+      expect(removed.status).toBe(200);
+      const tombstone = itemResponseSchema.parse(removed.body).item;
+      expect(liveCount(v)).toBe(MAX_LIVE_ITEMS_PER_VAULT - 1);
+      expect((await alice.putItem(v, randomUUID(), 'fits', null)).status).toBe(200);
+      const revive = await alice.putItem(v, tombstone.id, 'revived', tombstone.seq);
+      expect(revive.status).toBe(409);
+      expect(revive.body.error.code).toBe('vault_full');
+
+      // A vault at the limit can still be rotated.
+      const key = newVaultKey();
+      const current = s.db
+        .prepare('SELECT id, seq FROM items WHERE vault_id = ? AND deleted = 0')
+        .all(v) as { id: string; seq: number }[];
+      expect(current).toHaveLength(MAX_LIVE_ITEMS_PER_VAULT);
+      const rotate = await alice.req('POST', `/api/v1/vaults/${v}/rotate`, {
+        body: {
+          key_version: 2,
+          name_enc: encryptVaultName(key, v, 'Full (rotated)'),
+          members: [{ user_id: alice.id, wrapped_key: wrapVaultKey(key, alice.keypair.publicKey) }],
+          items: current.map((i) => ({
+            id: i.id,
+            ciphertext: 'v1.' + 'B'.repeat(76),
+            base_seq: i.seq,
+          })),
+        },
+      });
+      expect(rotate.status).toBe(200);
+      expect(vaultSchema.parse(rotate.body).key_version).toBe(2);
+    });
   });
 });

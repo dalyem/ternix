@@ -5,7 +5,12 @@ import rateLimit from '@fastify/rate-limit';
 import websocket from '@fastify/websocket';
 import Fastify, { type FastifyError, type FastifyInstance } from 'fastify';
 import { ready as readyCore } from '@ternix/core/crypto';
-import { ERROR_CODES, ERROR_STATUS, type ErrorCode } from '@ternix/core/protocol';
+import {
+  DEFAULT_BODY_LIMIT_BYTES,
+  ERROR_CODES,
+  ERROR_STATUS,
+  type ErrorCode,
+} from '@ternix/core/protocol';
 import type { Config } from './config.js';
 import type { AppContext } from './context.js';
 import { migrate, openDatabase, Sql, type Db } from './db.js';
@@ -19,8 +24,6 @@ import { itemRoutes } from './routes/items.js';
 import { vaultRoutes } from './routes/vaults.js';
 import { wsRoutes } from './routes/ws.js';
 import { Store } from './store.js';
-
-const MIB = 1024 * 1024;
 
 export interface BuiltApp {
   app: FastifyInstance;
@@ -39,7 +42,7 @@ function readVersion(): string {
 
 function codeForStatus(status: number): ErrorCode {
   for (const code of ERROR_CODES) if (ERROR_STATUS[code] === status) return code;
-  return status === 405 || status === 413 || status === 415 ? 'bad_request' : 'internal';
+  return status === 405 || status === 415 ? 'bad_request' : 'internal';
 }
 
 /** Build the server. Nothing listens until the caller calls `app.listen`. */
@@ -63,7 +66,7 @@ export async function buildApp(config: Config): Promise<BuiltApp> {
 
   const app = Fastify({
     trustProxy: config.trustProxy,
-    bodyLimit: MIB,
+    bodyLimit: DEFAULT_BODY_LIMIT_BYTES,
     logger:
       config.logLevel === 'silent'
         ? false

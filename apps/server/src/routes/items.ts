@@ -3,16 +3,15 @@ import {
   batchRequestSchema,
   deleteItemQuerySchema,
   listItemsQuerySchema,
+  MAX_BATCH_BODY_BYTES,
   putItemRequestSchema,
   type BatchResult,
 } from '@ternix/core/protocol';
-import { authenticator } from '../auth.js';
+import { requireSession } from '../auth.js';
 import type { AppContext } from '../context.js';
 import { ApiError } from '../errors.js';
 import type { ItemOutcome } from '../store.js';
 import { parse, requireVault, uuidParam } from '../validate.js';
-
-const MIB = 1024 * 1024;
 
 export async function itemRoutes(app: FastifyInstance, ctx: AppContext): Promise<void> {
   const { store, hub } = ctx;
@@ -25,7 +24,7 @@ export async function itemRoutes(app: FastifyInstance, ctx: AppContext): Promise
     });
 
   await app.register(async (authed) => {
-    authed.addHook('onRequest', authenticator(ctx));
+    requireSession(authed, ctx);
 
     authed.get('/api/v1/vaults/:id/items', async (req) => {
       const { vault } = requireVault(
@@ -87,30 +86,34 @@ export async function itemRoutes(app: FastifyInstance, ctx: AppContext): Promise
       return respond(outcome, vault.id, reply);
     });
 
-    authed.post('/api/v1/vaults/:id/items/batch', { bodyLimit: 20 * MIB }, async (req) => {
-      const userId = req.auth.user.id;
-      const { vault } = requireVault(store, userId, (req.params as { id: string }).id, 'editor');
-      const { ops } = parse(batchRequestSchema, req.body);
-      const results = store.transaction(() =>
-        ops.map((op): BatchResult => {
-          const outcome =
-            op.op === 'put'
-              ? store.putItem(vault, userId, op.id, op.ciphertext, op.key_version, op.base_seq)
-              : store.deleteItem(vault, userId, op.id, op.base_seq);
-          if (outcome.status === 'ok') return { id: op.id, status: 'ok', item: outcome.item };
-          if (outcome.status === 'conflict') {
-            return { id: op.id, status: 'conflict', current: outcome.current };
-          }
-          return {
-            id: op.id,
-            status: 'error',
-            error: { code: outcome.code, message: outcome.message },
-          };
-        }),
-      );
-      const seqs = results.flatMap((r) => (r.status === 'ok' ? [r.item.seq] : []));
-      if (seqs.length > 0) notifyChanged(vault.id, Math.max(...seqs));
-      return { results };
-    });
+    authed.post(
+      '/api/v1/vaults/:id/items/batch',
+      { bodyLimit: MAX_BATCH_BODY_BYTES },
+      async (req) => {
+        const userId = req.auth.user.id;
+        const { vault } = requireVault(store, userId, (req.params as { id: string }).id, 'editor');
+        const { ops } = parse(batchRequestSchema, req.body);
+        const results = store.transaction(() =>
+          ops.map((op): BatchResult => {
+            const outcome =
+              op.op === 'put'
+                ? store.putItem(vault, userId, op.id, op.ciphertext, op.key_version, op.base_seq)
+                : store.deleteItem(vault, userId, op.id, op.base_seq);
+            if (outcome.status === 'ok') return { id: op.id, status: 'ok', item: outcome.item };
+            if (outcome.status === 'conflict') {
+              return { id: op.id, status: 'conflict', current: outcome.current };
+            }
+            return {
+              id: op.id,
+              status: 'error',
+              error: { code: outcome.code, message: outcome.message },
+            };
+          }),
+        );
+        const seqs = results.flatMap((r) => (r.status === 'ok' ? [r.item.seq] : []));
+        if (seqs.length > 0) notifyChanged(vault.id, Math.max(...seqs));
+        return { results };
+      },
+    );
   });
 }

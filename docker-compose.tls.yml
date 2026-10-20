@@ -1,0 +1,31 @@
+# Automatic HTTPS for the Ternix server. An override of docker-compose.yml, used as
+#
+#   docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d --build
+#
+# It is a separate file, not a profile, because Compose interpolates every service in
+# docker-compose.yml even when its profile is off: a required variable there would break a
+# plain `docker compose up`.
+#
+# Needs TERNIX_DOMAIN (a DNS name pointing at this host) and TERNIX_TRUST_PROXY=true so rate
+# limits see real client addresses; set both in `.env`.
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - ternix
+    environment:
+      TERNIX_DOMAIN: ${TERNIX_DOMAIN:?set TERNIX_DOMAIN to the public host name}
+    ports:
+      - '80:80'
+      - '443:443'
+      - '443:443/udp'
+    volumes:
+      - ./apps/server/deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  caddy-data:
+  caddy-config:

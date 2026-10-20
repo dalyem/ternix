@@ -16,6 +16,7 @@ import {
 import {
   call,
   createInvite,
+  holdRequest,
   login,
   register,
   registerRaw,
@@ -326,6 +327,123 @@ describe('password change', () => {
         body: { email: 'p@example.com' },
       });
       expect(pre.body.kdf.salt).toBe(newKdf.salt);
+    } finally {
+      await s.close();
+    }
+  });
+});
+
+describe('requests that outlive their session', () => {
+  /** A password-change body that proves knowledge of `from` and installs `to`. */
+  async function changeBody(owner: Client, from: string, to: string, saltByte: number) {
+    const kdf = { ...owner.kdf, salt: toB64(new Uint8Array(16).fill(saltByte)) };
+    const current = await deriveKeys(from, owner.kdf);
+    const next = await deriveKeys(to, kdf);
+    return {
+      current_auth_key: toB64(current.authKey),
+      new_auth_key: toB64(next.authKey),
+      new_kdf: kdf,
+      new_encrypted_private_key: encryptPrivateKey(next.masterKey, owner.keypair.privateKey),
+    };
+  }
+
+  it('refuses a delayed password change from a device revoked in the meantime', async () => {
+    const s = await startServer();
+    try {
+      const a = await register(s.app, { email: 'r@example.com', password: 'old password' });
+      const b = await login(s.app, 'r@example.com', 'old password');
+
+      // A's headers pass authentication; its body (old key, attacker's new password) is held back.
+      const held = await holdRequest(
+        s.app,
+        'POST',
+        '/api/v1/me/password',
+        a.token,
+        await changeBody(a, 'old password', 'attacker password', 1),
+      );
+      // B changes the password and revokes A.
+      const changed = await b.req('POST', '/api/v1/me/password', {
+        body: await changeBody(b, 'old password', 'b new password', 2),
+      });
+      expect(changed.status).toBe(204);
+
+      const late = await held.finish();
+      expect(late.status).toBe(401);
+      expect(errorEnvelopeSchema.parse(late.body).error.code).toBe('unauthorized');
+
+      // B's credential was not overwritten.
+      await expect(login(s.app, 'r@example.com', 'attacker password')).rejects.toThrow(
+        /login failed: 401/,
+      );
+      await login(s.app, 'r@example.com', 'b new password');
+      expect((await b.req('GET', '/api/v1/me')).status).toBe(200);
+    } finally {
+      await s.close();
+    }
+  });
+
+  it('verifies the current key against the hash at write time, not the one cached at login', async () => {
+    const s = await startServer();
+    try {
+      const a = await register(s.app, { email: 'h@example.com', password: 'old password' });
+
+      // Request 1 is held back with the old key; request 2, from the same device, wins.
+      const held = await holdRequest(
+        s.app,
+        'POST',
+        '/api/v1/me/password',
+        a.token,
+        await changeBody(a, 'old password', 'late password', 1),
+      );
+      const first = await a.req('POST', '/api/v1/me/password', {
+        body: await changeBody(a, 'old password', 'first password', 2),
+      });
+      expect(first.status).toBe(204);
+
+      // The session is still valid, but the old key no longer matches the stored hash.
+      const late = await held.finish();
+      expect(late.status).toBe(401);
+      expect(late.body.error.message).toBe('Current password is incorrect');
+      await expect(login(s.app, 'h@example.com', 'late password')).rejects.toThrow(
+        /login failed: 401/,
+      );
+      await login(s.app, 'h@example.com', 'first password');
+    } finally {
+      await s.close();
+    }
+  });
+
+  it('only replaces the credential that was verified', async () => {
+    const s = await startServer();
+    try {
+      const a = await register(s.app, { email: 'c@example.com', password: 'old password' });
+      const { store } = s.ctx;
+      const stale = store.getUserById(a.id)!.auth_hash;
+      const kdf = a.kdf;
+
+      expect(store.updatePassword(a.id, stale, 'hash-one', kdf, 'v1.one')).toBe(true);
+      // A second writer that verified the old hash loses and changes nothing.
+      expect(store.updatePassword(a.id, stale, 'hash-two', kdf, 'v1.two')).toBe(false);
+      const row = store.getUserById(a.id)!;
+      expect(row.auth_hash).toBe('hash-one');
+      expect(row.encrypted_private_key).toBe('v1.one');
+    } finally {
+      await s.close();
+    }
+  });
+
+  it('refuses a delayed device revocation from a revoked device', async () => {
+    const s = await startServer();
+    try {
+      const a = await register(s.app, { email: 'd@example.com', password: 'pw' });
+      const b = await login(s.app, 'd@example.com', 'pw');
+      const c = await login(s.app, 'd@example.com', 'pw');
+
+      const held = await holdRequest(s.app, 'DELETE', `/api/v1/devices/${c.deviceId}`, a.token, {});
+      expect((await b.req('DELETE', `/api/v1/devices/${a.deviceId}`)).status).toBe(204);
+
+      expect((await held.finish()).status).toBe(401);
+      expect((await c.req('GET', '/api/v1/me')).status).toBe(200);
     } finally {
       await s.close();
     }

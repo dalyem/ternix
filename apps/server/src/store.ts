@@ -1,15 +1,16 @@
-import type {
-  Device,
-  Invite,
-  Item,
-  KdfParams,
-  Member,
-  RotateRequest,
-  User,
-  UserRole,
-  Vault,
-  VaultKind,
-  VaultRole,
+import {
+  MAX_LIVE_ITEMS_PER_VAULT,
+  type Device,
+  type Invite,
+  type Item,
+  type KdfParams,
+  type Member,
+  type RotateRequest,
+  type User,
+  type UserRole,
+  type Vault,
+  type VaultKind,
+  type VaultRole,
 } from '@ternix/core/protocol';
 import type { Db, Sql } from './db.js';
 
@@ -94,11 +95,20 @@ const now = () => new Date().toISOString();
 export type ItemOutcome =
   | { status: 'ok'; item: Item }
   | { status: 'conflict'; current: Item }
-  | { status: 'error'; code: 'key_version_mismatch' | 'not_found'; message: string };
+  | {
+      status: 'error';
+      code: 'key_version_mismatch' | 'not_found' | 'vault_full';
+      message: string;
+    };
 
 export type RotateOutcome =
   | { ok: true }
-  | { ok: false; reason: 'conflict'; expected: { user_ids: string[]; item_ids: string[] } }
+  | {
+      ok: false;
+      reason: 'conflict';
+      expected: { user_ids: string[]; item_ids: string[] };
+      staleItemIds: string[];
+    }
   | { ok: false; reason: 'key_version_mismatch' };
 
 export class Store {
@@ -148,10 +158,25 @@ export class Store {
       );
   }
 
-  updatePassword(userId: string, authHash: string, kdf: KdfParams, encryptedPrivateKey: string) {
-    this.sql
-      .q('UPDATE users SET auth_hash = ?, kdf = ?, encrypted_private_key = ? WHERE id = ?')
-      .run(authHash, JSON.stringify(kdf), encryptedPrivateKey, userId);
+  /**
+   * Replace the credential only if `auth_hash` is still `expectedHash`, the hash the caller
+   * verified. False means another change got there first and nothing was written.
+   */
+  updatePassword(
+    userId: string,
+    expectedHash: string,
+    authHash: string,
+    kdf: KdfParams,
+    encryptedPrivateKey: string,
+  ): boolean {
+    return (
+      this.sql
+        .q(
+          `UPDATE users SET auth_hash = ?, kdf = ?, encrypted_private_key = ?
+           WHERE id = ? AND auth_hash = ?`,
+        )
+        .run(authHash, JSON.stringify(kdf), encryptedPrivateKey, userId, expectedHash).changes > 0
+    );
   }
 
   // Devices (one per session token)
@@ -267,8 +292,13 @@ export class Store {
       .run(v.id, v.kind, v.nameEnc, now());
   }
 
-  updateVaultName(id: string, nameEnc: string): void {
-    this.sql.q('UPDATE vaults SET name_enc = ? WHERE id = ?').run(nameEnc, id);
+  /** Rename only while the vault is still at `keyVersion`; false when it has been rotated. */
+  renameVault(id: string, nameEnc: string, keyVersion: number): boolean {
+    return (
+      this.sql
+        .q('UPDATE vaults SET name_enc = ? WHERE id = ? AND key_version = ?')
+        .run(nameEnc, id, keyVersion).changes > 0
+    );
   }
 
   deleteVault(id: string): void {
@@ -405,6 +435,14 @@ export class Store {
       .get(vaultId)!.seq;
   }
 
+  liveItemCount(vaultId: string): number {
+    return this.sql
+      .q<[string], { n: number }>(
+        'SELECT COUNT(*) AS n FROM items WHERE vault_id = ? AND deleted = 0',
+      )
+      .get(vaultId)!.n;
+  }
+
   private nextSeq(): number {
     return this.sql
       .q<[], { value: number }>(
@@ -458,6 +496,15 @@ export class Store {
       }
       if (current.seq !== baseSeq) return { status: 'conflict', current };
     }
+    // Creating, or reviving a tombstone, adds a live item.
+    const adds = !current || current.deleted;
+    if (adds && this.liveItemCount(vault.id) >= MAX_LIVE_ITEMS_PER_VAULT) {
+      return {
+        status: 'error',
+        code: 'vault_full',
+        message: `A vault holds at most ${MAX_LIVE_ITEMS_PER_VAULT} items`,
+      };
+    }
     const seq = this.nextSeq();
     const t = now();
     this.sql
@@ -498,7 +545,9 @@ export class Store {
 
   /**
    * Re-key a vault in one transaction. The member set and the non-deleted item set in the
-   * request must equal the server's, otherwise nothing changes and the expected IDs return.
+   * request must equal the server's, and every item's `base_seq` must still be its current
+   * `seq` (so a concurrent edit is never overwritten); otherwise nothing changes and the
+   * expected IDs and the stale item IDs return.
    */
   rotate(vault: VaultRow, userId: string, req: RotateRequest): RotateOutcome {
     return this.transaction((): RotateOutcome => {
@@ -506,17 +555,22 @@ export class Store {
         return { ok: false, reason: 'key_version_mismatch' };
       }
       const memberIds = this.memberUserIds(vault.id);
-      const itemIds = this.sql
-        .q<[string], { id: string }>(
-          'SELECT id FROM items WHERE vault_id = ? AND deleted = 0 ORDER BY id',
+      const liveItems = this.sql
+        .q<[string], { id: string; seq: number }>(
+          'SELECT id, seq FROM items WHERE vault_id = ? AND deleted = 0 ORDER BY id',
         )
-        .all(vault.id)
-        .map((r) => r.id);
+        .all(vault.id);
+      const itemIds = liveItems.map((r) => r.id);
+      const currentSeq = new Map(liveItems.map((r) => [r.id, r.seq]));
+      const staleItemIds = req.items
+        .filter((i) => currentSeq.has(i.id) && currentSeq.get(i.id) !== i.base_seq)
+        .map((i) => i.id);
       const sameSet = (expected: string[], given: string[]) =>
         given.length === expected.length &&
         new Set(given).size === given.length &&
         sameMembers(expected, given);
       if (
+        staleItemIds.length > 0 ||
         !sameSet(
           memberIds,
           req.members.map((m) => m.user_id),
@@ -530,6 +584,7 @@ export class Store {
           ok: false,
           reason: 'conflict',
           expected: { user_ids: memberIds, item_ids: itemIds },
+          staleItemIds,
         };
       }
       const setWrapped = this.sql.q(

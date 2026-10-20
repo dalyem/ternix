@@ -20,7 +20,7 @@ item plaintext.
 - Errors: HTTP status plus `{"error": {"code": "<code>", "message": "<text>"}}`.
   Codes: `bad_request`, `unauthorized`, `forbidden`, `not_found`, `conflict`,
   `rate_limited`, `registration_closed`, `invalid_invite`, `email_taken`,
-  `key_version_mismatch`, `internal`.
+  `key_version_mismatch`, `payload_too_large` (413), `vault_full` (409), `internal`.
 
 ## 2. Cryptography (libsodium)
 
@@ -37,7 +37,9 @@ authKey   = crypto_kdf_derive_from_key(32, 2, "tnxauth_", root)
 
 - `masterKey` never leaves the client. It decrypts the account private key.
 - `authKey` is sent to the server as the login credential. The server stores
-  only `crypto_pwhash_str(authKey)` (argon2id, server-side MODERATE limits).
+  only `crypto_pwhash_str(authKey)` (argon2id, `opslimit` 3, `memlimit` 64 MiB), because
+  the auth key is already the output of a 64 MiB client-side Argon2id, so an offline
+  guesser pays that cost per guess and a heavier server-side hash would only burden small servers.
 - The email is lowercased and trimmed before any use.
 - At login a client must refuse KDF parameters weaker than the defaults above
   (`isKdfStrongEnough`), so a malicious server cannot downgrade the KDF.
@@ -160,7 +162,10 @@ vault always has at least one owner; the last owner cannot leave or be demoted.
   `seq` is the highest item sequence number in the vault.
 - `POST /api/v1/vaults {id, name_enc, wrapped_key}` → `201 vault`. Creates a
   `shared` vault with the caller as `owner`, `key_version: 1`.
-- `PATCH /api/v1/vaults/:id {name_enc}` (owner).
+- `PATCH /api/v1/vaults/:id {name_enc, key_version}` (owner). `name_enc` is sealed with
+  the key of `key_version`, which must equal the vault's current one, otherwise
+  `409 key_version_mismatch` and the name is unchanged (a client holding a pre-rotation
+  key cannot write a name nobody can decrypt). The check is atomic with the update.
 - `DELETE /api/v1/vaults/:id` (owner, `shared` only). Deletes all items.
 - `GET /api/v1/vaults/:id/members` → `{members: [{user_id, email, name, public_key, role, added_at}]}`.
 - `POST /api/v1/vaults/:id/members {user_id, role, wrapped_key, key_version}` (owner).
@@ -174,13 +179,27 @@ vault always has at least one owner; the last owner cannot leave or be demoted.
 `POST /api/v1/vaults/:id/rotate` (owner):
 ```
 { key_version: <current + 1>, name_enc,
-  members: [{user_id, wrapped_key}],   // must be exactly the current member set
-  items:   [{id, ciphertext}] }        // must be exactly the current non-deleted item set
+  members: [{user_id, wrapped_key}],         // must be exactly the current member set
+  items:   [{id, ciphertext, base_seq}] }    // must be exactly the current non-deleted item set
 ```
-The server applies it in one transaction: it stores the new wrapped keys, re-encrypts
-the items in place with new `seq` values, and bumps `key_version`. If the member or
-item sets differ from the server's, it returns `409 conflict` with the expected IDs,
-so the client can refresh and retry.
+`base_seq` is the `seq` of the item the owner decrypted and re-encrypted `ciphertext` from.
+
+The server applies it in one transaction. Before writing anything it checks, against
+the stored state, that the member set and the item set match exactly and that every item's
+current `seq` equals its `base_seq`. If anything differs it changes nothing and returns
+```
+409 { error: {code: "conflict", ...},
+      expected: { user_ids: [...], item_ids: [...] },   // the server's member and live item IDs
+      stale_item_ids: [...] }                           // requested items whose seq is not base_seq
+```
+so a rotation can never overwrite an edit made while the owner was re-encrypting. The
+client refreshes (`GET .../items?since=`), re-encrypts the stale items and retries. If it
+passes, the server stores the new wrapped keys, replaces each item's ciphertext in place with
+a new `seq`, and bumps `key_version`. A wrong `key_version` is `409 key_version_mismatch`.
+
+A rotation carries every live item, so for a full vault (section 8) it is one request of
+about 157 MiB. Clients should rotate on a good connection and expect `409` when others are
+editing.
 
 ## 6. Items and sync
 
@@ -194,6 +213,9 @@ so a client that comes back after any length of time still sees the delete.
   `{items: [...], next_since, has_more}`, ordered by `seq` ascending, only items
   with `seq > since`. A full sync is `since=0`.
 - `PUT /api/v1/vaults/:id/items/:item_id {ciphertext, key_version, base_seq}` (editor+).
+  `ciphertext` is at most `MAX_ITEM_CIPHERTEXT_LENGTH` characters (`413 payload_too_large`).
+  Creating an item in a vault that already has `MAX_LIVE_ITEMS_PER_VAULT` live items is
+  `409 vault_full` (as is reviving a tombstone). Section 8 has the limits.
   `base_seq` is `null` to create, or the `seq` the client last saw. If the stored
   `seq` differs from `base_seq` (or the item exists and `base_seq` is null), the server
   returns `409 {error, current: item}`. `key_version` must match the vault's current one.
@@ -201,8 +223,11 @@ so a client that comes back after any length of time still sees the delete.
 - `DELETE /api/v1/vaults/:id/items/:item_id?base_seq=<seq>` (editor+). Same
   conflict rule. `200 {item}` (the tombstone).
 - `POST /api/v1/vaults/:id/items/batch {ops: [{op: "put"|"delete", id, ciphertext?, key_version?, base_seq}]}`
-  (editor+, at most 500 ops). Each op is applied on its own, in order:
+  (editor+, at most `MAX_BATCH_OPS` = 500 ops). Each op is applied on its own, in order:
   `200 {results: [{id, status: "ok"|"conflict"|"error", item?, current?, error?}]}`.
+  An op that would exceed `MAX_LIVE_ITEMS_PER_VAULT` gets `status: "error"` with code
+  `vault_full`. A put whose `ciphertext` is over the limit rejects the whole request with
+  `413 payload_too_large`.
 
 ### Client conflict rule
 On a conflict the client decrypts `current`. If the local payload's `updated_at`
@@ -224,3 +249,22 @@ Server events (they are hints; the client pulls with `GET .../items?since=`):
 - `{"type": "session.revoked"}`: the server then closes the socket.
 
 The client sends `{"type": "ping"}` every 30 s; the server answers `{"type": "pong"}`.
+
+## 8. Limits
+
+These bound the data so that every vault the server accepts can still be rotated in one
+request. The constants are exported from `@ternix/core/protocol`; clients enforce them
+before sending.
+
+| Constant                      | Value         | Effect                                                                   |
+| ----------------------------- | ------------- | ------------------------------------------------------------------------ |
+| `MAX_ITEM_CIPHERTEXT_LENGTH`  | 32768 chars   | Longest item `ciphertext`, `v1.` prefix included (about 24 KiB of plaintext). Larger: `413 payload_too_large`. |
+| `MAX_LIVE_ITEMS_PER_VAULT`    | 5000          | Most non-deleted items per vault. A create beyond it: `409 vault_full`. Tombstones do not count. |
+| `MAX_BATCH_OPS`               | 500           | Operations per batch request.                                            |
+| `MAX_BATCH_BODY_BYTES`        | 20 MiB        | Body limit of the batch endpoint (500 maximal puts are about 16 MiB).    |
+| `MAX_ROTATE_BODY_BYTES`       | 200 MiB       | Body limit of the rotate endpoint.                                       |
+| `DEFAULT_BODY_LIMIT_BYTES`    | 1 MiB         | Body limit of every other endpoint; larger: `413 payload_too_large`.     |
+
+The rotate limit follows from the others: a full vault is 5000 items of about
+32,858 bytes of JSON each (32768 characters of ciphertext, a UUID, `base_seq`, and field
+names), which is about 157 MiB, and the remaining room holds member keys.

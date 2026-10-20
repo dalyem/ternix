@@ -1,12 +1,21 @@
 import type { z } from 'zod';
 import { ApiError, badRequest, forbidden, notFound } from './errors.js';
-import { uuidSchema, type VaultRole } from '@ternix/core/protocol';
+import { PAYLOAD_TOO_LARGE_ISSUE, uuidSchema, type VaultRole } from '@ternix/core/protocol';
 import type { Store, VaultRow } from './store.js';
 
-/** Parse with a core schema; the error message names fields but never echoes values. */
+/**
+ * Parse with a core schema; the error message names fields but never echoes values. An
+ * over-long item ciphertext is `413 payload_too_large`, any other failure `400`.
+ */
 export function parse<S extends z.ZodTypeAny>(schema: S, data: unknown): z.infer<S> {
   const result = schema.safeParse(data);
   if (result.success) return result.data;
+  const tooLarge = result.error.issues.some(
+    (i) => i.code === 'custom' && i.params?.code === PAYLOAD_TOO_LARGE_ISSUE,
+  );
+  if (tooLarge) {
+    throw new ApiError('payload_too_large', 'An item ciphertext exceeds the size limit');
+  }
   const issues = result.error.issues
     .slice(0, 3)
     .map((i) => `${i.path.join('.') || 'body'}: ${i.message}`.slice(0, 160));
