@@ -2,7 +2,9 @@
 
 This is the contract between `apps/server` and `apps/desktop`. Types live in
 `packages/core` (zod schemas); this file is the reference they implement. Change
-both sides and this file together.
+both sides and this file together. Where this file does not spell out a
+response body (for example add-member, rotate, or admin list responses), the
+schemas in `packages/core/src/protocol` are the definition.
 
 The server is zero-knowledge for vault contents: it stores ciphertext, wrapped
 keys and public keys, and never sees a master password, master key, vault key or
@@ -37,6 +39,8 @@ authKey   = crypto_kdf_derive_from_key(32, 2, "tnxauth_", root)
 - `authKey` is sent to the server as the login credential. The server stores
   only `crypto_pwhash_str(authKey)` (argon2id, server-side MODERATE limits).
 - The email is lowercased and trimmed before any use.
+- At login a client must refuse KDF parameters weaker than the defaults above
+  (`isKdfStrongEnough`), so a malicious server cannot downgrade the KDF.
 
 ### 2.2 Account keypair
 
