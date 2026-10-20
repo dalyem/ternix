@@ -115,6 +115,21 @@ describe('rpc dispatch', () => {
     });
   });
 
+  it('validates the member key pinning methods', async () => {
+    const key = 'A'.repeat(43) + '=';
+    for (const method of ['vaults.markMemberVerified', 'vaults.acceptMemberKey'] as const) {
+      await rejected(method, { userId: 'nope', publicKey: key });
+      await rejected(method, { userId: uuid, publicKey: '' });
+      await rejected(method, { userId: uuid, publicKey: 'not base64!' });
+      await rejected(method, { userId: uuid, publicKey: 'AAAA' });
+      await rejected(method, { userId: uuid, publicKey: key, extra: 1 });
+      await rejected(method, { userId: uuid });
+      const { dispatch, handlers } = setup();
+      expect((await dispatch(method, { userId: uuid, publicKey: key })).ok).toBe(true);
+      expect(handlers[method]).toHaveBeenCalledWith({ userId: uuid, publicKey: key });
+    }
+  });
+
   it('bounds terminal sizes and prompt answers', async () => {
     await rejected('ssh.open', { hostId: uuid, cols: 0, rows: 24 });
     await rejected('ssh.open', { hostId: uuid, cols: 80, rows: 100000 });

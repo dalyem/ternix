@@ -4,7 +4,8 @@ export interface AutoLockDeps {
   /** Minutes of idle time that lock the vault; 0 = never. */
   minutes(): number;
   isUnlocked(): boolean;
-  lock(): void;
+  /** Returns once the lock is complete (pending cache writes stored). */
+  lock(): Promise<void> | void;
 }
 
 /** Locks the vault when the system has been idle for the configured time. */
@@ -30,6 +31,9 @@ export class AutoLock {
   tick(): void {
     const minutes = this.deps.minutes();
     if (minutes <= 0 || !this.deps.isUnlocked()) return;
-    if (this.deps.idleSeconds() >= minutes * 60) this.deps.lock();
+    if (this.deps.idleSeconds() >= minutes * 60) {
+      // Never rejects into the timer: a failed cache write is the client's `error` event.
+      void Promise.resolve(this.deps.lock()).catch(() => undefined);
+    }
   }
 }

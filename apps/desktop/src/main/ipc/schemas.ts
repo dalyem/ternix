@@ -8,7 +8,7 @@ import {
   snippetPayloadSchema,
   sshKeyPayloadSchema,
 } from '@ternix/core/items';
-import { uuidSchema, vaultRoleSchema } from '@ternix/core/protocol';
+import { publicKeySchema, uuidSchema, vaultRoleSchema } from '@ternix/core/protocol';
 import type { RpcMethodName, RpcMethods } from '../../shared/ipc.js';
 import type { ItemDraft } from '../../shared/types.js';
 import { settingsPatchSchema } from '../app/settings.js';
@@ -109,6 +109,8 @@ export const rpcSchemas: Schemas = {
     role: vaultRoleSchema,
     expectedPublicKey: text(256),
   }),
+  'vaults.markMemberVerified': obj({ userId: id, publicKey: publicKeySchema }),
+  'vaults.acceptMemberKey': obj({ userId: id, publicKey: publicKeySchema }),
   'vaults.changeRole': obj({ vaultId: id, userId: id, role: vaultRoleSchema }),
   'vaults.removeMember': obj({ vaultId: id, userId: id }),
   'vaults.leave': obj({ vaultId: id }),

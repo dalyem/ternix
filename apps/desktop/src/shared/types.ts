@@ -199,4 +199,6 @@ export interface ErrorDto {
   status?: number;
   /** Set for `member_key_changed`. */
   keyChange?: KeyChangeDto;
+  /** Set for `unexpected_redirect` when the server said where it redirects to. */
+  location?: string;
 }

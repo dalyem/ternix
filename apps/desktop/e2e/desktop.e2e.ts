@@ -6,6 +6,7 @@ import {
   _electron as electron,
   type ElectronApplication,
   expect,
+  type Locator,
   type Page,
   test,
 } from '@playwright/test';
@@ -131,6 +132,20 @@ async function typeInTerminal(page: Page, text: string) {
   await page.keyboard.press('Enter');
 }
 
+/** A pin badge ("verified", "unverified", "key changed") inside `scope`. */
+const pinBadge = (scope: Locator, text: string) =>
+  scope.locator('.badge').filter({ hasText: new RegExp(`^${text}$`) });
+
+/** Look a person up on the Sharing page, confirm their fingerprint and add them. */
+async function addMemberViaUi(page: Page, email: string) {
+  await page.getByLabel('Email of the person to add').fill(email);
+  await page.getByRole('button', { name: 'Look up' }).click();
+  await expect(page.locator('.card .fingerprint')).toBeVisible();
+  await page.getByRole('checkbox', { name: /checked this fingerprint/ }).check();
+  await page.getByRole('button', { name: 'Add to vault' }).click();
+  await expect(page.getByTestId(`member-${email}`)).toBeVisible();
+}
+
 const nav = (page: Page, name: RegExp | string) =>
   page.locator('nav.sidebar').getByRole('button', { name });
 
@@ -164,6 +179,14 @@ test('packaged app: setup, register, host, host key, terminal, forwards, snippet
     expect(exposed.hasProcess).toBe('undefined');
     expect(exposed.ipcRenderer).toBe('undefined');
     expect(exposed.origin).toBe('ternix://app');
+  });
+
+  await test.step('the setup screen explains which addresses are accepted', async () => {
+    const hint = page.locator('.hint');
+    await expect(hint).toContainText('https://<machine>.<tailnet>.ts.net');
+    await expect(hint).toContainText('Tailscale serve provides the certificate');
+    await expect(hint).toContainText('Plain http:// works only for localhost.');
+    await shot(page, '00-setup-hint');
   });
 
   await test.step('main rejects malformed requests', async () => {
@@ -397,6 +420,34 @@ test('packaged app: setup, register, host, host key, terminal, forwards, snippet
     await expectTerminalLine(page, 'keyauth');
   });
 
+  await test.step('a new host starts with the default port of its group', async () => {
+    await page.getByRole('tab', { name: 'Vaults' }).click();
+    await nav(page, /^Hosts/).click();
+    await page.getByRole('button', { name: 'New group' }).click();
+    await page.getByLabel('Label', { exact: true }).fill('lab');
+    await page.getByLabel('Default port').fill('2222');
+    await expect(page.getByText('Default port for new hosts in this group.')).toBeVisible();
+    await shot(page, '12-group-port');
+    await page.getByRole('button', { name: 'Save' }).click();
+    await expect(page.locator('.group-label', { hasText: 'lab' })).toBeVisible();
+
+    await page.getByTestId('new-host').click();
+    const port = page.getByLabel('Port', { exact: true });
+    const group = page.getByLabel('Group', { exact: true });
+    await expect(port).toHaveValue('22');
+    await group.selectOption({ label: 'lab' });
+    await expect(port).toHaveValue('2222');
+    await group.selectOption({ label: 'None' });
+    await expect(port).toHaveValue('22');
+    await group.selectOption({ label: 'lab' });
+    await expect(port).toHaveValue('2222');
+    // A port the user typed is never replaced.
+    await port.fill('2200');
+    await group.selectOption({ label: 'None' });
+    await expect(port).toHaveValue('2200');
+    await page.getByRole('button', { name: 'Cancel' }).click();
+  });
+
   await test.step('admin settings: invites and devices', async () => {
     await nav(page, /^Settings/).click();
     await page.getByRole('tab', { name: 'Devices' }).click();
@@ -477,6 +528,12 @@ test('sharing: fingerprint check, roles, realtime, removal', async () => {
     await shot(a, 'share-1-verify');
     await add.click();
     await expect(a.getByRole('row', { name: /Bob/ })).toContainText('viewer');
+    // Alice checked the fingerprint herself, so her device pinned Bob's key as verified.
+    const bobRow = a.getByTestId('member-bob@example.com');
+    await expect(pinBadge(bobRow, 'verified')).toBeVisible();
+    await expect(pinBadge(bobRow, 'unverified')).toHaveCount(0);
+    await expect(bobRow.getByRole('button', { name: 'Mark verified' })).toHaveCount(0);
+    await shot(a, 'share-1b-bob-verified');
   });
 
   await test.step('a host saved in the shared vault reaches Bob in real time, read-only', async () => {
@@ -495,6 +552,35 @@ test('sharing: fingerprint check, roles, realtime, removal', async () => {
     await expect(b.getByRole('dialog', { name: /read only/ })).toBeVisible();
     await expect(b.getByRole('button', { name: 'Save' })).toHaveCount(0);
     await b.getByRole('button', { name: 'Close' }).click();
+  });
+
+  await test.step("Bob has never seen Alice's key: unverified until he compares it", async () => {
+    await nav(a, /^Sharing/).click();
+    const aliceFingerprint = (
+      (await a.locator('.server-card .fingerprint').textContent()) ?? ''
+    ).trim();
+    expect(aliceFingerprint).toMatch(/^[0-9a-f ]{20,}$/i);
+
+    await nav(b, /^Sharing/).click();
+    const aliceRow = b.getByTestId('member-alice2@example.com');
+    await expect(aliceRow).toBeVisible();
+    await expect(pinBadge(aliceRow, 'unverified')).toBeVisible();
+    await expect(pinBadge(b.getByTestId('member-bob@example.com'), 'verified')).toBeVisible();
+    await shot(b, 'share-1c-bob-sees-unverified');
+
+    await aliceRow.getByRole('button', { name: 'Mark verified' }).click();
+    const dialog = b.getByRole('dialog', { name: /Mark .* key as verified/ });
+    await expect(dialog.locator('.fingerprint')).toHaveText(aliceFingerprint);
+    await shot(b, 'share-1d-mark-verified');
+    await dialog.getByRole('button', { name: 'Cancel' }).click();
+    await expect(pinBadge(aliceRow, 'unverified')).toBeVisible();
+
+    await aliceRow.getByRole('button', { name: 'Mark verified' }).click();
+    await b.getByRole('dialog').getByRole('button', { name: 'It matches, mark verified' }).click();
+    await expect(pinBadge(aliceRow, 'verified')).toBeVisible();
+    await expect(pinBadge(aliceRow, 'unverified')).toHaveCount(0);
+    await expect(aliceRow.getByRole('button', { name: 'Mark verified' })).toHaveCount(0);
+    await nav(b, /^Hosts/).click();
   });
 
   await test.step('promoting Bob to editor lets him edit', async () => {
@@ -520,6 +606,96 @@ test('sharing: fingerprint check, roles, realtime, removal', async () => {
 
   await alice.app.close();
   await bob.app.close();
+});
+
+test('sharing: a substituted member key is refused until the owner verifies it', async () => {
+  const alice = await launch(newUserDataDir());
+  const a = alice.page;
+  await registerUser(a, 'alice3@example.com', 'Alice Three');
+  for (const [email, name] of [
+    ['bob3@example.com', 'Bob Three'],
+    ['carol3@example.com', 'Carol Three'],
+  ] as const) {
+    const other = await launch(newUserDataDir());
+    await registerUser(other.page, email, name);
+    await other.app.close();
+  }
+  const keyVersions = () => server.db.sharedKeyVersions('alice3@example.com');
+
+  await test.step('Alice shares a vault with Bob and Carol', async () => {
+    await nav(a, /^Sharing/).click();
+    await a.getByRole('button', { name: 'New shared vault' }).click();
+    await a.getByLabel('Name').fill('Ops');
+    await a.getByRole('button', { name: 'Create', exact: true }).click();
+    await expect(a.getByRole('option', { name: /Ops/ })).toBeVisible();
+    await addMemberViaUi(a, 'bob3@example.com');
+    await addMemberViaUi(a, 'carol3@example.com');
+    expect(keyVersions()).toEqual([1]);
+  });
+
+  let carolFingerprint = '';
+  let evilFingerprint = '';
+  await test.step("the server swaps Carol's public key", async () => {
+    const carolRow = a.getByTestId('member-carol3@example.com');
+    carolFingerprint = (
+      (await carolRow.locator('.fingerprint').first().textContent()) ?? ''
+    ).trim();
+    server.db.substituteKey('carol3@example.com');
+
+    // Leave and come back so the member list is fetched again.
+    await nav(a, /^Hosts/).click();
+    await nav(a, /^Sharing/).click();
+    await expect(pinBadge(carolRow, 'key changed')).toBeVisible();
+    await expect(carolRow.getByText('Pinned earlier:')).toContainText(carolFingerprint);
+    evilFingerprint = ((await carolRow.locator('.fingerprint').first().textContent()) ?? '').trim();
+    expect(evilFingerprint).not.toBe(carolFingerprint);
+    await expect(pinBadge(a.getByTestId('member-bob3@example.com'), 'verified')).toBeVisible();
+    await shot(a, 'share-4-key-changed-row');
+  });
+
+  await test.step('removing Bob does not rotate: the key change dialog opens and nothing is sent', async () => {
+    await a.getByTestId('member-bob3@example.com').getByRole('button', { name: 'Remove' }).click();
+    await a.getByRole('dialog').getByRole('button', { name: 'Remove' }).click();
+    const notice = a.getByRole('alert').filter({ hasText: 'could not be rotated' });
+    await expect(notice).toBeVisible({ timeout: 60_000 });
+    await expect(a.getByTestId('member-bob3@example.com')).toHaveCount(0);
+
+    await notice.getByRole('button', { name: 'Review changed key' }).click();
+    const dialog = a.getByRole('dialog', { name: 'Encryption key changed' });
+    await expect(dialog).toBeVisible();
+    await expect(dialog).toContainText(carolFingerprint);
+    await expect(dialog).toContainText(evilFingerprint);
+    await expect(dialog).toContainText('may be an attack');
+    await shot(a, 'share-5-key-changed-dialog');
+
+    await dialog.getByRole('button', { name: 'Cancel' }).click();
+    await expect(dialog).toHaveCount(0);
+    expect(keyVersions()).toEqual([1]);
+  });
+
+  await test.step('the rotate button is refused the same way', async () => {
+    await a.getByRole('button', { name: 'Rotate vault key' }).click();
+    const dialog = a.getByRole('dialog', { name: 'Encryption key changed' });
+    await expect(dialog).toBeVisible();
+    await dialog.getByRole('button', { name: 'Cancel' }).click();
+    expect(keyVersions()).toEqual([1]);
+  });
+
+  await test.step('after Alice verifies the new fingerprint, rotation goes through', async () => {
+    await a.getByRole('button', { name: 'Rotate vault key' }).click();
+    const dialog = a.getByRole('dialog', { name: 'Encryption key changed' });
+    await dialog
+      .getByRole('button', { name: 'I verified the new fingerprint with carol3@example.com' })
+      .click();
+    await expect(dialog).toHaveCount(0);
+    await expect.poll(keyVersions, { message: 'vault key rotated on the server' }).toEqual([2]);
+    const carolRow = a.getByTestId('member-carol3@example.com');
+    await expect(pinBadge(carolRow, 'verified')).toBeVisible();
+    await expect(pinBadge(carolRow, 'key changed')).toHaveCount(0);
+    await shot(a, 'share-6-key-accepted');
+  });
+
+  await alice.app.close();
 });
 
 test.afterEach(() => {

@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { MAX_FONT_SIZE, MIN_FONT_SIZE } from '../../../shared/app.js';
 import { call } from '../api.js';
-import { rememberServerUrl, toast, useStore } from '../store.js';
+import { rememberServerUrl, runAuthExclusive, toast, useStore } from '../store.js';
 import {
   Badge,
   Button,
@@ -17,6 +17,7 @@ import {
   useLoad,
 } from '../ui.js';
 import { SignOutDialog } from './Auth.js';
+import { ServerAddressHint } from './Setup.js';
 
 type Tab = 'account' | 'security' | 'terminal' | 'devices' | 'admin';
 
@@ -62,6 +63,7 @@ export function SettingsView() {
 function AccountTab() {
   const account = useStore((s) => s.account);
   const connection = useStore((s) => s.connection);
+  const pending = useStore((s) => s.authPending);
   const [signOut, setSignOut] = useState(false);
   const [changeServer, setChangeServer] = useState(false);
   if (!account) return null;
@@ -97,13 +99,23 @@ function AccountTab() {
       {changeServer ? (
         <ConfirmDialog
           title="Change server?"
-          message="Your session and this computer's offline copy belong to the current server, so changing it signs you out and closes open terminals."
+          message={
+            <>
+              <p>
+                Your session and this computer's offline copy belong to the current server, so
+                changing it signs you out and closes open terminals.
+              </p>
+              <p className="muted">
+                <ServerAddressHint />
+              </p>
+            </>
+          }
           confirmLabel="Sign out and change"
           danger
+          confirmDisabled={pending}
           onClose={() => setChangeServer(false)}
           onConfirm={async () => {
-            await call('auth.logout');
-            rememberServerUrl(null);
+            if (await runAuthExclusive(() => call('auth.logout'))) rememberServerUrl(null);
           }}
         />
       ) : null}

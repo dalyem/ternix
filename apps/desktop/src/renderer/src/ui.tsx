@@ -8,7 +8,8 @@ import {
   useState,
 } from 'react';
 import type { VaultRole } from '../../shared/types.js';
-import { errorMessage } from './api.js';
+import { errorMessage, isCancelled } from './api.js';
+import { runAuthExclusive, useStore } from './store.js';
 
 export function Button({
   variant = 'default',
@@ -214,6 +215,36 @@ export function Badge({
   );
 }
 
+/**
+ * What this device knows about a person's key: `key changed` when the server reports another
+ * key than the pinned one, `unverified` when the pin was only trusted on first use,
+ * `verified` once the fingerprint was compared out of band.
+ */
+export function PinBadge({ verified, keyChanged }: { verified: boolean; keyChanged: boolean }) {
+  if (keyChanged) {
+    return (
+      <Badge tone="bad" title="The server reports a different key than the one this device pinned">
+        key changed
+      </Badge>
+    );
+  }
+  if (!verified) {
+    return (
+      <Badge
+        tone="warn"
+        title="Seen for the first time and trusted, but never compared out of band"
+      >
+        unverified
+      </Badge>
+    );
+  }
+  return (
+    <Badge tone="good" title="You compared this fingerprint out of band">
+      verified
+    </Badge>
+  );
+}
+
 const ROLE_TONE: Record<VaultRole, 'accent' | 'good' | 'neutral'> = {
   owner: 'accent',
   editor: 'good',
@@ -281,6 +312,7 @@ export function ConfirmDialog({
   message,
   confirmLabel,
   danger,
+  confirmDisabled,
   onConfirm,
   onClose,
 }: {
@@ -288,6 +320,7 @@ export function ConfirmDialog({
   message: ReactNode;
   confirmLabel: string;
   danger?: boolean;
+  confirmDisabled?: boolean;
   onConfirm: () => Promise<unknown> | unknown;
   onClose: () => void;
 }) {
@@ -303,6 +336,7 @@ export function ConfirmDialog({
           <Button
             variant={danger ? 'danger' : 'primary'}
             busy={action.busy}
+            disabled={confirmDisabled}
             onClick={() => void action.run(async () => (await onConfirm(), onClose()))}
           >
             {confirmLabel}
@@ -331,13 +365,31 @@ export function useAction() {
     try {
       return await task();
     } catch (err) {
-      if (mounted.current) setError(err);
+      // Cancelled by lock, logout or quit: the screen is changing anyway, so no error.
+      if (mounted.current && !isCancelled(err)) setError(err);
       return undefined;
     } finally {
       if (mounted.current) setBusy(false);
     }
   }, []);
   return { busy, error, run, clear: () => setError(null) };
+}
+
+/**
+ * Like `useAction`, for login, register, unlock and logout: only one of them runs at a time
+ * across the whole window. `blocked` is true while any of them is pending; disable buttons
+ * with it.
+ */
+export function useAuthAction() {
+  const action = useAction();
+  const blocked = useStore((s) => s.authPending);
+  const { run: plainRun } = action;
+  const run = useCallback(
+    <T,>(task: () => Promise<T>): Promise<T | undefined> =>
+      plainRun(async () => runAuthExclusive(task)),
+    [plainRun],
+  );
+  return { ...action, run, blocked };
 }
 
 /** Load something once and on demand; `reload` refetches. */

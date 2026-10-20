@@ -1,8 +1,9 @@
 import { useEffect, useState } from 'react';
-import type { AccountDto, ServerInfoDto } from '../../../shared/types.js';
+import type { ProbedServerDto } from '../../../shared/ipc.js';
+import type { AccountDto } from '../../../shared/types.js';
 import { call } from '../api.js';
-import { setState, toast, useStore } from '../store.js';
-import { Button, ConfirmDialog, ErrorText, Notice, TextField, useAction } from '../ui.js';
+import { runAuthExclusive, setState, toast, useStore } from '../store.js';
+import { Button, ConfirmDialog, ErrorText, Notice, TextField, useAuthAction } from '../ui.js';
 import { AuthLayout, ServerInfoCard, ServerSetup, useServerProbe } from './Setup.js';
 
 const MIN_PASSWORD = 8;
@@ -109,7 +110,7 @@ function LoginForm({
 }) {
   const [email, setEmail] = useState(initialEmail);
   const [password, setPassword] = useState('');
-  const action = useAction();
+  const action = useAuthAction();
   return (
     <form
       onSubmit={(e) => {
@@ -144,7 +145,7 @@ function LoginForm({
         variant="primary"
         type="submit"
         busy={action.busy}
-        disabled={disabled || email === '' || password === ''}
+        disabled={disabled || action.blocked || email === '' || password === ''}
       >
         Sign in
       </Button>
@@ -158,7 +159,7 @@ function RegisterForm({
   disabled,
 }: {
   serverUrl: string;
-  info: ServerInfoDto | null;
+  info: ProbedServerDto | null;
   disabled: boolean;
 }) {
   const [email, setEmail] = useState('');
@@ -166,7 +167,7 @@ function RegisterForm({
   const [password, setPassword] = useState('');
   const [confirm, setConfirm] = useState('');
   const [invite, setInvite] = useState('');
-  const action = useAction();
+  const action = useAuthAction();
   const tooShort = password.length > 0 && password.length < MIN_PASSWORD;
   const mismatch = confirm.length > 0 && confirm !== password;
   const ready =
@@ -228,7 +229,12 @@ function RegisterForm({
         nobody can reset it: if you forget it, your data cannot be recovered.
       </Notice>
       <ErrorText error={action.error} />
-      <Button variant="primary" type="submit" busy={action.busy} disabled={disabled || !ready}>
+      <Button
+        variant="primary"
+        type="submit"
+        busy={action.busy}
+        disabled={disabled || action.blocked || !ready}
+      >
         Create account
       </Button>
     </form>
@@ -247,17 +253,26 @@ export function SignOutButton({ label = 'Sign out' }: { label?: string }) {
   );
 }
 
-export function SignOutDialog({ onClose }: { onClose: () => void }) {
+export function SignOutDialog({
+  onClose,
+  onSignedOut,
+}: {
+  onClose: () => void;
+  onSignedOut?: () => void;
+}) {
+  const pending = useStore((s) => s.authPending);
   return (
     <ConfirmDialog
       title="Sign out of Ternix?"
       message="This removes the saved session and the offline copy of your vaults from this computer, and closes open terminals. Your data stays on the server."
       confirmLabel="Sign out"
       danger
+      confirmDisabled={pending}
       onClose={onClose}
       onConfirm={async () => {
-        const result = await call('auth.logout');
-        if (!result.serverRevoked) {
+        const result = await runAuthExclusive(() => call('auth.logout'));
+        if (result) onSignedOut?.();
+        if (result && !result.serverRevoked) {
           // The local session is gone either way; tell the user the server may still list it.
           toast(
             'Signed out here, but the server could not be reached to revoke this device. Revoke it from another device.',
@@ -273,7 +288,7 @@ export function SignOutDialog({ onClose }: { onClose: () => void }) {
 export function Unlock() {
   const account = useStore((s) => s.account);
   const [password, setPassword] = useState('');
-  const action = useAction();
+  const action = useAuthAction();
   const [signingOut, setSigningOut] = useState(false);
 
   useEffect(() => {
@@ -312,7 +327,12 @@ export function Unlock() {
           required
         />
         <ErrorText error={action.error} />
-        <Button variant="primary" type="submit" busy={action.busy} disabled={password === ''}>
+        <Button
+          variant="primary"
+          type="submit"
+          busy={action.busy}
+          disabled={action.blocked || password === ''}
+        >
           Unlock
         </Button>
       </form>
@@ -324,5 +344,37 @@ export function Unlock() {
       </div>
       {signingOut ? <SignOutDialog onClose={() => setSigningOut(false)} /> : null}
     </AuthLayout>
+  );
+}
+
+/**
+ * The server reported another account key than the one this device pinned for the signed-in
+ * user, so it may be impersonating them. Nothing else in the app is usable until the user
+ * signs out (which also drops the pins).
+ */
+export function OwnKeyMismatch() {
+  const [signingOut, setSigningOut] = useState(false);
+  return (
+    <div className="lock-overlay" data-testid="own-key-mismatch">
+      <AuthLayout title="Account key mismatch">
+        <Notice tone="danger">
+          Your server reported a different account key than the one this device saved for your
+          account. Ternix stopped, because the server may be trying to impersonate you. Contact the
+          server admin before you sign in again.
+        </Notice>
+        <div className="row">
+          <span />
+          <Button variant="danger" onClick={() => setSigningOut(true)}>
+            Sign out
+          </Button>
+        </div>
+        {signingOut ? (
+          <SignOutDialog
+            onClose={() => setSigningOut(false)}
+            onSignedOut={() => setState({ ownKeyMismatch: false })}
+          />
+        ) : null}
+      </AuthLayout>
+    </div>
   );
 }

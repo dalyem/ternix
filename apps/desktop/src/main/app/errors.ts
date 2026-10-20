@@ -1,4 +1,4 @@
-import { toErrorDto } from '../client/index.js';
+import { toErrorDto, UnexpectedRedirectError } from '../client/index.js';
 import type { ErrorDto } from '../../shared/types.js';
 
 /** An error of the desktop shell itself (not the sync client), with a stable `code`. */
@@ -16,6 +16,9 @@ export class AppError extends Error {
 /** IPC-safe form of any thrown value; `AppError` and `SshError`-like errors keep their code. */
 export function errorToDto(err: unknown): ErrorDto {
   if (err instanceof AppError) return { name: err.name, code: err.code, message: err.message };
+  if (err instanceof UnexpectedRedirectError) {
+    return { ...toErrorDto(err), ...(err.location ? { location: err.location } : {}) };
+  }
   const dto = toErrorDto(err);
   const code = (err as { code?: unknown } | null)?.code;
   if (dto.code === 'internal' && typeof code === 'string' && /^[a-z_]+$/.test(code)) {

@@ -1,6 +1,7 @@
 import { type ChildProcess, spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { connect, createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -21,7 +22,30 @@ export async function freePort(): Promise<number> {
 
 export interface RunningServer {
   url: string;
+  /**
+   * What a malicious server could do to the database. `substituteKey` replaces a user's
+   * public key (by email) with a random one and returns the new key; `sharedKeyVersions`
+   * lists the key versions of the shared vaults the user belongs to, to prove that nothing
+   * was rotated.
+   */
+  db: { substituteKey(email: string): string; sharedKeyVersions(email: string): number[] };
   stop(): Promise<void>;
+}
+
+/** The server package's own `better-sqlite3`, opened on the server's database file. */
+function openServerDb(dataDir: string) {
+  const serverPackage = resolve(import.meta.dirname, '../../../server/package.json');
+  const Database = createRequire(serverPackage)('better-sqlite3') as new (file: string) => {
+    prepare(sql: string): {
+      run(...args: unknown[]): { changes: number };
+      all(...args: unknown[]): unknown[];
+    };
+    pragma(sql: string): unknown;
+    close(): void;
+  };
+  const db = new Database(join(dataDir, 'ternix.db'));
+  db.pragma('busy_timeout = 5000');
+  return db;
 }
 
 /** The real `@ternix/server` (built with `pnpm --filter @ternix/server build`), open registration. */
@@ -55,6 +79,38 @@ export async function startTernixServer(): Promise<RunningServer> {
   }
   return {
     url,
+    db: {
+      substituteKey: (email) => {
+        const db = openServerDb(dataDir);
+        try {
+          const publicKey = randomBytes(32).toString('base64');
+          const result = db
+            .prepare('UPDATE users SET public_key = ? WHERE email = ?')
+            .run(publicKey, email);
+          if (result.changes !== 1) throw new Error(`no user ${email}`);
+          return publicKey;
+        } finally {
+          db.close();
+        }
+      },
+      sharedKeyVersions: (email) => {
+        const db = openServerDb(dataDir);
+        try {
+          const rows = db
+            .prepare(
+              `SELECT v.key_version FROM vaults v
+                 JOIN vault_members m ON m.vault_id = v.id
+                 JOIN users u ON u.id = m.user_id
+                WHERE u.email = ? AND v.kind = 'shared'
+                ORDER BY v.created_at, v.id`,
+            )
+            .all(email) as { key_version: number }[];
+          return rows.map((row) => row.key_version);
+        } finally {
+          db.close();
+        }
+      },
+    },
     stop: async () => {
       child.kill('SIGTERM');
       await new Promise((r) => child.once('exit', r));

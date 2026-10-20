@@ -1,12 +1,13 @@
 import { useEffect, useState } from 'react';
 import type {
+  KeyChangeDto,
   LookupUserDto,
   MemberDto,
   RemoveMemberResultDto,
   VaultDto,
   VaultRole,
 } from '../../../shared/types.js';
-import { call } from '../api.js';
+import { call, keyChangeOf } from '../api.js';
 import { vaultTitle } from '../items.js';
 import { refreshData, toast, useStore } from '../store.js';
 import {
@@ -20,12 +21,14 @@ import {
   formatDate,
   Modal,
   Notice,
+  PinBadge,
   RoleBadge,
   Select,
   TextField,
   useAction,
   useLoad,
 } from '../ui.js';
+import { KeyChangeDialog, type ReportedKey, useKeyChangeGuard } from './KeyChange.js';
 
 const ROLE_OPTIONS: { value: VaultRole; label: string }[] = [
   { value: 'viewer', label: 'Viewer: can read' },
@@ -140,7 +143,20 @@ function VaultDetail({ vault }: { vault: VaultDto }) {
   const [deleting, setDeleting] = useState(false);
   const [leaving, setLeaving] = useState(false);
   const [rotationNotice, setRotationNotice] = useState<RemoveMemberResultDto | null>(null);
-  const rotate = useAction();
+  // A member whose key changed blocks rotation; the dialog resolves the key from the live list.
+  const rotate = useKeyChangeGuard(async (change): Promise<ReportedKey> => {
+    const list = await call('vaults.members', { vaultId: vault.id });
+    const member = list.find((m) => m.userId === change.userId);
+    if (!member) throw new Error('This person is no longer a member of the vault.');
+    return member;
+  });
+  const rotateNow = async () => {
+    await call('vaults.rotate', { vaultId: vault.id });
+    setRotationNotice(null);
+    toast('Vault key rotated.');
+    await refreshData();
+    members.reload();
+  };
 
   useEffect(() => setRotationNotice(null), [vault.id]);
 
@@ -172,19 +188,21 @@ function VaultDetail({ vault }: { vault: VaultDto }) {
           The member was removed, but the vault key could not be rotated:{' '}
           {rotationNotice.rotationError.message} Until it is, the removed person could still read
           what they already have and anything encrypted with the old key.{' '}
-          <Button
-            busy={rotate.busy}
-            onClick={() =>
-              void rotate.run(async () => {
-                await call('vaults.rotate', { vaultId: vault.id });
-                setRotationNotice(null);
-                toast('Vault key rotated.');
-                await refreshData();
-              })
-            }
-          >
-            Retry rotation
-          </Button>
+          {rotationNotice.rotationError.keyChange ? (
+            <Button
+              variant="danger"
+              onClick={() => {
+                const change = rotationNotice.rotationError?.keyChange;
+                if (change) rotate.open(change, rotateNow);
+              }}
+            >
+              Review changed key
+            </Button>
+          ) : (
+            <Button busy={rotate.busy} onClick={() => void rotate.run(rotateNow)}>
+              Retry rotation
+            </Button>
+          )}
           <ErrorText error={rotate.error} />
         </Notice>
       ) : null}
@@ -222,16 +240,7 @@ function VaultDetail({ vault }: { vault: VaultDto }) {
       {isOwner ? <AddMember vault={vault} onAdded={members.reload} /> : null}
       {isOwner ? (
         <div className="row">
-          <Button
-            busy={rotate.busy}
-            onClick={() =>
-              void rotate.run(async () => {
-                await call('vaults.rotate', { vaultId: vault.id });
-                toast('Vault key rotated.');
-                await refreshData();
-              })
-            }
-          >
+          <Button busy={rotate.busy} onClick={() => void rotate.run(rotateNow)}>
             Rotate vault key
           </Button>
           <span className="muted">
@@ -240,6 +249,8 @@ function VaultDetail({ vault }: { vault: VaultDto }) {
           </span>
         </div>
       ) : null}
+      {isOwner && !rotationNotice?.rotationError ? <ErrorText error={rotate.error} /> : null}
+      {rotate.dialog}
       {renaming ? <RenameDialog vault={vault} onClose={() => setRenaming(false)} /> : null}
       {deleting ? (
         <ConfirmDialog
@@ -322,15 +333,94 @@ function MemberRow({
 }) {
   const isOwner = vault.role === 'owner';
   const [removing, setRemoving] = useState(false);
+  const [verifying, setVerifying] = useState(false);
+  const [reviewing, setReviewing] = useState<KeyChangeDto | null>(null);
   const action = useAction();
+  const canVerify = !member.isSelf && !member.verified && !member.keyChanged;
   return (
-    <tr>
+    <tr data-testid={`member-${member.email}`}>
       <td>
         <strong>{member.name}</strong> {member.isSelf ? <Badge>you</Badge> : null}
         <div className="muted">{member.email}</div>
       </td>
       <td>
-        <Fingerprint value={member.fingerprint} />
+        <Fingerprint value={member.fingerprint} />{' '}
+        <PinBadge verified={member.verified} keyChanged={member.keyChanged} />
+        {member.keyChanged ? (
+          <div className="muted">
+            Pinned earlier: <Fingerprint value={member.pinnedFingerprint} />
+          </div>
+        ) : null}
+        {canVerify ? (
+          <div>
+            <Button onClick={() => setVerifying(true)}>Mark verified</Button>
+          </div>
+        ) : null}
+        {member.keyChanged && !member.isSelf ? (
+          <div>
+            <Button
+              variant="danger"
+              onClick={() =>
+                setReviewing({
+                  userId: member.userId,
+                  email: member.email,
+                  pinnedFingerprint: member.pinnedFingerprint,
+                  serverFingerprint: member.fingerprint,
+                })
+              }
+            >
+              Review changed key
+            </Button>
+          </div>
+        ) : null}
+        {verifying ? (
+          <ConfirmDialog
+            title={`Mark ${member.name}'s key as verified?`}
+            message={
+              <>
+                <p>
+                  Ask {member.name} to read you their fingerprint over a call or in person (Sharing
+                  page, “Your fingerprint”). Mark it verified only if it matches this one:
+                </p>
+                <p>
+                  <Fingerprint value={member.fingerprint} />
+                </p>
+              </>
+            }
+            confirmLabel="It matches, mark verified"
+            onClose={() => setVerifying(false)}
+            onConfirm={async () => {
+              try {
+                await call('vaults.markMemberVerified', {
+                  userId: member.userId,
+                  publicKey: member.publicKey,
+                });
+                onChanged();
+              } catch (err) {
+                // The pinned key is another one by now: the key change dialog takes over.
+                const change = keyChangeOf(err);
+                if (!change) throw err;
+                setReviewing(change);
+              }
+            }}
+          />
+        ) : null}
+        {reviewing ? (
+          <KeyChangeDialog
+            change={reviewing}
+            resolveKey={async () => {
+              const list = await call('vaults.members', { vaultId: vault.id });
+              const current = list.find((m) => m.userId === reviewing.userId);
+              if (!current) throw new Error('This person is no longer a member of the vault.');
+              return current;
+            }}
+            onAccepted={() => {
+              setReviewing(null);
+              onChanged();
+            }}
+            onClose={() => setReviewing(null)}
+          />
+        ) : null}
       </td>
       <td>
         {isOwner && !member.isSelf ? (
@@ -395,7 +485,13 @@ function AddMember({ vault, onAdded }: { vault: VaultDto; onAdded: () => void })
   const [verified, setVerified] = useState(false);
   const [role, setRole] = useState<VaultRole>('viewer');
   const lookup = useAction();
-  const add = useAction();
+  // `member_key_changed` while adding: the key the owner verified differs from the pin.
+  const add = useKeyChangeGuard(async (change): Promise<ReportedKey> => {
+    if (!found || found.id !== change.userId) {
+      throw new Error('Look the person up again before accepting their key.');
+    }
+    return found;
+  });
 
   const reset = () => {
     setFound(null);
@@ -438,9 +534,20 @@ function AddMember({ vault, onAdded }: { vault: VaultDto; onAdded: () => void })
             </dd>
             <dt>Fingerprint</dt>
             <dd>
-              <Fingerprint value={found.fingerprint} />
+              <Fingerprint value={found.fingerprint} />{' '}
+              {found.pinnedFingerprint !== null ? (
+                <PinBadge verified={found.verified} keyChanged={found.keyChanged} />
+              ) : null}
             </dd>
           </dl>
+          {found.keyChanged && found.pinnedFingerprint !== null ? (
+            <Notice tone="danger">
+              This device saw another key for {found.name} before (
+              <Fingerprint value={found.pinnedFingerprint} />
+              ). The server may have swapped it, or {found.name} registered again. Compare the
+              fingerprint above with {found.name} before you go on.
+            </Notice>
+          ) : null}
           <Notice tone="warning">
             The server could swap in someone else's key. Ask {found.name} to read you their
             fingerprint (Sharing page, “Your fingerprint”) over a call or in person, and make sure
@@ -452,11 +559,8 @@ function AddMember({ vault, onAdded }: { vault: VaultDto; onAdded: () => void })
             onChange={setVerified}
           />
           <Select label="Role" value={role} onChange={setRole} options={ROLE_OPTIONS} />
-          {/* TODO(member-key-pinning): when the client reports `member_key_changed` for a member
-              (their key differs from the one pinned earlier), show their old and new
-              fingerprints here and ask the owner to confirm before calling
-              `acceptMemberKey(userId, publicKey)`. Until then the error is shown as text. */}
           <ErrorText error={add.error} />
+          {add.dialog}
           <div className="row">
             <Button
               variant="primary"

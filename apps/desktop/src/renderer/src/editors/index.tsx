@@ -1,6 +1,7 @@
 import type { ItemType } from '@ternix/core/items';
 import { useMemo, useState } from 'react';
 import { call } from '../api.js';
+import { groupDefaultPort } from '../../../shared/groups.js';
 import type { PayloadOf } from '../items.js';
 import { type EditorTarget, useStore } from '../store.js';
 import { Button, Checkbox, Select, TextArea, TextField, Notice } from '../ui.js';
@@ -42,13 +43,18 @@ function HostEditor({ target }: { target: EditorTarget }) {
   const h = existing(target, 'host');
   const [label, setLabel] = useState(h?.label ?? target.preset?.['label'] ?? '');
   const [address, setAddress] = useState(h?.address ?? '');
-  const [port, setPort] = useState(String(h?.port ?? 22));
+  const items = useStore((s) => s.items);
+  const [groupId, setGroupId] = useState(h?.group_id ?? target.preset?.['group_id'] ?? '');
+  // A new host starts with the port its group (or the nearest group above) defaults to.
+  const [port, setPort] = useState(String(h?.port ?? groupDefaultPort(items, groupId) ?? 22));
+  // Until the user types a port, choosing another group re-fills it from that group.
+  const [portTouched, setPortTouched] = useState(false);
+  const [portFromGroup, setPortFromGroup] = useState(h === undefined && port !== '22');
   const [username, setUsername] = useState(h?.username ?? '');
   const [password, setPassword] = useState(h?.password ?? '');
   const [showPassword, setShowPassword] = useState(false);
   const [identityId, setIdentityId] = useState(h?.identity_id ?? '');
   const [keyId, setKeyId] = useState(h?.key_id ?? '');
-  const [groupId, setGroupId] = useState(h?.group_id ?? target.preset?.['group_id'] ?? '');
   const [jumpId, setJumpId] = useState(h?.jump_host_id ?? '');
   const [snippetId, setSnippetId] = useState(h?.startup_snippet_id ?? '');
   const [keepalive, setKeepalive] = useState(
@@ -115,7 +121,10 @@ function HostEditor({ target }: { target: EditorTarget }) {
             <TextField
               label="Port"
               value={port}
-              onChange={setPort}
+              onChange={(value) => {
+                setPort(value);
+                setPortTouched(true);
+              }}
               disabled={readOnly}
               inputMode="numeric"
             />
@@ -169,7 +178,14 @@ function HostEditor({ target }: { target: EditorTarget }) {
               label="Group"
               type="group"
               value={groupId}
-              onChange={setGroupId}
+              onChange={(id) => {
+                setGroupId(id);
+                if (!portTouched && (port === '22' || portFromGroup)) {
+                  const inherited = groupDefaultPort(items, id);
+                  setPort(String(inherited ?? 22));
+                  setPortFromGroup(inherited !== undefined);
+                }
+              }}
               targetVaultId={vaultId}
               disabled={readOnly}
             />
@@ -307,7 +323,8 @@ function GroupEditor({ target }: { target: EditorTarget }) {
             noneLabel="Top level"
           />
           <Notice>
-            Hosts in this group use these defaults for anything they do not set themselves.
+            Hosts in this group use the username and identity for anything they do not set
+            themselves. The port is only filled in when you create a host here.
           </Notice>
           <div className="grid-2">
             <TextField
@@ -322,6 +339,7 @@ function GroupEditor({ target }: { target: EditorTarget }) {
               onChange={setPort}
               disabled={readOnly}
               inputMode="numeric"
+              hint="Default port for new hosts in this group."
             />
           </div>
           <ItemSelect

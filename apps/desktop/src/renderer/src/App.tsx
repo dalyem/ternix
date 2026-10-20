@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import { SignedOut, Unlock } from './screens/Auth.js';
+import { OwnKeyMismatch, SignedOut, Unlock } from './screens/Auth.js';
 import { PromptHost } from './screens/Prompts.js';
 import { Shell } from './screens/Shell.js';
 import { boot, dismissToast, useStore } from './store.js';
@@ -24,6 +24,7 @@ export function App() {
   const booted = useStore((s) => s.booted);
   const state = useStore((s) => s.clientState);
   const hasTerminals = useStore((s) => s.terminals.length > 0);
+  const ownKeyMismatch = useStore((s) => s.ownKeyMismatch);
 
   useEffect(() => {
     void boot();
@@ -45,6 +46,7 @@ export function App() {
       ) : null}
       {state === 'loggedOut' || state === 'expired' ? <SignedOut /> : null}
       {state === 'unlocked' ? <PromptHost /> : null}
+      {ownKeyMismatch ? <OwnKeyMismatch /> : null}
       <Toasts />
     </>
   );

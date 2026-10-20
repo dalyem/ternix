@@ -40,6 +40,11 @@ export const EVENT_CHANNEL = 'ternix:event';
 /** Terminal output for session `<id>` is sent on `TERMINAL_CHANNEL_PREFIX + id`. */
 export const TERMINAL_CHANNEL_PREFIX = 'ternix:term:';
 
+/** A probed server, plus whether its address looks like a tailnet one (a UI hint only). */
+export interface ProbedServerDto extends ServerInfoDto {
+  tailnet: boolean;
+}
+
 export interface ClientSnapshot {
   state: ClientState;
   connection: ConnectionState;
@@ -61,7 +66,7 @@ export interface RpcMethods {
   'shell.openLink': Rpc<{ url: string }, void>;
 
   'client.snapshot': Rpc<void, ClientSnapshot>;
-  'server.probe': Rpc<{ address: string }, ServerInfoDto>;
+  'server.probe': Rpc<{ address: string }, ProbedServerDto>;
   'auth.register': Rpc<
     { serverUrl: string; email: string; name: string; password: string; inviteCode?: string },
     AccountDto
@@ -92,6 +97,10 @@ export interface RpcMethods {
     { vaultId: string; userId: string; role: VaultRole; expectedPublicKey: string },
     MemberDto
   >;
+  /** After the user compared the fingerprint of `publicKey`: mark the pinned key verified. */
+  'vaults.markMemberVerified': Rpc<{ userId: string; publicKey: string }, void>;
+  /** After the user compared the new fingerprint: pin `publicKey` as the user's verified key. */
+  'vaults.acceptMemberKey': Rpc<{ userId: string; publicKey: string }, void>;
   'vaults.changeRole': Rpc<{ vaultId: string; userId: string; role: VaultRole }, MemberDto>;
   'vaults.removeMember': Rpc<{ vaultId: string; userId: string }, RemoveMemberResultDto>;
   'vaults.leave': Rpc<{ vaultId: string }, void>;

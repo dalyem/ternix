@@ -2,6 +2,7 @@ import type { AppInfo, ImportedFile } from '../../shared/app.js';
 import type { ClientSnapshot } from '../../shared/ipc.js';
 import type { VaultItemsDto } from '../../shared/types.js';
 import type { TernixClient } from '../client/index.js';
+import { isTailnetHost } from '../client/serverUrl.js';
 import type { SafeStorageSecretStore } from '../app/secretStore.js';
 import type { SettingsStore } from '../app/settings.js';
 import type { SshManager } from '../ssh/manager.js';
@@ -51,7 +52,10 @@ export function createHandlers(deps: HandlerDeps): Handlers {
     'shell.openLink': ({ url }) => deps.openLink(url),
 
     'client.snapshot': async () => snapshot(),
-    'server.probe': ({ address }) => client.probeServer(address),
+    'server.probe': async ({ address }) => {
+      const info = await client.probeServer(address);
+      return { ...info, tailnet: isTailnetHost(new URL(info.serverUrl).hostname) };
+    },
     'auth.register': async (input) => {
       secrets.assertAvailable();
       return client.register(input);
@@ -62,8 +66,8 @@ export function createHandlers(deps: HandlerDeps): Handlers {
     },
     'auth.unlock': ({ password }) => client.unlock(password),
     'auth.lock': async () => {
-      client.lock();
       ssh.cancelAllPrompts();
+      await client.lock();
     },
     'auth.logout': async () => {
       const result = await client.logout();
@@ -90,6 +94,9 @@ export function createHandlers(deps: HandlerDeps): Handlers {
     'vaults.lookupUser': ({ email }) => client.lookupUser(email),
     'vaults.addMember': ({ vaultId, userId, role, expectedPublicKey }) =>
       client.addMember(vaultId, userId, role, expectedPublicKey),
+    'vaults.markMemberVerified': ({ userId, publicKey }) =>
+      client.markMemberVerified(userId, publicKey),
+    'vaults.acceptMemberKey': ({ userId, publicKey }) => client.acceptMemberKey(userId, publicKey),
     'vaults.changeRole': ({ vaultId, userId, role }) =>
       client.changeMemberRole(vaultId, userId, role),
     'vaults.removeMember': ({ vaultId, userId }) => client.removeMember(vaultId, userId),

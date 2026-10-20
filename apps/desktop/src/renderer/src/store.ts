@@ -9,7 +9,7 @@ import type {
   ItemPayload,
   VaultDto,
 } from '../../shared/types.js';
-import { call, errorMessage, on } from './api.js';
+import { call, errorMessage, isCancelled, on, onOwnKeyMismatch } from './api.js';
 
 export type NavView =
   'hosts' | 'keychain' | 'snippets' | 'forwards' | 'knownHosts' | 'sharing' | 'settings';
@@ -62,6 +62,10 @@ export interface State {
   /** Why the user is back at the login screen (revoked session, ...). */
   authNotice: string | null;
   serverUrl: string | null;
+  /** A login, logout or unlock is running; the buttons for those wait for it. */
+  authPending: boolean;
+  /** The server reported another account key than the one pinned: only logout is offered. */
+  ownKeyMismatch: boolean;
 }
 
 const SERVER_URL_KEY = 'ternix.serverUrl';
@@ -95,6 +99,8 @@ let state: State = {
   toasts: [],
   authNotice: null,
   serverUrl: null,
+  authPending: false,
+  ownKeyMismatch: false,
 };
 
 const listeners = new Set<() => void>();
@@ -132,7 +138,23 @@ export function dismissToast(id: number): void {
 }
 
 export function reportError(err: unknown): void {
+  // A cancelled operation was superseded on purpose (lock, logout, quit): not a failure.
+  if (isCancelled(err)) return;
   toast(errorMessage(err), 'error');
+}
+
+/**
+ * Run a login, register, unlock or logout one at a time: while one is pending another call
+ * returns undefined at once, so a double click or a click during sign-out cannot race it.
+ */
+export async function runAuthExclusive<T>(task: () => Promise<T>): Promise<T | undefined> {
+  if (state.authPending) return undefined;
+  setState({ authPending: true });
+  try {
+    return await task();
+  } finally {
+    setState({ authPending: false });
+  }
 }
 
 // Server address
@@ -208,7 +230,14 @@ function applyClientState(clientState: ClientState): void {
   if (clientState === 'unlocked') void refreshData();
   else clearData();
   if (clientState === 'loggedOut') {
-    setState({ account: null, terminals: [], activeTab: null, view: 'hosts', vaultFilter: 'all' });
+    setState({
+      account: null,
+      terminals: [],
+      activeTab: null,
+      view: 'hosts',
+      vaultFilter: 'all',
+      ownKeyMismatch: false,
+    });
   } else if (previous !== clientState) {
     void call('client.snapshot')
       .then((snap) => setState({ account: snap.account }))
@@ -304,7 +333,11 @@ async function doBoot(): Promise<void> {
           : 'Your session has expired. Sign in again to continue.',
     }),
   );
-  on('client.error', (err) => toast(`Sync problem: ${err.message}`, 'warning'));
+  on('client.error', (err) => {
+    if (err.code === 'own_key_mismatch') setState({ ownKeyMismatch: true });
+    else if (err.code !== 'cancelled') toast(`Sync problem: ${err.message}`, 'warning');
+  });
+  onOwnKeyMismatch(() => setState({ ownKeyMismatch: true }));
   on('settings.changed', (settings) => setState({ settings }));
   on('ssh.status', upsertTerminal);
   on('ssh.prompt', (prompt) => setState((s) => ({ prompts: [...s.prompts, prompt] })));

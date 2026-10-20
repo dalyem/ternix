@@ -45,6 +45,9 @@ import { snapshotItems } from './ssh/items.js';
 import { SshManager } from './ssh/manager.js';
 
 const MAX_KEY_FILE_BYTES = 256 * 1024;
+/** How long quitting waits for SSH sessions to close, and then for the cache to be written. */
+const QUIT_SSH_GRACE_MS = 2_000;
+const QUIT_FLUSH_TIMEOUT_MS = 5_000;
 
 const platform: DesktopPlatform =
   process.platform === 'darwin' ? 'macos' : process.platform === 'win32' ? 'windows' : 'linux';
@@ -126,10 +129,11 @@ async function start(): Promise<void> {
     agentPath: defaultAgentPath(process.platform, process.env),
   });
 
-  const lockVault = () => {
-    if (client.state !== 'unlocked') return;
-    client.lock();
+  /** Keys are gone when this returns; the promise settles once pending cache writes are stored. */
+  const lockVault = (): Promise<void> => {
+    if (client.state !== 'unlocked') return Promise.resolve();
     ssh.cancelAllPrompts();
+    return client.lock();
   };
 
   client.on('state', (state) => {
@@ -212,7 +216,7 @@ async function start(): Promise<void> {
       // The UI is gone: nothing may stay waiting on an answer, and the vault locks.
       ssh.cancelAllPrompts();
       ssh.detachAll();
-      lockVault();
+      void lockVault();
     });
   };
 
@@ -229,20 +233,26 @@ async function start(): Promise<void> {
     lock: lockVault,
   });
   autoLock.start();
-  powerMonitor.on('suspend', lockVault);
-  powerMonitor.on('lock-screen', lockVault);
+  powerMonitor.on('suspend', () => void lockVault());
+  powerMonitor.on('lock-screen', () => void lockVault());
 
+  // The first quit request is held back until the SSH sessions are closed and the client has
+  // stored its pending cache writes (each bounded by a timeout), then quits for real. The
+  // `quitting` flag lets that second request through, so this cannot loop.
   let quitting = false;
   app.on('before-quit', (event) => {
     if (quitting) return;
     quitting = true;
     event.preventDefault();
     autoLock.stop();
-    const grace = new Promise((resolve) => setTimeout(resolve, 2_000));
-    void Promise.race([ssh.closeAll(), grace]).finally(() => {
-      client.close();
-      app.quit();
-    });
+    const within = (work: Promise<unknown>, ms: number) =>
+      Promise.race([
+        work.catch(() => undefined),
+        new Promise((resolve) => setTimeout(resolve, ms)),
+      ]);
+    void within(ssh.closeAll(), QUIT_SSH_GRACE_MS)
+      .then(() => within(client.close(), QUIT_FLUSH_TIMEOUT_MS))
+      .finally(() => app.quit());
   });
 }
 

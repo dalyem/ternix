@@ -64,10 +64,35 @@ typecheck test` covers everything that does not need the Electron binary).
 - **Locking.** The vault locks on the auto-lock timeout (settings, default 15 minutes of system
   idle time via `powerMonitor.getSystemIdleTime`), when the computer suspends, when the screen
   locks, from "Lock now", and when the window is closed (macOS keeps the app running).
-  Locking zeroes the client's keys and clears the vault data from the renderer. **Open SSH
+  Locking zeroes the client's keys (`client.lock()` is awaited, so the pending cache writes are
+  stored) and clears the vault data from the renderer. **Open SSH
   sessions stay connected** (as in Termius): their output keeps arriving, and the lock screen
   is drawn over the terminals, whose scrollback stays in renderer memory until the tab is closed.
   Unanswered SSH prompts are denied. New connections need an unlocked vault.
+- **Quitting.** The first quit request is held back (`before-quit` with `preventDefault`) until
+  the SSH sessions are closed (2 s at most) and `client.close()` has stored the pending cache
+  writes (5 s at most); then the app quits for real. A flag keeps the second request from
+  looping.
+- **Server address.** `https://` is required, except plain `http://` for loopback. A Tailscale
+  address (`*.ts.net`, 100.64.0.0/10) is no exception: use `tailscale serve` and
+  `https://<machine>.<tailnet>.ts.net`. The setup screen says so, and shows a "Tailscale" badge
+  next to the normalized URL (`server.probe` adds `tailnet` using the client's `isTailnetHost`).
+  The client never follows a redirect; `unexpected_redirect` is shown as "The server answered
+  with a redirect to <location>. Enter the final address instead."
+- **Member keys.** Members are shown with a pin badge: `verified` (the fingerprint was compared
+  out of band), `unverified` (trusted on first use; "Mark verified" asks to compare the
+  fingerprint, then calls `vaults.markMemberVerified` with the key that was shown) and
+  `key changed` (the server reports another key than the pinned one). A refused rotation, add or
+  verify (`member_key_changed`, with `ErrorDto.keyChange`) opens the key change dialog with both
+  fingerprints; "I verified the new fingerprint with <email>" calls `vaults.acceptMemberKey` and
+  runs the operation again, Cancel sends nothing. `own_key_mismatch` anywhere replaces the app
+  with a blocking screen that only offers sign out.
+- **Cancelled operations.** `cancelled` (an unlock, login, register or password change that
+  lock, logout or quit superseded) never shows as an error. Login, register, unlock and sign
+  out run one at a time in the UI: their buttons are disabled while any of them is pending.
+- **Group ports.** A host's own port is authoritative (`@ternix/ssh`); a group's "Default port"
+  only pre-fills the port when creating a host in the group, or when the group changes while the
+  port is untouched (the nearest group up the chain that has a port).
 - **Offline.** Reading works from the cache after unlock. Writes need the server (the client
   throws `OfflineError`, shown in the editor).
 
@@ -123,7 +148,10 @@ and uploads them as artifacts.
 `e2e/desktop.e2e.ts` drives the packaged app with Playwright's Electron support against a real
 `@ternix/server` and an SSH server: it enters the server address, registers, creates a host,
 connects, verifies the host key, runs `echo`, checks the saved `known_host`, locks and unlocks,
-restarts the app and unlocks again. By default the SSH server is an in-process `ssh2` server
+restarts the app and unlocks again. It also covers sharing (the verified/unverified badges and
+the mark-verified flow) and a malicious server: the test rewrites a member's `public_key` in
+the server's SQLite database and checks that removal and rotation open the key change dialog,
+send nothing until the new fingerprint is accepted, and then go through. By default the SSH server is an in-process `ssh2` server
 with a fake shell; set `E2E_SSH_ADDRESS`, `E2E_SSH_PORT`, `E2E_SSH_USER` and `E2E_SSH_PASSWORD`
 to use a real OpenSSH `sshd`. Screenshots go to `e2e/artifacts/` (ignored by git).
 
