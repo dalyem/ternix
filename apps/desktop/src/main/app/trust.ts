@@ -112,6 +112,69 @@ export async function confirmHostKey(
   return answer ? 'trust' : 'reject';
 }
 
+/** One hop of a connection, in the order the connection goes through them. */
+export interface RouteHop {
+  host: string;
+  port: number;
+  /** No `known_host` item for this `host:port`: never connected to, or never trusted. */
+  isNew: boolean;
+}
+
+/**
+ * Control and invisible characters (line breaks, bidi overrides, zero-width spaces) in an
+ * address are shown as `\u{..}`, so a name cannot add lines to the dialog or hide its end.
+ */
+const INVISIBLE =
+  // eslint-disable-next-line no-control-regex
+  /[\u0000-\u001f\u007f-\u009f\u00ad\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/g;
+const visible = (text: string) =>
+  text.replace(INVISIBLE, (c) => `\\u{${(c.codePointAt(0) ?? 0).toString(16)}}`);
+
+/**
+ * Before a connection to an address without a stored host key does anything on the network
+ * (even the DNS lookup, which could carry data out in the name), the user approves the
+ * addresses. The approval is for this attempt only; the host-key dialog that follows is what
+ * saves trust.
+ */
+export async function confirmNewHosts(
+  box: MessageBox,
+  route: readonly RouteHop[],
+  signal?: AbortSignal,
+): Promise<boolean> {
+  const fresh = route.filter((hop) => hop.isNew);
+  if (fresh.length === 0) return true;
+  const shown = (hop: RouteHop) => visible(hostPort(hop));
+  const lines =
+    route.length > 1
+      ? [
+          'Route, in order:',
+          ...route.map(
+            (hop, i) =>
+              `${i + 1}. ${shown(hop)} (${i === route.length - 1 ? 'target' : 'jump host'}` +
+              `${hop.isNew ? ', new' : ''})`,
+          ),
+        ]
+      : [shown(route[0]!)];
+  const answer = await approved(box, {
+    type: 'question',
+    title: 'Connect to a new host?',
+    message:
+      fresh.length === 1
+        ? `Connect to a new host?\n${shown(fresh[0]!)}`
+        : `Connect to ${fresh.length} new hosts?`,
+    detail:
+      `There is no saved host key for ${fresh.length === 1 ? 'this address' : 'these addresses'}. ` +
+      `Connecting looks the name up and opens a connection before the host key can be checked. ` +
+      `Continue only if you meant to connect here.\n\n${lines.join('\n')}`,
+    buttons: ['Cancel', 'Connect'],
+    defaultId: DENY,
+    cancelId: DENY,
+    noLink: true,
+    ...(signal ? { signal } : {}),
+  });
+  return answer !== null;
+}
+
 /** A person whose key is about to be trusted. `email` is what the server reported to main. */
 export interface MemberFacts {
   email: string;

@@ -25,7 +25,7 @@ import type {
 } from '../../shared/app.js';
 import type { ItemDraft } from '../../shared/types.js';
 import { AppError } from '../app/errors.js';
-import type { HostKeyFacts } from '../app/trust.js';
+import type { HostKeyFacts, RouteHop } from '../app/trust.js';
 import type { ItemSnapshot } from './items.js';
 import { parseQuickTarget } from './quick.js';
 
@@ -43,6 +43,11 @@ export interface SshManagerDeps {
    * renderer). Aborting `signal` closes the dialog; the answer is then ignored.
    */
   confirmHostKey(facts: HostKeyFacts, signal: AbortSignal): Promise<HostKeyDecision>;
+  /**
+   * Ask the user, in a dialog main owns, whether to connect to hops without a stored host key.
+   * Called before anything goes out on the network (DNS included); false or a rejection denies.
+   */
+  confirmNewHosts(route: RouteHop[], signal: AbortSignal): Promise<boolean>;
   agentPath: string | undefined;
   createSession?: (options: SessionOptions) => SshSession;
   /** How long a keyboard-interactive prompt waits before it is denied. Default 5 minutes. */
@@ -96,10 +101,11 @@ interface Terminal {
 /** A question waiting for the user, bound to the connection attempt that asked it. */
 type Pending =
   | {
-      kind: 'hostkey';
+      /** One of main's native dialogs (new host, host key). */
+      kind: 'native';
       terminalId: string;
       attempt: number;
-      /** Closes the native dialog; the attempt sees `reject`. */
+      /** Closes the dialog; the attempt sees the deny answer. */
       cancel: () => void;
     }
   | {
@@ -116,6 +122,9 @@ const KEYBOARD_TIMEOUT_MS = 5 * 60_000;
 const OUTPUT_FLUSH_BYTES = 64 * 1024;
 
 const errMessage = (err: unknown): string => (err instanceof Error ? err.message : String(err));
+
+/** How hops and `known_host` items are matched, as `checkHostKey` does: host case-insensitive. */
+const hopKey = (host: string, port: number) => `${host.toLowerCase()}:${port}`;
 
 function toClosed(reason: CloseReason): TerminalClosedDto {
   if (reason.kind === 'error') {
@@ -277,7 +286,7 @@ export class SshManager {
     const pending = this.prompts.get(promptId);
     if (!pending) return;
     this.prompts.delete(promptId);
-    if (pending.kind === 'hostkey') {
+    if (pending.kind === 'native') {
       pending.cancel();
       return;
     }
@@ -286,11 +295,43 @@ export class SshManager {
     this.deps.emit('ssh.prompt-cancelled', { promptId });
   }
 
-  /** Main's own dialog decides; the renderer only sees the tab's `verifying-host-key` state. */
-  private askHostKey(t: Terminal, attempt: number, info: HostKeyInfo): Promise<HostKeyDecision> {
-    if (info.status === 'trusted' || !this.deps.hasWindow()) return Promise.resolve('reject');
+  /**
+   * Open one of main's native dialogs for an attempt. Closing, failing or reconnecting the tab
+   * aborts it, and the answer is then `denied` whatever the user clicked.
+   */
+  private askNative<T>(
+    t: Terminal,
+    attempt: number,
+    ask: (signal: AbortSignal) => Promise<T>,
+    denied: T,
+  ): Promise<T> {
+    if (!this.deps.hasWindow()) return Promise.resolve(denied);
     const promptId = randomUUID();
     const abort = new AbortController();
+    return new Promise((resolve) => {
+      let settled = false;
+      const settle = (answer: T) => {
+        if (settled) return;
+        settled = true;
+        this.prompts.delete(promptId);
+        resolve(abort.signal.aborted ? denied : answer);
+      };
+      this.prompts.set(promptId, {
+        kind: 'native',
+        terminalId: t.id,
+        attempt,
+        cancel: () => {
+          abort.abort();
+          settle(denied);
+        },
+      });
+      ask(abort.signal).then(settle, () => settle(denied));
+    });
+  }
+
+  /** Main's own dialog decides; the renderer only sees the tab's `verifying-host-key` state. */
+  private askHostKey(t: Terminal, attempt: number, info: HostKeyInfo): Promise<HostKeyDecision> {
+    if (info.status === 'trusted') return Promise.resolve('reject');
     const facts: HostKeyFacts = {
       hopLabel: info.hop.label,
       hopIndex: info.hop.index,
@@ -304,25 +345,12 @@ export class SshManager {
         ? { stored: { keyType: info.stored.keyType, fingerprint: info.stored.fingerprint } }
         : {}),
     };
-    return new Promise((resolve) => {
-      let settled = false;
-      const settle = (decision: HostKeyDecision) => {
-        if (settled) return;
-        settled = true;
-        this.prompts.delete(promptId);
-        resolve(abort.signal.aborted ? 'reject' : decision);
-      };
-      this.prompts.set(promptId, {
-        kind: 'hostkey',
-        terminalId: t.id,
-        attempt,
-        cancel: () => {
-          abort.abort();
-          settle('reject');
-        },
-      });
-      this.deps.confirmHostKey(facts, abort.signal).then(settle, () => settle('reject'));
-    });
+    return this.askNative<HostKeyDecision>(
+      t,
+      attempt,
+      (signal) => this.deps.confirmHostKey(facts, signal),
+      'reject',
+    );
   }
 
   private askKeyboard(
@@ -442,6 +470,36 @@ export class SshManager {
       ]),
     );
 
+    // An address without a stored host key is approved in main's dialog before anything is
+    // sent, DNS lookup included: the name itself could carry data out.
+    const known = new Set(trust.knownHosts.map((r) => hopKey(r.payload.host, r.payload.port)));
+    const route: RouteHop[] = [...settings.jumpChain, settings].map((hop) => ({
+      host: hop.address,
+      port: hop.port,
+      isNew: !known.has(hopKey(hop.address, hop.port)),
+    }));
+    if (route.some((hop) => hop.isNew)) {
+      this.publish(t);
+      const approved = await this.askNative(
+        t,
+        attempt,
+        (signal) => this.deps.confirmNewHosts(route, signal),
+        false,
+      );
+      if (!current()) return;
+      if (!approved) {
+        settings = undefined;
+        this.fail(
+          t,
+          new AppError(
+            'not_approved',
+            'Connection not approved. Nothing was sent to the new host.',
+          ),
+        );
+        return;
+      }
+    }
+
     const options: SessionOptions = {
       knownHosts: trust.knownHosts.map((r) => r.payload),
       ...(this.deps.agentPath ? { agentPath: this.deps.agentPath } : {}),
@@ -512,6 +570,11 @@ export class SshManager {
         void session.close();
         return;
       }
+      // A typed quick-connect password is not kept for reconnecting: the next attempt signs in
+      // with the agent or asks through keyboard-interactive.
+      if (t.source.kind === 'quick' && t.source.password !== undefined) {
+        t.source = { kind: 'quick', target: t.source.target, password: undefined };
+      }
       const shell = await session.openShell({ cols: t.cols, rows: t.rows });
       if (!live()) {
         shell.close();
@@ -553,13 +616,11 @@ export class SshManager {
   private prepare(t: Terminal): { settings: ResolvedConnection; trust: TrustContext } {
     const snapshot = this.deps.snapshot();
     const settings = this.resolve(t, snapshot);
-    const hops = new Set(
-      [...settings.jumpChain, settings].map((h) => `${h.address.toLowerCase()}:${h.port}`),
-    );
+    const hops = new Set([...settings.jumpChain, settings].map((h) => hopKey(h.address, h.port)));
     const knownHosts: KnownHostRecord[] = [];
     for (const record of snapshot.records.values()) {
       const p = record.payload;
-      if (p.type === 'known_host' && hops.has(`${p.host.toLowerCase()}:${p.port}`)) {
+      if (p.type === 'known_host' && hops.has(hopKey(p.host, p.port))) {
         knownHosts.push({ vaultId: record.vaultId, itemId: record.itemId, payload: p });
       }
     }

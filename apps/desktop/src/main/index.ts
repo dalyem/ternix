@@ -17,6 +17,7 @@ import { defaultAgentPath } from '@ternix/ssh';
 import type { AppEventName, AppEvents, DesktopPlatform } from '../shared/app.js';
 import {
   EVENT_CHANNEL,
+  PAGE_CHANNEL,
   RPC_CHANNEL,
   TERMINAL_CHANNEL_PREFIX,
   type RpcResult,
@@ -26,10 +27,12 @@ import { deriveKeysInWorker } from './app/derive.js';
 import { AppError } from './app/errors.js';
 import { installMenu } from './app/menu.js';
 import { handleAppScheme, registerAppScheme } from './app/protocol.js';
+import { QuitGuard } from './app/quit.js';
 import { basicTextRequested, SafeStorageSecretStore } from './app/secretStore.js';
 import { isAppUrl } from './app/security.js';
+import { ServerAddressStore } from './app/serverAddress.js';
 import { SettingsStore } from './app/settings.js';
-import { confirmHostKey, type MessageBox } from './app/trust.js';
+import { confirmHostKey, confirmNewHosts, type MessageBox } from './app/trust.js';
 import {
   appUrls,
   createMainWindow,
@@ -41,6 +44,7 @@ import {
 import { JsonFileCacheStore, TernixClient } from './client/index.js';
 import { createDispatcher } from './ipc/dispatch.js';
 import { createHandlers } from './ipc/handlers.js';
+import { PageGate, SessionNotices } from './ipc/pageGate.js';
 import { rpcSchemas } from './ipc/schemas.js';
 import { snapshotItems } from './ssh/items.js';
 import { SshManager } from './ssh/manager.js';
@@ -114,6 +118,8 @@ async function start(): Promise<void> {
   const secrets = new SafeStorageSecretStore(userData, safeStorage);
   const settings = new SettingsStore(userData);
   await settings.load();
+  const serverAddress = new ServerAddressStore(userData);
+  await serverAddress.load();
 
   const client = new TernixClient({
     secretStore: secrets,
@@ -137,6 +143,7 @@ async function start(): Promise<void> {
     },
     hasWindow: () => activeContents() !== null,
     confirmHostKey: (facts, signal) => confirmHostKey(messageBox, facts, signal),
+    confirmNewHosts: (route, signal) => confirmNewHosts(messageBox, route, signal),
     agentPath: defaultAgentPath(process.platform, process.env),
   });
 
@@ -146,6 +153,17 @@ async function start(): Promise<void> {
     ssh.cancelAllPrompts();
     return client.lock();
   };
+
+  // Leaving a session replaces the page, so whatever a compromised renderer kept in its own
+  // memory is gone before it could reach `server.probe` or `auth.login`. Terminal output is
+  // buffered until the new page attaches.
+  const pages = new PageGate(() => {
+    ssh.detachAll();
+    activeContents()?.reload();
+  });
+  pages.watch(client);
+  const notices = new SessionNotices();
+  notices.watch(client);
 
   client.on('state', (state) => {
     emit('client.state', state);
@@ -163,6 +181,8 @@ async function start(): Promise<void> {
     settings,
     ssh,
     secrets,
+    serverAddress,
+    notices,
     appInfo: () => ({ version: app.getVersion(), platform, secretStorage: secrets.status() }),
     writeClipboard: (text) => clipboard.writeText(text),
     importKeyFile: async () => {
@@ -199,9 +219,19 @@ async function start(): Promise<void> {
     onSettingsChanged: () => emit('settings.changed', settings.get()),
     messageBox,
   });
-  const dispatch = createDispatcher(rpcSchemas, handlers);
+  const dispatch = pages.guard(createDispatcher(rpcSchemas, handlers));
 
-  ipcMain.handle(RPC_CHANNEL, async (event, method: unknown, arg: unknown) => {
+  // The preload of each page load asks for its generation once, before page scripts run.
+  ipcMain.on(PAGE_CHANNEL, (event) => {
+    const ours =
+      mainWindow !== null &&
+      event.sender === mainWindow.webContents &&
+      event.senderFrame !== null &&
+      event.senderFrame === event.sender.mainFrame;
+    event.returnValue = ours ? pages.issue() : 0;
+  });
+
+  ipcMain.handle(RPC_CHANNEL, async (event, page: unknown, method: unknown, arg: unknown) => {
     // Only our own window, top frame, showing our own page, may call in.
     const frame = event.senderFrame;
     const trusted =
@@ -217,7 +247,7 @@ async function start(): Promise<void> {
       };
       return denied;
     }
-    return dispatch(method, arg);
+    return dispatch(page, method, arg);
   });
 
   const openWindow = () => {
@@ -248,24 +278,18 @@ async function start(): Promise<void> {
   powerMonitor.on('suspend', () => void lockVault());
   powerMonitor.on('lock-screen', () => void lockVault());
 
-  // The first quit request is held back until the SSH sessions are closed and the client has
-  // stored its pending cache writes (each bounded by a timeout), then quits for real. The
-  // `quitting` flag lets that second request through, so this cannot loop.
-  let quitting = false;
-  app.on('before-quit', (event) => {
-    if (quitting) return;
-    quitting = true;
-    event.preventDefault();
-    autoLock.stop();
-    const within = (work: Promise<unknown>, ms: number) =>
-      Promise.race([
-        work.catch(() => undefined),
-        new Promise((resolve) => setTimeout(resolve, ms)),
-      ]);
-    void within(ssh.closeAll(), QUIT_SSH_GRACE_MS)
-      .then(() => within(client.close(), QUIT_FLUSH_TIMEOUT_MS))
-      .finally(() => app.quit());
+  // Every quit request is held back until the SSH sessions are closed and the client has stored
+  // its pending cache writes (each bounded by a timeout); then the app quits for real.
+  const quitGuard = new QuitGuard({
+    steps: [
+      { run: () => ssh.closeAll(), timeoutMs: QUIT_SSH_GRACE_MS },
+      { run: () => client.close(), timeoutMs: QUIT_FLUSH_TIMEOUT_MS },
+    ],
+    onStart: () => autoLock.stop(),
+    quit: () => app.quit(),
   });
+  app.on('before-quit', quitGuard.onQuitRequest);
+  app.on('will-quit', quitGuard.onQuitRequest);
 }
 
 if (!app.requestSingleInstanceLock()) {

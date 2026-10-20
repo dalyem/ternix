@@ -39,16 +39,31 @@ export const RPC_CHANNEL = 'ternix:rpc';
 export const EVENT_CHANNEL = 'ternix:event';
 /** Terminal output for session `<id>` is sent on `TERMINAL_CHANNEL_PREFIX + id`. */
 export const TERMINAL_CHANNEL_PREFIX = 'ternix:term:';
+/**
+ * Asked once by the preload of every page load (synchronously, before page scripts run): the
+ * page generation it then sends with each request. Main refuses requests from a page that was
+ * replaced after the user signed out (see `main/ipc/pageGate.ts`).
+ */
+export const PAGE_CHANNEL = 'ternix:page';
 
 /** A probed server, plus whether its address looks like a tailnet one (a UI hint only). */
 export interface ProbedServerDto extends ServerInfoDto {
   tailnet: boolean;
 }
 
+/**
+ * Why the last session ended, for the page that loads after it: the server revoked the device
+ * or the session expired, or a logout could not reach the server to revoke this device.
+ */
+export type SessionNotice = 'revoked' | 'expired' | 'logout_unrevoked';
+
 export interface ClientSnapshot {
   state: ClientState;
   connection: ConnectionState;
   account: AccountDto | null;
+  /** The server address to sign in to, remembered by main. */
+  serverUrl: string | null;
+  notice: SessionNotice | null;
 }
 
 export interface Rpc<In, Out> {
@@ -68,6 +83,8 @@ export interface RpcMethods {
   'client.snapshot': Rpc<void, ClientSnapshot>;
   /** Only while signed out (`loggedOut` or `expired`); refused with `forbidden` otherwise. */
   'server.probe': Rpc<{ address: string }, ProbedServerDto>;
+  /** Remember (or forget, with null) the server to sign in to. Only while signed out. */
+  'server.remember': Rpc<{ serverUrl: string | null }, void>;
   'auth.register': Rpc<
     { serverUrl: string; email: string; name: string; password: string; inviteCode?: string },
     AccountDto
@@ -75,7 +92,11 @@ export interface RpcMethods {
   'auth.login': Rpc<{ serverUrl: string; email: string; password: string }, AccountDto>;
   'auth.unlock': Rpc<{ password: string }, void>;
   'auth.lock': Rpc<void, void>;
-  'auth.logout': Rpc<void, LogoutResultDto>;
+  /**
+   * Succeeds when there is no session. Leaving a session reloads the window (see
+   * `PAGE_CHANNEL`). `forgetServer` also forgets the remembered server address.
+   */
+  'auth.logout': Rpc<{ forgetServer?: boolean }, LogoutResultDto>;
   'auth.changePassword': Rpc<{ current: string; next: string }, void>;
   'account.revalidate': Rpc<void, AccountDto>;
   'devices.list': Rpc<void, DeviceDto[]>;

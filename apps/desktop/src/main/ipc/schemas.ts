@@ -85,6 +85,7 @@ export const rpcSchemas: Schemas = {
 
   'client.snapshot': none,
   'server.probe': obj({ address: serverAddress }),
+  'server.remember': obj({ serverUrl: serverAddress.nullable() }),
   'auth.register': obj({
     serverUrl: serverAddress,
     email,
@@ -95,7 +96,9 @@ export const rpcSchemas: Schemas = {
   'auth.login': obj({ serverUrl: serverAddress, email, password }),
   'auth.unlock': obj({ password }),
   'auth.lock': none,
-  'auth.logout': none,
+  'auth.logout': obj({ forgetServer: z.boolean().optional() })
+    .optional()
+    .transform((value) => value ?? {}),
   'auth.changePassword': obj({ current: password, next: password }),
   'account.revalidate': none,
   'devices.list': none,

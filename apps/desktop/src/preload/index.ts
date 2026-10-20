@@ -1,6 +1,7 @@
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron';
 import {
   EVENT_CHANNEL,
+  PAGE_CHANNEL,
   RPC_CHANNEL,
   TERMINAL_CHANNEL_PREFIX,
   type TernixBridge,
@@ -14,8 +15,14 @@ import {
  */
 const SESSION_ID = /^[0-9a-f-]{36}$/;
 
+/**
+ * This page load's generation, asked before any page script runs and kept out of their reach.
+ * After a sign-out main reloads the window and refuses requests that carry an older one.
+ */
+const page: unknown = ipcRenderer.sendSync(PAGE_CHANNEL);
+
 const bridge: TernixBridge = {
-  invoke: (method, arg) => ipcRenderer.invoke(RPC_CHANNEL, method, arg),
+  invoke: (method, arg) => ipcRenderer.invoke(RPC_CHANNEL, page, method, arg),
 
   onEvent(listener) {
     const handler = (_event: IpcRendererEvent, name: unknown, payload: unknown) => {

@@ -11,7 +11,7 @@ import type {
   SshSession,
 } from '@ternix/ssh';
 import type { AppEventName, AppEvents, HostKeyDecision } from '../src/shared/app.js';
-import type { HostKeyFacts } from '../src/main/app/trust.js';
+import type { HostKeyFacts, RouteHop } from '../src/main/app/trust.js';
 import type { ItemSnapshot } from '../src/main/ssh/items.js';
 import { SshManager } from '../src/main/ssh/manager.js';
 import { deferred } from './helpers.js';
@@ -118,6 +118,8 @@ function setup(
   options: {
     snapshot?: ItemSnapshot;
     confirm?: (facts: HostKeyFacts, signal: AbortSignal) => Promise<HostKeyDecision>;
+    /** The "Connect to a new host?" dialog; approves by default. */
+    confirmNew?: (route: RouteHop[], signal: AbortSignal) => Promise<boolean>;
     keyboardTimeoutMs?: number;
   } = {},
 ) {
@@ -125,6 +127,7 @@ function setup(
   const events: { name: AppEventName; payload: unknown }[] = [];
   const putItem = vi.fn(async () => ({}));
   const confirmHostKey = vi.fn(options.confirm ?? (async () => 'reject' as HostKeyDecision));
+  const confirmNewHosts = vi.fn(options.confirmNew ?? (async () => true));
   const manager = new SshManager({
     snapshot: () => options.snapshot ?? snapshotWith(),
     putItem,
@@ -133,6 +136,7 @@ function setup(
     sendTerminal: () => true,
     hasWindow: () => true,
     confirmHostKey,
+    confirmNewHosts,
     agentPath: undefined,
     createSession: (o) => {
       const s = new FakeSession(o);
@@ -147,7 +151,7 @@ function setup(
     await vi.waitFor(() => expect(sessions[index]?.hooks).toBeDefined());
     return sessions[index]!;
   };
-  return { manager, sessions, session, events, putItem, confirmHostKey };
+  return { manager, sessions, session, events, putItem, confirmHostKey, confirmNewHosts };
 }
 
 afterEach(() => {
@@ -308,5 +312,150 @@ describe('SshManager connection failures', () => {
       state: 'closed',
       closed: { kind: 'error', code: 'channel_failed' },
     });
+  });
+});
+
+describe('SshManager new hosts', () => {
+  const JUMP_ID = 'cccccccc-8e6b-4d0a-9b7e-0a1b2c3d4e5f';
+  const TARGET_ID = 'dddddddd-8e6b-4d0a-9b7e-0a1b2c3d4e5f';
+  const host = (address: string, extra: Record<string, unknown> = {}): ItemPayload =>
+    ({
+      type: 'host',
+      schema: 1,
+      updated_at: now,
+      label: address,
+      address,
+      port: 22,
+      username: 'me',
+      tags: [],
+      agent_forwarding: false,
+      ...extra,
+    }) as ItemPayload;
+
+  it('asks before the engine sees an address without a stored host key', async () => {
+    const answer = deferred<boolean>();
+    const { manager, sessions, session, confirmNewHosts } = setup({
+      confirmNew: () => answer.promise,
+    });
+    manager.open(HOST_ID, 80, 24);
+    await vi.waitFor(() => expect(confirmNewHosts).toHaveBeenCalled());
+    expect(confirmNewHosts.mock.calls[0]![0]).toEqual([
+      { host: 'box.example.com', port: 22, isNew: true },
+    ]);
+    // Nothing exists that could resolve or connect while the dialog is open.
+    expect(sessions).toHaveLength(0);
+    answer.resolve(true);
+    const s = await session();
+    expect(s.settings).toMatchObject({ address: 'box.example.com', port: 22 });
+  });
+
+  it('a declined dialog closes the tab and the engine is never called', async () => {
+    const { manager, sessions } = setup({ confirmNew: async () => false });
+    const tab = manager.quickConnect('me@leak-SECRET.attacker.example', 'pw', 80, 24);
+    await vi.waitFor(() => expect(manager.list()[0]?.state).toBe('closed'));
+    expect(sessions).toHaveLength(0);
+    expect(manager.list()[0]).toMatchObject({
+      id: tab.id,
+      closed: { kind: 'error', code: 'not_approved' },
+    });
+  });
+
+  it('closing the tab while the dialog is open closes the dialog and connects nowhere', async () => {
+    const answer = deferred<boolean>();
+    let signal: AbortSignal | undefined;
+    const { manager, sessions } = setup({
+      confirmNew: (_route, s) => {
+        signal = s;
+        return answer.promise;
+      },
+    });
+    const tab = manager.open(HOST_ID, 80, 24);
+    await vi.waitFor(() => expect(signal).toBeDefined());
+    await manager.close(tab.id);
+    expect(signal!.aborted).toBe(true);
+    answer.resolve(true);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(sessions).toHaveLength(0);
+  });
+
+  it('connects to hosts with a stored key without asking (host matched case-insensitively)', async () => {
+    const { manager, session, confirmNewHosts } = setup({
+      snapshot: snapshotWith([
+        ['aaaaaaaa-8e6b-4d0a-9b7e-0a1b2c3d4e5f', knownHost('BOX.example.com', KEY_A)],
+      ]),
+    });
+    manager.open(HOST_ID, 80, 24);
+    await session();
+    expect(confirmNewHosts).not.toHaveBeenCalled();
+  });
+
+  it('a stored key for another port does not count', async () => {
+    const { manager, session, confirmNewHosts } = setup({
+      snapshot: snapshotWith([
+        [
+          'aaaaaaaa-8e6b-4d0a-9b7e-0a1b2c3d4e5f',
+          { ...knownHost('box.example.com', KEY_A), port: 2222 } as ItemPayload,
+        ],
+      ]),
+    });
+    manager.open(HOST_ID, 80, 24);
+    await session();
+    expect(confirmNewHosts).toHaveBeenCalledTimes(1);
+  });
+
+  it('lists the whole route of a jump chain, marking the new hop', async () => {
+    const { manager, session, confirmNewHosts } = setup({
+      snapshot: snapshotWith([
+        [JUMP_ID, host('jump.example.com')],
+        [TARGET_ID, host('inner.example.com', { jump_host_id: JUMP_ID })],
+        ['aaaaaaaa-8e6b-4d0a-9b7e-0a1b2c3d4e5f', knownHost('jump.example.com', KEY_A)],
+      ]),
+    });
+    manager.open(TARGET_ID, 80, 24);
+    await session();
+    expect(confirmNewHosts).toHaveBeenCalledTimes(1);
+    expect(confirmNewHosts.mock.calls[0]![0]).toEqual([
+      { host: 'jump.example.com', port: 22, isNew: false },
+      { host: 'inner.example.com', port: 22, isNew: true },
+    ]);
+  });
+
+  it('asks again on every attempt until a key is stored', async () => {
+    const { manager, session, confirmNewHosts } = setup();
+    const tab = manager.open(HOST_ID, 80, 24);
+    await session(0);
+    manager.reconnect(tab.id, 80, 24);
+    await session(1);
+    expect(confirmNewHosts).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('SshManager quick connect', () => {
+  it('forgets the typed password once the session has signed in', async () => {
+    const { manager, session } = setup();
+    const tab = manager.quickConnect('me@quick.example.com:2200', 'typed-PW', 80, 24);
+    const first = await session(0);
+    expect(first.settings?.password).toBe('typed-PW');
+    first.connected.resolve();
+    await vi.waitFor(() => expect(manager.list()[0]?.state).toBe('closed'));
+    manager.reconnect(tab.id, 80, 24);
+    const second = await session(1);
+    expect(second.settings).toMatchObject({ address: 'quick.example.com', port: 2200 });
+    expect(second.settings?.password).toBeUndefined();
+  });
+
+  it('keeps the password for a retry when signing in never succeeded', async () => {
+    const { manager, session } = setup();
+    const tab = manager.quickConnect('me@quick.example.com', 'typed-PW', 80, 24);
+    const first = await session(0);
+    first.emit({
+      state: 'closed',
+      reason: {
+        kind: 'error',
+        error: Object.assign(new Error('refused'), { code: 'connect_failed' }),
+      },
+    } as SessionStatus);
+    manager.reconnect(tab.id, 80, 24);
+    expect((await session(1)).settings?.password).toBe('typed-PW');
   });
 });

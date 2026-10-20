@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   confirmHostKey,
   confirmMember,
+  confirmNewHosts,
   type HostKeyFacts,
   type MessageBoxRequest,
 } from '../src/main/app/trust.js';
@@ -89,5 +90,51 @@ describe('native trust dialogs', () => {
       expect(request.buttons[request.cancelId]).toBe('Cancel');
       expect(await confirmMember(box(1).fn, who, action)).toBe(true);
     }
+  });
+});
+
+describe('new host dialog', () => {
+  it('shows the address verbatim, defaults to Cancel, and approves only on Connect', async () => {
+    const long = `${'a'.repeat(60)}.secret-in-the-name.attacker.example`;
+    const yes = box(1);
+    expect(await confirmNewHosts(yes.fn, [{ host: long, port: 22, isNew: true }])).toBe(true);
+    const [request] = yes.asked;
+    expect(request!.title).toBe('Connect to a new host?');
+    expect(request!.message).toContain(`${long}:22`);
+    expect(request!.buttons[request!.defaultId]).toBe('Cancel');
+    expect(request!.cancelId).toBe(request!.defaultId);
+    expect(await confirmNewHosts(box(0).fn, [{ host: long, port: 22, isNew: true }])).toBe(false);
+  });
+
+  it('lists a jump route in order and marks the new hops', async () => {
+    const asked = box(1);
+    await confirmNewHosts(asked.fn, [
+      { host: 'jump.example.com', port: 22, isNew: false },
+      { host: '2001:db8::1', port: 2222, isNew: true },
+    ]);
+    expect(asked.asked[0]!.detail).toContain(
+      '1. jump.example.com:22 (jump host)\n2. [2001:db8::1]:2222 (target, new)',
+    );
+  });
+
+  it('cannot be given extra lines or hidden text by the address', async () => {
+    const asked = box(1);
+    await confirmNewHosts(asked.fn, [
+      { host: 'evil.example\nTrusted yes\u202e', port: 22, isNew: true },
+    ]);
+    const shown = asked.asked[0]!.message + asked.asked[0]!.detail;
+    expect(shown).not.toContain('\u202e');
+    expect(shown).toContain('evil.example\\u{a}Trusted yes\\u{202e}:22');
+  });
+
+  it('does not ask when every hop is known, and denies when aborted', async () => {
+    const never = box(1);
+    expect(await confirmNewHosts(never.fn, [{ host: 'a', port: 22, isNew: false }])).toBe(true);
+    expect(never.fn).not.toHaveBeenCalled();
+    const abort = new AbortController();
+    abort.abort();
+    expect(
+      await confirmNewHosts(box(1).fn, [{ host: 'a', port: 22, isNew: true }], abort.signal),
+    ).toBe(false);
   });
 });

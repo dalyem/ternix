@@ -1,7 +1,7 @@
 import { type ReactNode, useEffect, useState } from 'react';
 import type { ProbedServerDto } from '../../../shared/ipc.js';
 import { call, errorMessage } from '../api.js';
-import { rememberServerUrl } from '../store.js';
+import { rememberServerUrl, reportError } from '../store.js';
 import { Badge, Button, Notice, TextField } from '../ui.js';
 
 export function AuthLayout({ title, children }: { title: string; children: ReactNode }) {
@@ -111,8 +111,7 @@ export function ServerSetup({
         onSubmit={(e) => {
           e.preventDefault();
           if (!info) return;
-          rememberServerUrl(info.serverUrl);
-          onDone(info);
+          rememberServerUrl(info.serverUrl).then(() => onDone(info), reportError);
         }}
       >
         <TextField

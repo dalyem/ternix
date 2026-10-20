@@ -2,6 +2,7 @@ import { useSyncExternalStore } from 'react';
 import type { ItemType } from '@ternix/core/items';
 import type { AppInfo, AppSettings, PromptDto, TerminalDto } from '../../shared/app.js';
 import { DEFAULT_SETTINGS } from '../../shared/app.js';
+import type { SessionNotice } from '../../shared/ipc.js';
 import type {
   AccountDto,
   ClientState,
@@ -64,6 +65,7 @@ export interface State {
   toasts: Toast[];
   /** Why the user is back at the login screen (revoked session, ...). */
   authNotice: string | null;
+  /** The server to sign in to; main remembers it (`server.remember`). */
   serverUrl: string | null;
   /** A login, logout or unlock is running; the buttons for those wait for it. */
   authPending: boolean;
@@ -71,15 +73,11 @@ export interface State {
   ownKeyMismatch: boolean;
 }
 
-const SERVER_URL_KEY = 'ternix.serverUrl';
-
-function savedServerUrl(): string | null {
-  try {
-    return window.localStorage.getItem(SERVER_URL_KEY);
-  } catch {
-    return null;
-  }
-}
+/**
+ * Where earlier versions kept the server address. Never read: a compromised page could have
+ * written an address of its choosing there for the next page to probe. Main keeps it now.
+ */
+const LEGACY_SERVER_URL_KEY = 'ternix.serverUrl';
 
 let state: State = {
   booted: false,
@@ -162,14 +160,33 @@ export async function runAuthExclusive<T>(task: () => Promise<T>): Promise<T | u
 
 // Server address
 
-export function rememberServerUrl(serverUrl: string | null): void {
-  try {
-    if (serverUrl) window.localStorage.setItem(SERVER_URL_KEY, serverUrl);
-    else window.localStorage.removeItem(SERVER_URL_KEY);
-  } catch {
-    // Not persisted; the user types it again.
-  }
+/** Remember the server to sign in to (main stores it; only allowed while signed out). */
+export async function rememberServerUrl(serverUrl: string | null): Promise<void> {
+  await call('server.remember', { serverUrl });
   setState({ serverUrl });
+}
+
+// Session
+
+const hasSession = (s: State) => s.clientState === 'locked' || s.clientState === 'unlocked';
+
+function sessionEndedText(reason: 'revoked' | 'expired'): string {
+  return reason === 'revoked'
+    ? 'This device was signed out by the server. Sign in again to continue.'
+    : 'Your session has expired. Sign in again to continue.';
+}
+
+/** Leaving a session reloads the page; main tells the new page why the session ended. */
+function showSessionNotice(notice: SessionNotice | null): void {
+  if (notice === 'revoked' || notice === 'expired') {
+    setState({ authNotice: sessionEndedText(notice) });
+  } else if (notice === 'logout_unrevoked') {
+    // The local session is gone either way; tell the user the server may still list it.
+    toast(
+      'Signed out here, but the server could not be reached to revoke this device. Revoke it from another device.',
+      'warning',
+    );
+  }
 }
 
 // Data
@@ -334,19 +351,16 @@ async function doBoot(): Promise<void> {
   on('client.connection', (connection) => setState({ connection }));
   on('client.vaults-changed', scheduleRefresh);
   on('client.items-changed', scheduleRefresh);
-  on('client.session-revoked', ({ reason }) =>
-    setState({
-      authNotice:
-        reason === 'revoked'
-          ? 'This device was signed out by the server. Sign in again to continue.'
-          : 'Your session has expired. Sign in again to continue.',
-    }),
-  );
+  on('client.session-revoked', ({ reason }) => setState({ authNotice: sessionEndedText(reason) }));
   on('client.error', (err) => {
     if (err.code === 'own_key_mismatch') setState({ ownKeyMismatch: true });
     else if (err.code !== 'cancelled') toast(`Sync problem: ${err.message}`, 'warning');
   });
-  onOwnKeyMismatch(() => setState({ ownKeyMismatch: true }));
+  // Signed out, the only source is a login or register, which left no session to sign out
+  // of: the sign-in form shows it instead of the blocking screen.
+  onOwnKeyMismatch(() => {
+    if (hasSession(state)) setState({ ownKeyMismatch: true });
+  });
   on('settings.changed', (settings) => setState({ settings }));
   on('ssh.status', upsertTerminal);
   on('ssh.prompt', (prompt) => setState((s) => ({ prompts: [...s.prompts, prompt] })));
@@ -354,6 +368,12 @@ async function doBoot(): Promise<void> {
     setState((s) => ({ prompts: s.prompts.filter((p) => p.promptId !== promptId) })),
   );
   on('ssh.notice', (notice) => toast(notice.message, notice.level));
+
+  try {
+    window.localStorage.removeItem(LEGACY_SERVER_URL_KEY);
+  } catch {
+    // Nothing to clean up.
+  }
 
   const [info, settings, snapshot, terminals] = await Promise.all([
     call('app.info'),
@@ -369,9 +389,10 @@ async function doBoot(): Promise<void> {
     account: snapshot.account,
     terminals,
     activeTab: terminals[0]?.id ?? null,
-    serverUrl: savedServerUrl(),
+    serverUrl: snapshot.serverUrl,
     booted: true,
   });
+  showSessionNotice(snapshot.notice);
   if (snapshot.state === 'unlocked') void refreshData();
 }
 

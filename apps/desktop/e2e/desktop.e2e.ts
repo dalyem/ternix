@@ -14,6 +14,7 @@ import {
   type RunningServer,
   type SshTarget,
   startEchoServer,
+  startKeySwappingProxy,
   startSshTarget,
   startTernixServer,
 } from './support/servers.js';
@@ -77,8 +78,14 @@ async function launch(userData: string): Promise<{ app: ElectronApplication; pag
 const shot = (page: Page, name: string) =>
   page.screenshot({ path: join(ARTIFACTS, `${name}.jpg`), type: 'jpeg', quality: 85 });
 
-async function registerUser(page: Page, email: string, name: string, shotName?: string) {
-  await page.getByLabel('Server address').fill(server.url);
+async function registerUser(
+  page: Page,
+  email: string,
+  name: string,
+  shotName?: string,
+  serverUrl = server.url,
+) {
+  await page.getByLabel('Server address').fill(serverUrl);
   await expect(page.getByTestId('server-info')).toContainText('Registration');
   await expect(page.getByTestId('server-info')).toContainText('open');
   if (shotName) await shot(page, `${shotName}-setup`);
@@ -283,8 +290,21 @@ test('packaged app: setup, register, host, host key, terminal, forwards, snippet
     ).toMatchObject({ ok: false, error: { code: 'invalid_input' } });
   });
 
-  await test.step('connect and verify the unknown host key in the native dialog', async () => {
+  await test.step('a new address is approved before anything is sent; declining sends nothing', async () => {
     await page.getByTestId(`host-${HOST_LABEL}`).getByRole('button', { name: 'Connect' }).click();
+    const asked = await answerDialog(app, 'Connect to a new host?', 'Cancel');
+    expect(asked.message).toContain(`${target.address}:${target.port}`);
+    expect(asked.buttons[asked.defaultId]).toBe('Cancel');
+    expect(asked.cancelId).toBe(asked.defaultId);
+    const banner = page.getByTestId('terminal-status');
+    await expect(banner).toContainText('not approved');
+    // Declined before the connection started: no host key was ever seen.
+    expect((await askedDialogs(app)).map((d) => d.title)).toEqual(['Connect to a new host?']);
+    await banner.getByRole('button', { name: 'Reconnect' }).click();
+    await answerDialog(app, 'Connect to a new host?', 'Connect');
+  });
+
+  await test.step('connect and verify the unknown host key in the native dialog', async () => {
     await shot(page, '04-host-key');
     const asked = await answerDialog(app, 'Trust this host?', 'Trust and connect');
     expect(asked.message).toContain(`${target.address}:${target.port}`);
@@ -561,6 +581,41 @@ test('packaged app: setup, register, host, host key, terminal, forwards, snippet
     await shot(page, '10-after-restart');
   });
 
+  await test.step('a quick connect to an unknown name asks before the name is looked up', async () => {
+    const leak = 'e2e@leak-SECRET.invalid';
+    expect(
+      await invoke(page, 'ssh.quickConnect', { target: leak, cols: 80, rows: 24 }),
+    ).toMatchObject({ ok: true });
+    const asked = await answerDialog(app, 'Connect to a new host?', 'Cancel');
+    expect(asked.message).toContain('leak-SECRET.invalid:22');
+    const list = (await invoke(page, 'ssh.list')) as {
+      value: { target: string; state: string; closed?: { code?: string } }[];
+    };
+    const tab = list.value.find((t) => t.target.includes('leak-SECRET.invalid'));
+    // Refused by the dialog, not by a failed DNS lookup.
+    expect(tab).toMatchObject({ state: 'closed', closed: { code: 'not_approved' } });
+  });
+
+  await test.step('signing out replaces the page; the fresh page can probe', async () => {
+    await page.evaluate(() => {
+      (window as unknown as { __leftBehind?: string }).__leftBehind = 'revealed secret';
+    });
+    await page.getByTestId('lock-now').click();
+    await page.getByRole('button', { name: 'Sign out' }).click();
+    await page.getByRole('dialog').getByRole('button', { name: 'Sign out' }).click();
+    await expect(page.getByRole('heading', { name: 'Sign in' })).toBeVisible();
+    await expect
+      .poll(() =>
+        page.evaluate(() => (window as unknown as { __leftBehind?: string }).__leftBehind ?? null),
+      )
+      .toBeNull();
+    expect(await invoke(page, 'server.probe', { address: server.url })).toMatchObject({
+      ok: true,
+      value: { serverUrl: server.url },
+    });
+    await shot(page, '13-signed-out');
+  });
+
   await app.close();
 });
 
@@ -795,4 +850,65 @@ test.afterEach(() => {
     .join('')
     .match(/.*(Uncaught|UnhandledPromiseRejection|TypeError|ReferenceError|Cannot find module).*/g);
   expect(crashes, 'errors in the main process').toBeNull();
+});
+
+test('own key mismatch: signed in it signs out to a fresh page; at registration it stays on the form', async () => {
+  // A server of its own, so this account is its first (admin) user.
+  const own = await startTernixServer();
+  const proxy = await startKeySwappingProxy(own.url);
+  const { app, page } = await launch(newUserDataDir());
+  try {
+    await test.step('the server swaps the key of a signed-in account', async () => {
+      await registerUser(page, 'dave@example.com', 'Dave', undefined, own.url);
+      own.db.substituteKey('dave@example.com');
+      await nav(page, /^Settings/).click();
+      await page.getByRole('tab', { name: 'Admin' }).click(); // the user list reports the key
+      await expect(page.getByTestId('own-key-mismatch')).toBeVisible();
+      await shot(page, '20-own-key-mismatch');
+      await page.evaluate(() => {
+        (window as unknown as { __leftBehind?: string }).__leftBehind = 'yes';
+      });
+      await page.getByTestId('own-key-mismatch').getByRole('button', { name: 'Sign out' }).click();
+      await page.getByRole('dialog').getByRole('button', { name: 'Sign out' }).click();
+      await expect(page.getByRole('heading', { name: 'Sign in' })).toBeVisible();
+      await expect(page.getByTestId('own-key-mismatch')).toHaveCount(0);
+      expect(
+        await page.evaluate(
+          () => (window as unknown as { __leftBehind?: string }).__leftBehind ?? null,
+        ),
+      ).toBeNull();
+    });
+
+    await test.step('registration through a server that swaps the key', async () => {
+      await page.getByRole('button', { name: 'Change server' }).click();
+      await page.getByLabel('Server address').fill(proxy.url);
+      await expect(page.getByTestId('server-info')).toBeVisible();
+      await page.getByRole('button', { name: 'Continue' }).click();
+      await page.getByRole('tab', { name: 'Create account' }).click();
+      await page.getByLabel('Email').fill('erin@example.com');
+      await page.getByLabel('Your name').fill('Erin');
+      await page.getByLabel('Master password', { exact: true }).fill(PASSWORD);
+      await page.getByLabel('Repeat master password').fill(PASSWORD);
+      await page.getByRole('button', { name: 'Create account' }).click();
+      const mismatch = page.getByTestId('sign-in-key-mismatch');
+      await expect(mismatch).toBeVisible({ timeout: 60_000 });
+      await expect(page.getByTestId('own-key-mismatch')).toHaveCount(0);
+      await shot(page, '21-sign-in-key-mismatch');
+      // No session was stored: signing out is a no-op, not an error.
+      expect(await invoke(page, 'client.snapshot')).toMatchObject({
+        ok: true,
+        value: { state: 'loggedOut' },
+      });
+      expect(await invoke(page, 'auth.logout', {})).toMatchObject({
+        ok: true,
+        value: { serverRevoked: true },
+      });
+      await mismatch.getByRole('button', { name: 'Back' }).click();
+      await expect(page.getByRole('button', { name: 'Create account' })).toBeVisible();
+    });
+  } finally {
+    await app.close();
+    await proxy.stop();
+    await own.stop();
+  }
 });

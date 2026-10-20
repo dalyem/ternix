@@ -1,15 +1,17 @@
 import { fingerprint, fromB64 } from '@ternix/core/crypto';
 import type { AppInfo, ImportedFile } from '../../shared/app.js';
 import type { ClientSnapshot } from '../../shared/ipc.js';
-import type { ListedVaultItemsDto } from '../../shared/types.js';
+import type { ListedVaultItemsDto, LogoutResultDto } from '../../shared/types.js';
 import type { TernixClient } from '../client/index.js';
 import { isTailnetHost } from '../client/serverUrl.js';
 import { AppError } from '../app/errors.js';
 import type { SafeStorageSecretStore } from '../app/secretStore.js';
+import type { ServerAddressStore } from '../app/serverAddress.js';
 import type { SettingsStore } from '../app/settings.js';
 import { confirmMember, type MemberAction, type MessageBox } from '../app/trust.js';
 import type { SshManager } from '../ssh/manager.js';
 import type { Handlers } from './dispatch.js';
+import type { SessionNotices } from './pageGate.js';
 import { itemDraftSchema } from './schemas.js';
 import { mergeSecrets, redactItems, redactWrite, secretsOf } from './secrets.js';
 
@@ -18,6 +20,10 @@ export interface HandlerDeps {
   settings: SettingsStore;
   ssh: SshManager;
   secrets: SafeStorageSecretStore;
+  /** The server address the sign-in screen starts with. */
+  serverAddress: ServerAddressStore;
+  /** Why the last session ended, for the page that loads after it. */
+  notices: SessionNotices;
   appInfo(): AppInfo;
   writeClipboard(text: string): void;
   /** Native file dialog; null when the user cancelled. */
@@ -47,7 +53,15 @@ export function createHandlers(deps: HandlerDeps): Handlers {
     state: client.state,
     connection: client.connection,
     account: client.account,
+    serverUrl: deps.serverAddress.get(),
+    notice: deps.notices.current,
   });
+  const signedOut = () => client.state === 'loggedOut' || client.state === 'expired';
+  /** A successful sign-in decides the address the sign-in screen offers next time. */
+  const rememberServer = async <T extends { serverUrl: string }>(account: T): Promise<T> => {
+    await deps.serverAddress.set(account.serverUrl).catch(() => undefined);
+    return account;
+  };
   const allItems = (): ListedVaultItemsDto[] =>
     client.listVaults().map((vault) => {
       try {
@@ -94,27 +108,46 @@ export function createHandlers(deps: HandlerDeps): Handlers {
     'server.probe': async ({ address }) => {
       // An unlocked (or locked) renderer must not reach arbitrary URLs: the path alone could
       // carry vault data out. The server address is only chosen while signed out.
-      if (client.state !== 'loggedOut' && client.state !== 'expired') {
+      if (!signedOut()) {
         throw new AppError('forbidden', 'Sign out before connecting to another server.');
       }
       const info = await client.probeServer(address);
       return { ...info, tailnet: isTailnetHost(new URL(info.serverUrl).hostname) };
     },
+    'server.remember': async ({ serverUrl }) => {
+      // Like probing: a signed-in page could otherwise plant an address (with data in its
+      // path) for the page after sign-out to probe.
+      if (!signedOut()) {
+        throw new AppError('forbidden', 'Sign out before connecting to another server.');
+      }
+      await deps.serverAddress.set(serverUrl);
+    },
     'auth.register': async (input) => {
       secrets.assertAvailable();
-      return client.register(input);
+      return rememberServer(await client.register(input));
     },
     'auth.login': async (input) => {
       secrets.assertAvailable();
-      return client.login(input);
+      return rememberServer(await client.login(input));
     },
     'auth.unlock': ({ password }) => client.unlock(password),
     'auth.lock': async () => {
       ssh.cancelAllPrompts();
       await client.lock();
     },
-    'auth.logout': async () => {
-      const result = await client.logout();
+    'auth.logout': async ({ forgetServer }) => {
+      let result: LogoutResultDto;
+      try {
+        result = await client.logout();
+      } catch (err) {
+        // No session to end (an own-key mismatch during login or register leaves none): the
+        // user is signed out already, which is what they asked for.
+        if ((err as { code?: unknown } | null)?.code !== 'not_logged_in') throw err;
+        result = { serverRevoked: true };
+      }
+      // For the page that loads after the sign-out (this one is being replaced).
+      deps.notices.current = result.serverRevoked ? null : 'logout_unrevoked';
+      if (forgetServer) await deps.serverAddress.set(null).catch(() => undefined);
       await ssh.closeAll();
       return result;
     },

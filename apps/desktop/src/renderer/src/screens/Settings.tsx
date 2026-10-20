@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { MAX_FONT_SIZE, MIN_FONT_SIZE } from '../../../shared/app.js';
 import { call } from '../api.js';
-import { rememberServerUrl, runAuthExclusive, toast, useStore } from '../store.js';
+import { runAuthExclusive, toast, useStore } from '../store.js';
 import {
   Badge,
   Button,
@@ -115,7 +115,8 @@ function AccountTab() {
           confirmDisabled={pending}
           onClose={() => setChangeServer(false)}
           onConfirm={async () => {
-            if (await runAuthExclusive(() => call('auth.logout'))) rememberServerUrl(null);
+            // The window reloads once signed out; main forgets the server address itself.
+            await runAuthExclusive(() => call('auth.logout', { forgetServer: true }));
           }}
         />
       ) : null}

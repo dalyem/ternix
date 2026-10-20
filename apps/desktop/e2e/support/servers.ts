@@ -1,6 +1,7 @@
 import { type ChildProcess, spawn } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
+import { createServer as createHttpServer } from 'node:http';
 import { createRequire } from 'node:module';
 import { connect, createServer } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -116,6 +117,53 @@ export async function startTernixServer(): Promise<RunningServer> {
       await new Promise((r) => child.once('exit', r));
       rmSync(dataDir, { recursive: true, force: true });
     },
+  };
+}
+
+/**
+ * A malicious server in front of `target`: it forwards every request, but answers a
+ * registration with another account key than the one the app sent.
+ */
+export async function startKeySwappingProxy(
+  target: string,
+): Promise<{ url: string; stop(): Promise<void> }> {
+  const proxy = createHttpServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (chunk: Buffer) => chunks.push(chunk));
+    req.on('end', () => {
+      void (async () => {
+        const headers: Record<string, string> = {};
+        for (const name of ['content-type', 'authorization']) {
+          const value = req.headers[name];
+          if (typeof value === 'string') headers[name] = value;
+        }
+        const upstream = await fetch(`${target}${req.url ?? '/'}`, {
+          method: req.method ?? 'GET',
+          headers,
+          ...(chunks.length > 0 ? { body: Buffer.concat(chunks) } : {}),
+          redirect: 'manual',
+        });
+        let body = Buffer.from(await upstream.arrayBuffer());
+        if (req.method === 'POST' && req.url === '/api/v1/auth/register' && upstream.ok) {
+          const json = JSON.parse(body.toString('utf8')) as { user: { public_key: string } };
+          json.user.public_key = randomBytes(32).toString('base64');
+          body = Buffer.from(JSON.stringify(json));
+        }
+        res.writeHead(upstream.status, {
+          'content-type': upstream.headers.get('content-type') ?? 'application/json',
+        });
+        res.end(body);
+      })().catch(() => {
+        res.writeHead(502);
+        res.end();
+      });
+    });
+  });
+  await new Promise<void>((ready) => proxy.listen(0, '127.0.0.1', ready));
+  const { port } = proxy.address() as { port: number };
+  return {
+    url: `http://127.0.0.1:${port}`,
+    stop: () => new Promise((done) => proxy.close(() => done())),
   };
 }
 

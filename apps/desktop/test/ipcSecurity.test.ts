@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { fingerprint, fromB64 } from '@ternix/core/crypto';
 import { createDispatcher } from '../src/main/ipc/dispatch.js';
 import { createHandlers, type HandlerDeps } from '../src/main/ipc/handlers.js';
+import { SessionNotices } from '../src/main/ipc/pageGate.js';
 import { rpcSchemas } from '../src/main/ipc/schemas.js';
 import type { MessageBoxRequest } from '../src/main/app/trust.js';
 import type { RpcMethodName, RpcMethods } from '../src/shared/ipc.js';
@@ -51,6 +52,8 @@ function ipcFor(t: Registered, dialog = fakeDialog()) {
   const handlers = createHandlers({
     client: t.client,
     ssh,
+    serverAddress: { get: () => null, set: async () => undefined },
+    notices: new SessionNotices(),
     messageBox: dialog.box,
   } as unknown as HandlerDeps);
   const dispatch = createDispatcher(rpcSchemas, handlers);

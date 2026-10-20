@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react';
 import type { ProbedServerDto } from '../../../shared/ipc.js';
 import type { AccountDto } from '../../../shared/types.js';
-import { call } from '../api.js';
-import { runAuthExclusive, setState, toast, useStore } from '../store.js';
+import { call, isOwnKeyMismatch } from '../api.js';
+import { runAuthExclusive, setState, useStore } from '../store.js';
 import { Button, ConfirmDialog, ErrorText, Notice, TextField, useAuthAction } from '../ui.js';
 import { AuthLayout, ServerInfoCard, ServerSetup, useServerProbe } from './Setup.js';
 
@@ -99,6 +99,26 @@ function SignIn({
   );
 }
 
+/**
+ * The server reported another account key than this device expected while signing in. No
+ * session was stored, so there is nothing to sign out of: say so and go back to the form.
+ */
+function SignInKeyMismatch({ onBack }: { onBack: () => void }) {
+  return (
+    <div data-testid="sign-in-key-mismatch">
+      <Notice tone="danger">
+        Your server reported a different account key than the one this device expected, so it may be
+        trying to impersonate you. Ternix did not sign in and saved nothing. Contact the server
+        admin before you try again.
+      </Notice>
+      <div className="row">
+        <span />
+        <Button onClick={onBack}>Back</Button>
+      </div>
+    </div>
+  );
+}
+
 function LoginForm({
   serverUrl,
   initialEmail,
@@ -111,6 +131,7 @@ function LoginForm({
   const [email, setEmail] = useState(initialEmail);
   const [password, setPassword] = useState('');
   const action = useAuthAction();
+  if (isOwnKeyMismatch(action.error)) return <SignInKeyMismatch onBack={action.clear} />;
   return (
     <form
       onSubmit={(e) => {
@@ -172,6 +193,7 @@ function RegisterForm({
   const mismatch = confirm.length > 0 && confirm !== password;
   const ready =
     email !== '' && name.trim() !== '' && password.length >= MIN_PASSWORD && confirm === password;
+  if (isOwnKeyMismatch(action.error)) return <SignInKeyMismatch onBack={action.clear} />;
   return (
     <form
       onSubmit={(e) => {
@@ -270,15 +292,10 @@ export function SignOutDialog({
       confirmDisabled={pending}
       onClose={onClose}
       onConfirm={async () => {
-        const result = await runAuthExclusive(() => call('auth.logout'));
+        // Leaving a session reloads the window (main shows the outcome on the new page); with
+        // no session to leave, this page goes on.
+        const result = await runAuthExclusive(() => call('auth.logout', {}));
         if (result) onSignedOut?.();
-        if (result && !result.serverRevoked) {
-          // The local session is gone either way; tell the user the server may still list it.
-          toast(
-            'Signed out here, but the server could not be reached to revoke this device. Revoke it from another device.',
-            'warning',
-          );
-        }
       }}
     />
   );
@@ -350,7 +367,7 @@ export function Unlock() {
 /**
  * The server reported another account key than the one this device pinned for the signed-in
  * user, so it may be impersonating them. Nothing else in the app is usable until the user
- * signs out (which also drops the pins).
+ * signs out (which also drops the pins); then the window reloads into the sign-in screen.
  */
 export function OwnKeyMismatch() {
   const [signingOut, setSigningOut] = useState(false);

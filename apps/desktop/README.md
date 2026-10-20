@@ -59,6 +59,15 @@ typecheck test` covers everything that does not need the Electron binary).
   hooks keep only the known hosts of its hops and the personal vault ID. One `SshSession` runs
   per terminal tab in main. Terminal bytes travel on a channel per session (`ternix:term:<id>`,
   coalesced to a few messages per frame); keystrokes come back through the `ssh.write` method.
+  Before a connection does anything on the network, main checks every hop (jump hosts and
+  target) for a stored `known_host` item (host compared case-insensitively, port exactly, as
+  the host-key check does). If any hop has none, main's native **"Connect to a new host?"**
+  dialog lists the new `host:port` addresses verbatim (control and invisible characters shown
+  as `\u{..}`) and, for a jump chain, the whole route in order; Cancel is the default. Until
+  the user answers there is no DNS lookup and no socket, so a name such as
+  `<encoded secret>.attacker.example` cannot leak through the resolver. Declining closes the
+  tab with "Connection not approved" (`not_approved`). The approval holds for that attempt
+  only; the host-key dialog that follows is what saves trust.
   Host keys are verified in a **native dialog that main opens** (`src/main/app/trust.ts`), not
   in the renderer: an unknown key shows host:port, key type and SHA256 fingerprint and, when
   accepted, is saved as a `known_host` item in the personal vault. A changed key shows both
@@ -69,7 +78,10 @@ typecheck test` covers everything that does not need the Electron binary).
   (closing a native dialog with its `AbortSignal`), and main checks that the attempt is still
   current before it saves a key or goes on. A connection whose shell cannot be opened is
   closed. Port forwards are started and stopped per open terminal, with status. The agent
-  socket comes from `defaultAgentPath(process.platform, process.env)`.
+  socket comes from `defaultAgentPath(process.platform, process.env)`. A quick-connect password
+  is dropped once the session has signed in; reconnecting that tab signs in with the agent or
+  asks through keyboard-interactive (a server that accepts only the `password` method needs a
+  new quick connect).
 - **Secrets in the renderer.** `items.all` and every write result carry payloads without
   `password`, `passphrase` and `private_key`; `has_password`, `has_passphrase` and
   `has_private_key` say whether a value is stored. An editor fetches one item's secrets with
@@ -84,17 +96,29 @@ typecheck test` covers everything that does not need the Electron binary).
   stored) and clears the vault data from the renderer: on every way out of `unlocked` (lock,
   logout, expiry, revocation) the store drops items and the open editor, and the vault views,
   editors and settings forms unmount, taking revealed secrets and typed passwords with them.
-  Only the terminal panes stay mounted. **Open SSH
+  Only the terminal panes stay mounted. **Leaving the session** (logout, expiry, revocation,
+  signing out from the key-mismatch screen; switching accounts logs out first) goes further:
+  main reloads the window, so nothing the old page kept in its own JavaScript survives, and
+  refuses every request from the old page (see the security table). Terminals that stay
+  connected through an expiry reattach to the new page (their scrollback starts over). Main
+  keeps why the session ended (revoked, expired, logout could not reach the server) and the
+  new page shows it. **Open SSH
   sessions stay connected** (as in Termius): their output keeps arriving, and the lock screen
   is drawn over the terminals, whose scrollback stays in renderer memory until the tab is closed.
   Unanswered SSH prompts are denied. New connections need an unlocked vault.
-- **Quitting.** The first quit request is held back (`before-quit` with `preventDefault`) until
-  the SSH sessions are closed (2 s at most) and `client.close()` has stored the pending cache
-  writes (5 s at most); then the app quits for real. A flag keeps the second request from
-  looping.
-- **Server address.** It is chosen only while signed out: `server.probe` is refused in the
-  `locked` and `unlocked` states (a renderer could otherwise send vault data out in a URL), and
-  the client refuses `login`/`register` unless signed out. `https://` is required, except plain
+- **Quitting.** Every quit request (`before-quit` and `will-quit`, so also the last window
+  closing on Windows and Linux) is held back with `preventDefault` until the SSH sessions are
+  closed (2 s at most) and `client.close()` has stored the pending cache writes (5 s at most);
+  then the app quits for real (`src/main/app/quit.ts`). "Shutdown running" and "exit allowed"
+  are separate states: a second quit while the work runs is held back too, and only the request
+  made after the work finished goes through.
+- **Server address.** It is chosen only while signed out: `server.probe` and `server.remember`
+  are refused in the `locked` and `unlocked` states (a renderer could otherwise send vault data
+  out in a URL), and the client refuses `login`/`register` unless signed out. Main remembers
+  the address the sign-in screen starts with (`server.json` in `userData`; set by a signed-out
+  page or by a successful sign-in, forgotten by "Sign out and change"), not the renderer's
+  `localStorage`, where a signed-in page could plant an address for the page after sign-out
+  to probe. `https://` is required, except plain
   `http://` for loopback. A Tailscale
   address (`*.ts.net`, 100.64.0.0/10) is no exception: use `tailscale serve` and
   `https://<machine>.<tailnet>.ts.net`. The setup screen says so, and shows a "Tailscale" badge
@@ -111,8 +135,11 @@ typecheck test` covers everything that does not need the Electron binary).
   default button is Cancel, and declining fails with `cancelled`, which the UI ignores. A
   refused rotation, add or verify (`member_key_changed`, with `ErrorDto.keyChange`) opens the
   renderer's key change dialog with both fingerprints; "I verified the new fingerprint with
-  <email>" calls `vaults.acceptMemberKey` (main asks again) and runs the operation again. `own_key_mismatch` anywhere replaces the app
-  with a blocking screen that only offers sign out.
+  <email>" calls `vaults.acceptMemberKey` (main asks again) and runs the operation again.
+  `own_key_mismatch` with a session replaces the app with a blocking screen that only offers
+  sign out, which reloads into the sign-in screen. Raised by a register or login, it leaves no
+  session: the sign-in screen shows it with a "Back" button instead. `auth.logout` succeeds
+  when there is no session.
 - **Cancelled operations.** `cancelled` (an unlock, login, register or password change that
   lock, logout or quit superseded) never shows as an error. Login, register, unlock and sign
   out run one at a time in the UI: their buttons are disabled while any of them is pending.
@@ -140,7 +167,9 @@ The renderer is untrusted: anything it can do, an XSS in it could do. So:
 | Host keys, adding members, accepting and verifying member keys: answered in main's native dialog, default deny; no IPC answer  | `src/main/app/trust.ts`, `ssh/manager.ts`, `ipc/handlers.ts`                                |
 | Item lists carry no secret fields; one item at a time through `items.reveal`; untouched secrets kept on edit                   | `src/main/ipc/secrets.ts`, `handlers.ts`                                                    |
 | `known_host` items written only by main after the host-key dialog                                                              | `items.put` in `handlers.ts`                                                                |
-| `server.probe` only while signed out                                                                                           | `handlers.ts`                                                                               |
+| `server.probe` and `server.remember` only while signed out; the server address is main's                                       | `handlers.ts`, `src/main/app/serverAddress.ts`                                              |
+| Leaving a session reloads the window; requests from the page before the reload are refused (`stale_page`)                      | `src/main/ipc/pageGate.ts`, `PAGE_CHANNEL` in `src/preload/index.ts`                        |
+| A hop without a stored host key is approved in main's dialog before any DNS lookup or connection                               | `confirmNewHosts` in `trust.ts`, `ssh/manager.ts`                                           |
 | Locking unmounts everything but the terminals and clears decrypted state                                                       | `src/renderer/src/screens/Shell.tsx`, `store.ts` (`clearData`)                              |
 | Session on disk only through `safeStorage`; refuses when unavailable                                                           | `src/main/app/secretStore.ts`; login and register check it first                            |
 | Fuses: `runAsNode` off, `NODE_OPTIONS` off, `--inspect` off, `onlyLoadAppFromAsar` on, ASAR integrity on, cookie encryption on | `electron-builder.common.mjs` (`releaseFuses`); read back in CI by `scripts/check-fuses.sh` |
@@ -159,17 +188,31 @@ These controls are defence in depth, not isolation of secret editing. Code runni
 compromised renderer can still:
 
 - call `items.reveal` and read items' secrets one at a time (an editor needs them), and keep
-  them until it finds a way out (it has no network access of its own: CSP `connect-src 'none'`,
-  no navigation, no `server.probe` while signed in);
-- type into open terminals with `ssh.write`, and so run commands on hosts that are connected,
-  or start connections to saved hosts and quick-connect targets (a new host key still needs the
-  user's answer in main's dialog);
+  them in its own memory while the session lasts. It has no network access of its own (CSP
+  `connect-src 'none'`, no navigation), `server.probe` and `server.remember` are refused while
+  signed in, and leaving the session reloads the page and refuses the old page's requests.
+  It can write what it read to the page's web storage (`localStorage`, `sessionStorage`),
+  which survives the reload; the app never reads either, so only a new compromise of the
+  fresh page could pick it up;
+- read snippets and notes in bulk with `items.all` (only `password`, `passphrase` and
+  `private_key` are held back): do not keep secrets in snippet scripts or notes;
+- type into open terminals with `ssh.write`, and so run commands on hosts that are connected;
+- start connections to saved hosts and quick-connect targets. A host with a stored key
+  connects without asking; an address without one waits for the user in main's "Connect to a
+  new host?" dialog before any lookup, and a new host key still needs the host-key dialog;
+- start a saved port forward on a connected, trusted host. A remote forward's destination
+  (`dest_host`) is resolved and connected to locally each time the server sends a connection
+  through it, without a dialog, so an attacker-chosen forward on a trusted host can make the
+  computer look up a name;
 - show misleading information next to a native dialog; the dialog's own text comes from main.
 
 The review recommended moving secret editing out of the renderer entirely (a separate,
 minimal window or native forms owned by main). That is out of scope for v1.
 `@ternix/ssh` keeps the resolved credentials inside its `ssh2` clients for the life of a
-session; the desktop app drops its own references once the session has signed in.
+session. The desktop app drops its own references once the session has signed in: the
+resolved connection right after `connect`, and a typed quick-connect password (kept in the
+tab's source until then, so a failed first attempt can be retried) as soon as that attempt has
+signed in.
 
 ## Packaging
 
@@ -200,10 +243,15 @@ artifacts. Actions are pinned to commit SHAs.
 
 `e2e/desktop.e2e.ts` drives the packaged app with Playwright's Electron support against a real
 `@ternix/server` and an SSH server: it enters the server address, registers, creates a host,
-checks that the renderer gets no secrets and cannot probe, connects, verifies the host key,
-runs `echo`, checks the saved `known_host`, locks and unlocks, checks that locking with a
-revealed private key in an open editor leaves no secret in the page, restarts the app and
-unlocks again. Native dialogs are answered through `e2e/support/dialogs.ts`, which replaces
+checks that the renderer gets no secrets and cannot probe, declines and then approves the
+"Connect to a new host?" dialog, verifies the host key, runs `echo`, checks the saved
+`known_host`, locks and unlocks, checks that locking with a revealed private key in an open
+editor leaves no secret in the page, restarts the app and unlocks again, checks that a quick
+connect to an unknown name stops at the new-host dialog, and signs out: the page is replaced
+(a value the old page left in `window` is gone) and the fresh page can probe. Another test
+covers own-key mismatches: signed in, the blocking screen signs out into a fresh sign-in page;
+during registration (through a proxy that swaps the key), the sign-in form shows the warning
+with "Back". Native dialogs are answered through `e2e/support/dialogs.ts`, which replaces
 `dialog.showMessageBox` in the main process through the Node inspector (only the e2e package
 has that fuse on; the app has no hook for it). It also covers sharing (the verified/unverified badges and
 the mark-verified flow) and a malicious server: the test rewrites a member's `public_key` in
