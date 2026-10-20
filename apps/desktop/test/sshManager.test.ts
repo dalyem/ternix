@@ -14,6 +14,7 @@ import type { AppEventName, AppEvents, HostKeyDecision } from '../src/shared/app
 import type { HostKeyFacts, RouteHop } from '../src/main/app/trust.js';
 import type { ItemSnapshot } from '../src/main/ssh/items.js';
 import { SshManager } from '../src/main/ssh/manager.js';
+import { looksLikeLocalBindAddress } from '../src/shared/forwards.js';
 import { deferred } from './helpers.js';
 
 const HOST_ID = '3f1c9a52-8e6b-4d0a-9b7e-0a1b2c3d4e5f';
@@ -81,6 +82,7 @@ class FakeSession {
   onForwardStatus() {
     return () => undefined;
   }
+  startForward = vi.fn(async () => undefined);
   emit(status: SessionStatus) {
     for (const l of [...this.statusListeners]) l(status);
   }
@@ -457,5 +459,94 @@ describe('SshManager quick connect', () => {
     } as SessionStatus);
     manager.reconnect(tab.id, 80, 24);
     expect((await session(1)).settings?.password).toBe('typed-PW');
+  });
+});
+
+describe('SshManager port forwards', () => {
+  const forward = (n: number, kind: string, bindAddress: string): [string, ItemPayload] => [
+    `eeeeeee${n}-8e6b-4d0a-9b7e-0a1b2c3d4e5f`,
+    {
+      type: 'port_forward',
+      schema: 1,
+      updated_at: now,
+      label: `f${n}`,
+      host_id: HOST_ID,
+      kind,
+      bind_address: bindAddress,
+      bind_port: 8000 + n,
+      ...(kind === 'dynamic' ? {} : { dest_host: 'db.internal', dest_port: 5432 }),
+    } as ItemPayload,
+  ];
+
+  it('a local or dynamic forward must listen on an IP address or localhost', async () => {
+    const refused = [
+      forward(1, 'local', 'leak-SECRET.attacker.example'),
+      forward(2, 'dynamic', 'leak-SECRET.attacker.example'),
+      forward(3, 'local', 'localhost.'),
+    ];
+    const allowed = [
+      forward(4, 'local', '127.0.0.1'),
+      forward(5, 'dynamic', '::1'),
+      forward(6, 'local', 'localhost'),
+      forward(7, 'local', '0.0.0.0'),
+      forward(8, 'local', ''), // the engine's default, 127.0.0.1
+      // Remote forwards listen on the server, which resolves the name itself.
+      forward(9, 'remote', 'gateway.example'),
+    ];
+    const { manager, session } = setup({ snapshot: snapshotWith([...refused, ...allowed]) });
+    const tab = manager.open(HOST_ID, 80, 24);
+    const s = await session();
+    for (const [id] of refused) {
+      await expect(manager.startForward(tab.id, id)).rejects.toMatchObject({
+        code: 'invalid_input',
+        message: 'Bind address must be an IP address or localhost',
+      });
+      expect(manager.list()[0]?.forwards.find((f) => f.id === id)).toMatchObject({
+        state: 'error',
+      });
+    }
+    expect(s.startForward).not.toHaveBeenCalled();
+    for (const [id] of allowed) await manager.startForward(tab.id, id);
+    expect(s.startForward).toHaveBeenCalledTimes(allowed.length);
+
+    // The editor's early check agrees with main.
+    for (const [, p] of [...refused, ...allowed.slice(0, 4)]) {
+      const { bind_address } = p as { bind_address: string };
+      expect(looksLikeLocalBindAddress(bind_address), bind_address).toBe(
+        allowed.some(([, a]) => a === p),
+      );
+    }
+  });
+});
+
+describe('SshManager attaching a page', () => {
+  it('tells a later page its display starts fresh, once a page has shown the shell', async () => {
+    const { manager, session } = setup();
+    const tab = manager.open(HOST_ID, 80, 24);
+    const s = await session();
+    const shell = {
+      onData: vi.fn(() => () => undefined),
+      onExit: vi.fn(() => () => undefined),
+      resize: vi.fn(),
+      write: vi.fn(),
+      close: vi.fn(),
+    };
+    s.openShell.mockResolvedValue(shell as unknown as ShellStream);
+    s.connected.resolve();
+    await vi.waitFor(() => expect(manager.list()[0]?.state).toBe('ready'));
+
+    expect(manager.attach(tab.id)).toEqual({ displayReset: false });
+    // Leaving the session reloads the page; the new page attaches again.
+    manager.detachAll();
+    expect(manager.attach(tab.id)).toEqual({ displayReset: true });
+  });
+
+  it('a page that attaches before the shell is open has nothing to reset', async () => {
+    const { manager, session } = setup();
+    const tab = manager.open(HOST_ID, 80, 24);
+    await session();
+    expect(manager.attach(tab.id)).toEqual({ displayReset: false });
+    manager.detachAll();
+    expect(manager.attach(tab.id)).toEqual({ displayReset: false });
   });
 });

@@ -1,6 +1,7 @@
 import type { RpcResult, SessionNotice } from '../../shared/ipc.js';
 import type { ClientState } from '../../shared/types.js';
 import type { TernixClient } from '../client/index.js';
+import { AppError } from '../app/errors.js';
 
 /** The part of `TernixClient` the gate watches. */
 export type SessionSource = Pick<TernixClient, 'state' | 'on'>;
@@ -14,14 +15,15 @@ const signedOut = (state: ClientState) => state === 'loggedOut' || state === 'ex
 export const leavesSession = (previous: ClientState, next: ClientState): boolean =>
   signedIn(previous) && signedOut(next);
 
+const STALE_MESSAGE = 'This page was replaced after you signed out. Request refused.';
+
 const stale: RpcResult<never> = {
   ok: false,
-  error: {
-    name: 'AppError',
-    code: 'stale_page',
-    message: 'This page was replaced after you signed out. Request refused.',
-  },
+  error: { name: 'AppError', code: 'stale_page', message: STALE_MESSAGE },
 };
+
+/** For a handler that finds, after an `await`, that its page was replaced meanwhile. */
+export const stalePageError = () => new AppError('stale_page', STALE_MESSAGE);
 
 /**
  * A page that was signed in may hold revealed secrets in its own JavaScript, and once signed

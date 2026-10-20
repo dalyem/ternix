@@ -183,6 +183,7 @@ async function start(): Promise<void> {
     secrets,
     serverAddress,
     notices,
+    pages,
     appInfo: () => ({ version: app.getVersion(), platform, secretStorage: secrets.status() }),
     writeClipboard: (text) => clipboard.writeText(text),
     importKeyFile: async () => {

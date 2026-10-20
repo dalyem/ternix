@@ -154,8 +154,11 @@ export interface RpcMethods {
     { target: string; password?: string; cols: number; rows: number },
     TerminalDto
   >;
-  /** Start streaming terminal output on the session's channel; output so far is replayed. */
-  'ssh.attach': Rpc<{ id: string }, void>;
+  /**
+   * Start streaming terminal output on the session's channel; output so far is replayed.
+   * `displayReset`: an earlier page showed this shell, so this page's terminal starts fresh.
+   */
+  'ssh.attach': Rpc<{ id: string }, { displayReset: boolean }>;
   'ssh.write': Rpc<{ id: string; data: string }, void>;
   'ssh.resize': Rpc<{ id: string; cols: number; rows: number }, void>;
   'ssh.reconnect': Rpc<{ id: string; cols: number; rows: number }, TerminalDto>;

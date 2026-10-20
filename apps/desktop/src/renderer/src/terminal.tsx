@@ -21,6 +21,10 @@ const isMac = navigator.userAgent.includes('Mac');
 const FONT_FAMILY =
   'ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", "DejaVu Sans Mono", monospace';
 const WRITE_CHUNK = 32 * 1024;
+/** After a page reload the terminal starts blank, without the modes the shell had set. */
+const DISPLAY_RESET_NOTICE =
+  '\r\n\x1b[2m[Ternix] Display was reset after signing back in. ' +
+  'Full-screen apps may need a redraw (Ctrl+L) or restart.\x1b[0m\r\n';
 
 const THEME = {
   background: '#0d0f12',
@@ -161,7 +165,12 @@ function TerminalPane({
     fitNow();
     call('ssh.resize', { id, cols: term.cols, rows: term.rows }).catch(() => undefined);
     // Subscribe first, then ask for the output so far: nothing is lost in between.
-    call('ssh.attach', { id }).catch(reportError);
+    call('ssh.attach', { id })
+      .then(({ displayReset }) => {
+        // Shown here only, never sent to the server.
+        if (displayReset && handle.current?.term === term) term.write(DISPLAY_RESET_NOTICE);
+      })
+      .catch(reportError);
 
     return () => {
       observer.disconnect();

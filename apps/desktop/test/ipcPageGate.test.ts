@@ -25,6 +25,7 @@ import {
   type TestClient,
   type TestServer,
   uniqueEmail,
+  waitFor,
 } from './helpers.js';
 
 /**
@@ -62,6 +63,7 @@ function wire(t: TestClient) {
     secrets: { assertAvailable: () => undefined },
     serverAddress,
     notices,
+    pages,
     messageBox: vi.fn(async () => ({ response: 0, checkboxChecked: false })),
   } as unknown as HandlerDeps);
   const dispatch = pages.guard(createDispatcher(rpcSchemas, handlers));
@@ -103,6 +105,79 @@ describe('leaving a session replaces the page', () => {
       ok: true,
       value: { serverUrl: server.url },
     });
+  });
+
+  for (const method of ['auth.login', 'auth.register'] as const) {
+    it(`refuses ${method} sent while the page's own logout is still running`, async () => {
+      const a = await registerUser(server, { realtime: false });
+      const { pages, reload, dispatch } = wire(a);
+      const page = pages.issue();
+      // Hold the server's answer to the logout; nothing may reach the attacker meanwhile.
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => (release = resolve));
+      a.spy.before = async (_method, path) => {
+        if (path.includes('leak-SECRET')) throw new TypeError('attacker reached');
+        if (path.endsWith('/auth/logout')) await held;
+      };
+
+      const logout = dispatch(page, 'auth.logout', undefined);
+      await waitFor(() => a.spy.count('POST', '/auth/logout') === 1, 'logout sent');
+      const arg =
+        method === 'auth.login'
+          ? { serverUrl: ATTACKER, email: 'x@attacker.example', password: 'SECRET' }
+          : { serverUrl: ATTACKER, email: 'x@attacker.example', name: 'x', password: 'SECRET-pw' };
+      const queued = dispatch(page, method, arg);
+      const probe = dispatch(page, 'server.probe', { address: ATTACKER });
+      const remember = dispatch(page, 'server.remember', { serverUrl: ATTACKER });
+      release();
+
+      expect(await logout).toMatchObject({ ok: true });
+      expect(reload).toHaveBeenCalledTimes(1);
+      for (const result of [await queued, await probe, await remember]) {
+        expect(result).toMatchObject({ ok: false, error: { code: 'forbidden' } });
+      }
+      expect(a.spy.calls.filter((c) => c.path.includes('leak-SECRET'))).toEqual([]);
+      expect(a.client.state).toBe('loggedOut');
+    });
+  }
+
+  it('the page after a logout may probe while that logout is still finishing', async () => {
+    const a = await registerUser(server, { realtime: false });
+    const { pages, dispatch, ssh } = wire(a);
+    let release!: () => void;
+    ssh.closeAll.mockImplementation(
+      () => new Promise<undefined>((resolve) => (release = () => resolve(undefined))),
+    );
+    const logout = dispatch(pages.issue(), 'auth.logout', undefined);
+    await waitFor(() => a.client.state === 'loggedOut', 'signed out');
+    // The window has reloaded; the fresh page starts while main closes the SSH sessions.
+    expect(await dispatch(pages.issue(), 'server.probe', { address: server.url })).toMatchObject({
+      ok: true,
+    });
+    release();
+    expect(await logout).toMatchObject({ ok: true });
+  });
+
+  it('a server choice whose page is replaced mid-request does not count', async () => {
+    const account = await registerUser(server, { realtime: false });
+    const t = await makeClient();
+    const { pages, dispatch, serverAddress } = wire(t);
+    const page = pages.issue();
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    t.spy.before = async (_method, path) => {
+      if (path.endsWith('/auth/prelogin')) await held;
+    };
+    const login = dispatch(page, 'auth.login', {
+      serverUrl: server.url,
+      email: account.email,
+      password: account.password,
+    });
+    await waitFor(() => t.spy.count('POST', '/auth/prelogin') === 1, 'prelogin sent');
+    pages.retire();
+    release();
+    expect(await login).toMatchObject({ ok: false, error: { code: 'stale_page' } });
+    expect(serverAddress.get()).toBeNull();
   });
 
   it('locking keeps the page (probing is refused while locked anyway)', async () => {

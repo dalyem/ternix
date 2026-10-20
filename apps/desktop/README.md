@@ -77,11 +77,14 @@ typecheck test` covers everything that does not need the Electron binary).
   belongs to one connection attempt: closing, failing or reconnecting the tab cancels it
   (closing a native dialog with its `AbortSignal`), and main checks that the attempt is still
   current before it saves a key or goes on. A connection whose shell cannot be opened is
-  closed. Port forwards are started and stopped per open terminal, with status. The agent
-  socket comes from `defaultAgentPath(process.platform, process.env)`. A quick-connect password
-  is dropped once the session has signed in; reconnecting that tab signs in with the agent or
-  asks through keyboard-interactive (a server that accepts only the `password` method needs a
-  new quick connect).
+  closed. Port forwards are started and stopped per open terminal, with status. A local or
+  dynamic forward must listen on an IP address or `localhost` (main refuses any other bind
+  address before starting it, since a name would be looked up in DNS). The agent socket comes
+  from `defaultAgentPath(process.platform, process.env)` and is used for agent forwarding only:
+  the engine signs in with a stored key, a password or keyboard-interactive, in that order,
+  never with the agent. A quick-connect password is dropped once the session has signed in, so
+  reconnecting that tab can only sign in through keyboard-interactive; a server that does not
+  offer it needs a new quick connect.
 - **Secrets in the renderer.** `items.all` and every write result carry payloads without
   `password`, `passphrase` and `private_key`; `has_password`, `has_passphrase` and
   `has_private_key` say whether a value is stored. An editor fetches one item's secrets with
@@ -100,7 +103,11 @@ typecheck test` covers everything that does not need the Electron binary).
   signing out from the key-mismatch screen; switching accounts logs out first) goes further:
   main reloads the window, so nothing the old page kept in its own JavaScript survives, and
   refuses every request from the old page (see the security table). Terminals that stay
-  connected through an expiry reattach to the new page (their scrollback starts over). Main
+  connected through an expiry reattach to the new page, but its terminal starts blank: the
+  scrollback starts over, and the modes the shell had set (mouse reporting, application cursor
+  keys, the alternate screen) are gone, because main keeps no copy of the display. The tab
+  shows a note saying so (written to the terminal only, never sent to the server): full-screen
+  apps may need a redraw (Ctrl+L) or a restart. Main
   keeps why the session ended (revoked, expired, logout could not reach the server) and the
   new page shows it. **Open SSH
   sessions stay connected** (as in Termius): their output keeps arriving, and the lock screen
@@ -167,9 +174,10 @@ The renderer is untrusted: anything it can do, an XSS in it could do. So:
 | Host keys, adding members, accepting and verifying member keys: answered in main's native dialog, default deny; no IPC answer  | `src/main/app/trust.ts`, `ssh/manager.ts`, `ipc/handlers.ts`                                |
 | Item lists carry no secret fields; one item at a time through `items.reveal`; untouched secrets kept on edit                   | `src/main/ipc/secrets.ts`, `handlers.ts`                                                    |
 | `known_host` items written only by main after the host-key dialog                                                              | `items.put` in `handlers.ts`                                                                |
-| `server.probe` and `server.remember` only while signed out; the server address is main's                                       | `handlers.ts`, `src/main/app/serverAddress.ts`                                              |
+| `server.probe`, `server.remember`, `auth.login`, `auth.register` only while signed out, never from a page logging out          | `choosingServer` in `handlers.ts`, `src/main/app/serverAddress.ts`                          |
 | Leaving a session reloads the window; requests from the page before the reload are refused (`stale_page`)                      | `src/main/ipc/pageGate.ts`, `PAGE_CHANNEL` in `src/preload/index.ts`                        |
 | A hop without a stored host key is approved in main's dialog before any DNS lookup or connection                               | `confirmNewHosts` in `trust.ts`, `ssh/manager.ts`                                           |
+| Local and dynamic forwards listen only on an IP address or `localhost`, never a name to look up                                | `startForward` in `ssh/manager.ts`; the forward editor checks too                           |
 | Locking unmounts everything but the terminals and clears decrypted state                                                       | `src/renderer/src/screens/Shell.tsx`, `store.ts` (`clearData`)                              |
 | Session on disk only through `safeStorage`; refuses when unavailable                                                           | `src/main/app/secretStore.ts`; login and register check it first                            |
 | Fuses: `runAsNode` off, `NODE_OPTIONS` off, `--inspect` off, `onlyLoadAppFromAsar` on, ASAR integrity on, cookie encryption on | `electron-builder.common.mjs` (`releaseFuses`); read back in CI by `scripts/check-fuses.sh` |
@@ -189,8 +197,9 @@ compromised renderer can still:
 
 - call `items.reveal` and read items' secrets one at a time (an editor needs them), and keep
   them in its own memory while the session lasts. It has no network access of its own (CSP
-  `connect-src 'none'`, no navigation), `server.probe` and `server.remember` are refused while
-  signed in, and leaving the session reloads the page and refuses the old page's requests.
+  `connect-src 'none'`, no navigation), `server.probe`, `server.remember`, `auth.login` and
+  `auth.register` are refused while signed in and from a page whose logout is still running,
+  and leaving the session reloads the page and refuses the old page's requests.
   It can write what it read to the page's web storage (`localStorage`, `sessionStorage`),
   which survives the reload; the app never reads either, so only a new compromise of the
   fresh page could pick it up;
@@ -203,7 +212,8 @@ compromised renderer can still:
 - start a saved port forward on a connected, trusted host. A remote forward's destination
   (`dest_host`) is resolved and connected to locally each time the server sends a connection
   through it, without a dialog, so an attacker-chosen forward on a trusted host can make the
-  computer look up a name;
+  computer look up a name. Local and dynamic forwards hand their destinations to the SSH
+  server, and their bind address cannot be a name;
 - show misleading information next to a native dialog; the dialog's own text comes from main.
 
 The review recommended moving secret editing out of the renderer entirely (a separate,

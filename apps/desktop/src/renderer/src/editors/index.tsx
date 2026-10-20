@@ -1,6 +1,7 @@
 import type { ItemType } from '@ternix/core/items';
 import { useMemo, useState } from 'react';
 import { call } from '../api.js';
+import { BIND_ADDRESS_MESSAGE, looksLikeLocalBindAddress } from '../../../shared/forwards.js';
 import { groupDefaultPort } from '../../../shared/groups.js';
 import type { PayloadOf } from '../items.js';
 import { type EditorTarget, useStore } from '../store.js';
@@ -556,9 +557,11 @@ function ForwardEditor({ target }: { target: EditorTarget }) {
               ? 'The listen port must be 0 to 65535'
               : bindAddress.trim() === ''
                 ? 'Enter a listen address'
-                : needsDest && (destHost.trim() === '' || parsePort(destPort) === null)
-                  ? 'Enter the destination host and port'
-                  : null
+                : kind !== 'remote' && !looksLikeLocalBindAddress(bindAddress)
+                  ? BIND_ADDRESS_MESSAGE
+                  : needsDest && (destHost.trim() === '' || parsePort(destPort) === null)
+                    ? 'Enter the destination host and port'
+                    : null
       }
       build={() => ({
         type: 'port_forward',

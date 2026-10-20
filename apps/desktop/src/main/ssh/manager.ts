@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { isIP } from 'node:net';
 import { hostPayloadSchema, type ItemPayload, type KnownHostPayload } from '@ternix/core/items';
 import {
   type CloseReason,
@@ -23,6 +24,7 @@ import type {
   TerminalClosedDto,
   TerminalDto,
 } from '../../shared/app.js';
+import { BIND_ADDRESS_MESSAGE } from '../../shared/forwards.js';
 import type { ItemDraft } from '../../shared/types.js';
 import { AppError } from '../app/errors.js';
 import type { HostKeyFacts, RouteHop } from '../app/trust.js';
@@ -90,6 +92,8 @@ interface Terminal {
   /** Bumped for every connection attempt; events from older attempts are ignored. */
   attempt: number;
   attached: boolean;
+  /** A page has shown this terminal's output (a later page starts with a blank display). */
+  shown: boolean;
   unsubscribeData: Unsubscribe | null;
   outBuffer: Uint8Array[];
   outBytes: number;
@@ -133,6 +137,12 @@ function toClosed(reason: CloseReason): TerminalClosedDto {
   return { kind: reason.kind };
 }
 
+/** Empty means the engine's default, 127.0.0.1. */
+function isLocalBindAddress(address: string): boolean {
+  const a = address.trim();
+  return a === '' || a.toLowerCase() === 'localhost' || isIP(a) !== 0;
+}
+
 /**
  * One `SshSession` per terminal tab, in the main process. The renderer sees only tab state
  * (`TerminalDto`), prompts to answer, and the shell's bytes; credentials and keys resolved
@@ -173,6 +183,7 @@ export class SshManager {
       shell: null,
       attempt: 0,
       attached: false,
+      shown: false,
       unsubscribeData: null,
       outBuffer: [],
       outBytes: 0,
@@ -193,10 +204,18 @@ export class SshManager {
     return this.toDto(t);
   }
 
-  attach(id: string): void {
+  /**
+   * Start sending output to the page. `displayReset` when an earlier page showed this shell:
+   * the new page's terminal has none of the modes the shell set there (mouse reporting,
+   * application cursor keys, the alternate screen), and main does not keep a copy of them.
+   */
+  attach(id: string): { displayReset: boolean } {
     const t = this.require(id);
+    const displayReset = t.shown && t.state === 'ready';
     t.attached = true;
+    t.shown = true;
     this.pump(t);
+    return { displayReset };
   }
 
   /**
@@ -244,6 +263,10 @@ export class SshManager {
     const spec = t.specs.get(forwardId);
     if (!spec || !t.session) throw new AppError('invalid_input', 'Unknown port forward');
     try {
+      // A local or dynamic forward listens here, and a name would go to DNS unapproved.
+      if (spec.kind !== 'remote' && !isLocalBindAddress(spec.bindAddress)) {
+        throw new AppError('invalid_input', BIND_ADDRESS_MESSAGE);
+      }
       await t.session.startForward(spec);
     } catch (err) {
       this.updateForward(t, forwardId, { state: 'error', error: errMessage(err) });
@@ -571,7 +594,8 @@ export class SshManager {
         return;
       }
       // A typed quick-connect password is not kept for reconnecting: the next attempt signs in
-      // with the agent or asks through keyboard-interactive.
+      // with keyboard-interactive, if the server offers it (the engine never uses the agent to
+      // sign in).
       if (t.source.kind === 'quick' && t.source.password !== undefined) {
         t.source = { kind: 'quick', target: t.source.target, password: undefined };
       }

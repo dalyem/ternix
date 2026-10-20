@@ -11,7 +11,7 @@ import type { SettingsStore } from '../app/settings.js';
 import { confirmMember, type MemberAction, type MessageBox } from '../app/trust.js';
 import type { SshManager } from '../ssh/manager.js';
 import type { Handlers } from './dispatch.js';
-import type { SessionNotices } from './pageGate.js';
+import { type PageGate, type SessionNotices, stalePageError } from './pageGate.js';
 import { itemDraftSchema } from './schemas.js';
 import { mergeSecrets, redactItems, redactWrite, secretsOf } from './secrets.js';
 
@@ -24,6 +24,8 @@ export interface HandlerDeps {
   serverAddress: ServerAddressStore;
   /** Why the last session ended, for the page that loads after it. */
   notices: SessionNotices;
+  /** Which page load is current (the gate already refused requests from older ones). */
+  pages: Pick<PageGate, 'issue' | 'isCurrent'>;
   appInfo(): AppInfo;
   writeClipboard(text: string): void;
   /** Native file dialog; null when the user cancelled. */
@@ -57,6 +59,27 @@ export function createHandlers(deps: HandlerDeps): Handlers {
     notice: deps.notices.current,
   });
   const signedOut = () => client.state === 'loggedOut' || client.state === 'expired';
+  /** The page generation of each `auth.logout` that has not returned yet. */
+  const loggingOut: number[] = [];
+  /**
+   * For requests that pick a server (probe, remember, login, register): only while signed out,
+   * and not from a page whose own logout is still running, so a signed-in page cannot queue one
+   * behind that logout and have it run after the page was replaced. (The page that loads after
+   * the logout has a new generation and may go ahead.) Returns a check for after each `await`:
+   * the page that sent the request must still be the current one.
+   *
+   * Called synchronously at handler entry, where the gate has just checked the caller's
+   * generation, so `pages.issue()` is the caller's generation.
+   */
+  const choosingServer = (): (() => void) => {
+    const page = deps.pages.issue();
+    if (!signedOut() || loggingOut.includes(page)) {
+      throw new AppError('forbidden', 'Sign out before connecting to another server.');
+    }
+    return () => {
+      if (!deps.pages.isCurrent(page)) throw stalePageError();
+    };
+  };
   /** A successful sign-in decides the address the sign-in screen offers next time. */
   const rememberServer = async <T extends { serverUrl: string }>(account: T): Promise<T> => {
     await deps.serverAddress.set(account.serverUrl).catch(() => undefined);
@@ -108,27 +131,30 @@ export function createHandlers(deps: HandlerDeps): Handlers {
     'server.probe': async ({ address }) => {
       // An unlocked (or locked) renderer must not reach arbitrary URLs: the path alone could
       // carry vault data out. The server address is only chosen while signed out.
-      if (!signedOut()) {
-        throw new AppError('forbidden', 'Sign out before connecting to another server.');
-      }
+      const checkPage = choosingServer();
       const info = await client.probeServer(address);
+      checkPage();
       return { ...info, tailnet: isTailnetHost(new URL(info.serverUrl).hostname) };
     },
     'server.remember': async ({ serverUrl }) => {
       // Like probing: a signed-in page could otherwise plant an address (with data in its
       // path) for the page after sign-out to probe.
-      if (!signedOut()) {
-        throw new AppError('forbidden', 'Sign out before connecting to another server.');
-      }
+      choosingServer();
       await deps.serverAddress.set(serverUrl);
     },
     'auth.register': async (input) => {
+      const checkPage = choosingServer();
       secrets.assertAvailable();
-      return rememberServer(await client.register(input));
+      const account = await client.register(input);
+      checkPage();
+      return rememberServer(account);
     },
     'auth.login': async (input) => {
+      const checkPage = choosingServer();
       secrets.assertAvailable();
-      return rememberServer(await client.login(input));
+      const account = await client.login(input);
+      checkPage();
+      return rememberServer(account);
     },
     'auth.unlock': ({ password }) => client.unlock(password),
     'auth.lock': async () => {
@@ -136,20 +162,26 @@ export function createHandlers(deps: HandlerDeps): Handlers {
       await client.lock();
     },
     'auth.logout': async ({ forgetServer }) => {
-      let result: LogoutResultDto;
+      const page = deps.pages.issue();
+      loggingOut.push(page);
       try {
-        result = await client.logout();
-      } catch (err) {
-        // No session to end (an own-key mismatch during login or register leaves none): the
-        // user is signed out already, which is what they asked for.
-        if ((err as { code?: unknown } | null)?.code !== 'not_logged_in') throw err;
-        result = { serverRevoked: true };
+        let result: LogoutResultDto;
+        try {
+          result = await client.logout();
+        } catch (err) {
+          // No session to end (an own-key mismatch during login or register leaves none): the
+          // user is signed out already, which is what they asked for.
+          if ((err as { code?: unknown } | null)?.code !== 'not_logged_in') throw err;
+          result = { serverRevoked: true };
+        }
+        // For the page that loads after the sign-out (this one is being replaced).
+        deps.notices.current = result.serverRevoked ? null : 'logout_unrevoked';
+        if (forgetServer) await deps.serverAddress.set(null).catch(() => undefined);
+        await ssh.closeAll();
+        return result;
+      } finally {
+        loggingOut.splice(loggingOut.indexOf(page), 1);
       }
-      // For the page that loads after the sign-out (this one is being replaced).
-      deps.notices.current = result.serverRevoked ? null : 'logout_unrevoked';
-      if (forgetServer) await deps.serverAddress.set(null).catch(() => undefined);
-      await ssh.closeAll();
-      return result;
     },
     'auth.changePassword': ({ current, next }) => client.changePassword(current, next),
     'account.revalidate': () => client.revalidate(),
