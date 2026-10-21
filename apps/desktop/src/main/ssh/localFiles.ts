@@ -1,7 +1,17 @@
 import { randomBytes } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
 import type { Stats } from 'node:fs';
-import { lstat, mkdir, open, opendir, realpath, rename, stat, unlink } from 'node:fs/promises';
+import {
+  link,
+  lstat,
+  mkdir,
+  open,
+  opendir,
+  realpath,
+  rename,
+  stat,
+  unlink,
+} from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import { basename, isAbsolute, join, relative, sep } from 'node:path';
 import type { LocalSink, LocalSource } from '@ternix/ssh';
@@ -112,25 +122,24 @@ export class LocalDestination {
   /**
    * The folder `name` inside `parent` (a folder this destination returned, or its root): made
    * when missing, reused when it is a real folder, refused when a file or a link is in the way.
-   * `check` runs after each wait, so nothing is made once the work is no longer wanted.
+   * `check` runs after each wait, whether it succeeded or failed, so nothing is made or read once
+   * the work is no longer wanted.
    */
   async directory(parent: string, name: string, check: StillWanted = always): Promise<string> {
     requireSafeName(name, this.platform);
     check();
-    await this.requireRealDir(parent);
-    check();
+    await this.requireRealDir(parent).finally(check);
     const target = join(parent, name);
     const existing = await lstat(target).catch(() => undefined);
     check();
     if (!existing) {
-      await mkdir(target);
+      await mkdir(target).finally(check);
       // Made by us just now; check again in case something raced us to it, or swapped a folder
       // above it for a link so that the new folder landed somewhere else.
-      if (!(await lstat(target)).isDirectory()) {
+      if (!(await lstat(target).finally(check)).isDirectory()) {
         throw new AppError('unsafe_name', `"${printable(name)}" changed while it was created`);
       }
-      await this.requireRealDir(target);
-      check();
+      await this.requireRealDir(target).finally(check);
       return target;
     }
     if (existing.isSymbolicLink()) {
@@ -174,17 +183,35 @@ export interface LocalFile {
   discard(): Promise<void>;
 }
 
+/**
+ * `link` failures that mean the filesystem has no hard links: Linux's vfat says EPERM, network
+ * shares ENOTSUP or EOPNOTSUPP, and Windows reports FAT's "incorrect function" as EISDIR. EXDEV
+ * cannot happen within one folder unless it was swapped, which the check after it catches.
+ */
+const NO_HARD_LINKS = new Set<unknown>([
+  'EPERM',
+  'ENOTSUP',
+  'EOPNOTSUPP',
+  'ENOSYS',
+  'EXDEV',
+  'EISDIR',
+]);
+
 // O_NOFOLLOW is POSIX only; with O_CREAT | O_EXCL a link at the path fails anyway.
 const CREATE_NEW =
   fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | (fsConstants.O_NOFOLLOW ?? 0);
 
 /**
- * Create `name` in `dir` for writing. Without `replace`, an existing entry (file, folder or link,
- * even a dangling one) fails with `already_exists`. With `replace`, the data goes to a new
- * temporary file next to it, which replaces the entry on `finish` (a rename replaces a link
- * itself, never its target), so a failed download leaves the old file as it was. A folder is
- * never replaced. `dir` is resolved once, here, and must still resolve to the same folder
- * whenever the file is checked (see `createIn`).
+ * Create `name` in `dir` for writing. The data always goes to a new temporary file next to it
+ * (`.ternix-<random>.part`), which takes the name on `finish`, so a failed download leaves no
+ * partial file under the name, and the cleanup only ever removes the temporary name. Without
+ * `replace`, an existing entry (file, folder or link, even a dangling one) fails with
+ * `already_exists`, and the temporary file is published with a hard link, which never replaces
+ * anything: an entry that appeared meanwhile fails with `already_exists` too. With `replace`, the
+ * temporary file is renamed over the entry (a rename replaces a link itself, never its target),
+ * so a failed download leaves the old file as it was. A folder is never replaced. `dir` is
+ * resolved once, here, and must still resolve to the same folder whenever the file is checked
+ * (see `createIn`).
  */
 export async function createLocalFile(
   dir: string,
@@ -198,14 +225,15 @@ export async function createLocalFile(
 
 /**
  * `createLocalFile` in `dir`, a folder that resolves to itself inside `root`. Node has no
- * `openat`, so every path operation resolves `dir` again, and a local process that can write to
- * the folder could swap it (or the file) for a link in between. The gaps are kept as small as
- * Node allows: right after the open, and after all work on the handle (mode, close) right before
- * the rename into place or the removal of a failed download, the folder must still resolve to
- * itself inside `root` and the name must still be the file the handle has open (same device and
- * inode, not a link). Nothing is awaited between that last check and the rename or unlink. When
- * the check fails, the name is left alone and the download fails; what was written is emptied
- * through the handle when it is still open (that file is provably ours).
+ * `openat`, `linkat` or `renameat`, so every path operation resolves `dir` again, and a local
+ * process that can write to the folder could swap it (or the file) for a link in between. The
+ * gaps are kept as small as Node allows: right after the open, and after all work on the handle
+ * (mode, close) right before the link, rename or unlink, the folder must still resolve to itself
+ * inside `root` and the name must still be the file the handle has open (same device and inode,
+ * not a link). Nothing is awaited between that last check and the call. When the check fails, the
+ * name is left alone and the download fails; what was written is emptied through the handle when
+ * it is still open (that file is provably ours). The README's security section lists what a swap
+ * inside one of those calls can still do.
  *
  * Modes: a new file is created with 0666 less the umask, like any new file. A temporary file is
  * 0600 while it is written; on `finish` it takes the permission bits of the file it replaces
@@ -227,7 +255,7 @@ async function createIn(
   if (existing?.isDirectory()) {
     throw new AppError('already_exists', `"${printable(name)}" is a folder; it is not replaced`);
   }
-  const path = existing ? join(dir, `.ternix-${randomBytes(6).toString('hex')}.part`) : target;
+  const path = join(dir, `.ternix-${randomBytes(6).toString('hex')}.part`);
   // The permission bits a replaced file had; undefined for a new file or a replaced link.
   const keepMode = existing?.isFile() ? existing.mode & 0o777 : undefined;
   await hooks.beforeOpen?.();
@@ -249,16 +277,31 @@ async function createIn(
     closed = true;
     await handle.close();
   };
-  /** Whether `path` is still the file `handle` has open, in the folder that was checked. */
+  /** Whether `at` is still the file `handle` has open, in the folder that was checked. */
   let own: Stats;
-  const isOurs = async (): Promise<boolean> => {
+  const isOurs = async (at = path): Promise<boolean> => {
     try {
       await requireSameFolder(dir, root);
     } catch {
       return false;
     }
-    const now = await lstat(path).catch(() => undefined);
+    const now = await lstat(at).catch(() => undefined);
     return now !== undefined && now.isFile() && now.dev === own.dev && now.ino === own.ino;
+  };
+  const conflict = () =>
+    new AppError(
+      'already_exists',
+      `"${printable(name)}" appeared while it was downloaded; it was not replaced`,
+    );
+  const moved = () =>
+    new AppError(
+      'unsafe_name',
+      `The chosen folder changed while "${printable(name)}" was saved; it may have moved`,
+    );
+  /** Rename into place, then make sure it landed where it should; a rename can replace. */
+  const renameOver = async () => {
+    await rename(path, target);
+    if (!(await isOurs(target))) throw moved();
   };
   /** Empty what the handle has open and fail; the name, maybe someone else's now, is left. */
   const refuse = async (): Promise<never> => {
@@ -299,14 +342,25 @@ async function createIn(
       if (keepMode !== undefined) await handle.chmod(keepMode);
       await close();
       // A swap meanwhile: the file keeps its data, wherever the other process moved it.
-      if (!(await isOurs())) {
-        throw new AppError(
-          'unsafe_name',
-          `The chosen folder changed while "${printable(name)}" was saved; it may have moved`,
-        );
+      if (!(await isOurs())) throw moved();
+      // Replacing: no wait between the check and the rename.
+      if (existing) return renameOver();
+      try {
+        // No wait between the check and the link, which never replaces an entry.
+        await link(path, target);
+      } catch (err) {
+        const code = (err as { code?: unknown }).code;
+        // Something took the name meanwhile; `discard` removes the temporary file.
+        if (code === 'EEXIST') throw conflict();
+        if (!NO_HARD_LINKS.has(code)) throw err;
+        // No hard links here (FAT, exFAT, some network shares): check, then rename.
+        if (await lstat(target).catch(() => undefined)) throw conflict();
+        if (!(await isOurs())) throw moved();
+        return renameOver();
       }
-      // No wait between the check and the rename.
-      if (path !== target) await rename(path, target);
+      // Published only if the name is our file in the checked folder; the temporary name goes.
+      if (!(await isOurs(target))) throw moved();
+      await unlink(path).catch(() => undefined);
     },
     discard: async () => {
       // Emptied through the handle first: whatever happens to the name, nothing is left in it.
@@ -388,10 +442,15 @@ export async function planUpload(
     }
     plan.dirs.push(dirs);
     check();
-    let handle;
+    const handle = await opendir(dir).catch(() => undefined);
     try {
-      handle = await opendir(dir);
-    } catch {
+      check();
+    } catch (err) {
+      // Opened as the upload stopped: closed without a read.
+      await handle?.close().catch(() => undefined);
+      throw err;
+    }
+    if (!handle) {
       plan.skipped++;
       return;
     }

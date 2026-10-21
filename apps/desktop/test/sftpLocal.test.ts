@@ -14,7 +14,7 @@ import {
 } from 'node:fs/promises';
 import type * as fsPromises from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { LocalFileHooks } from '../src/main/ssh/localFiles.js';
 import {
@@ -26,17 +26,47 @@ import {
 } from '../src/main/ssh/localFiles.js';
 
 type HandleMethod = 'chmod' | 'close';
+type PathMethod = 'link' | 'rename' | 'unlink';
 
 /**
  * File handles from `open` run `next.during` inside their next `next.method` call, before the
- * call itself: another process acting while main waits on its own handle. Otherwise the real
- * module.
+ * call itself: another process acting while main waits on its own handle. `link`, `rename` and
+ * `unlink` do the same with `pathHooks.next`, standing for a swap inside the system call; its
+ * `during` may return the paths the call then uses, for a swap after the kernel looked up the
+ * first path and before the second. `pathHooks.linkFails` makes `link` fail with that code, as
+ * on a filesystem without hard links. Otherwise the real module.
  */
 const handleHooks = vi.hoisted(() => ({
   next: undefined as { method: HandleMethod; during: () => Promise<void> } | undefined,
 }));
+const pathHooks = vi.hoisted(() => ({
+  next: undefined as
+    { method: PathMethod; during: (paths: string[]) => Promise<string[] | void> } | undefined,
+  linkFails: undefined as string | undefined,
+  links: 0,
+}));
 vi.mock('node:fs/promises', async (importOriginal) => {
   const real = await importOriginal<typeof fsPromises>();
+  const inside =
+    (method: PathMethod, call: (...paths: string[]) => Promise<void>) =>
+    async (...args: unknown[]) => {
+      const paths = args.map(String);
+      const next = pathHooks.next;
+      if (next?.method !== method) return call(...paths);
+      pathHooks.next = undefined;
+      return call(...((await next.during(paths)) ?? paths));
+    };
+  const link = inside('link', async (from, to) => {
+    pathHooks.links++;
+    if (pathHooks.linkFails) {
+      throw Object.assign(new Error(`${pathHooks.linkFails}: link`), {
+        code: pathHooks.linkFails,
+      });
+    }
+    return real.link(from!, to!);
+  });
+  const rename = inside('rename', (from, to) => real.rename(from!, to!));
+  const unlink = inside('unlink', (path) => real.unlink(path!));
   const open = async (...args: Parameters<typeof real.open>) => {
     const handle = await real.open(...args);
     for (const method of ['chmod', 'close'] as const) {
@@ -56,13 +86,19 @@ vi.mock('node:fs/promises', async (importOriginal) => {
     }
     return handle;
   };
-  const fs = { ...real, open };
+  const fs = { ...real, open, link, rename, unlink };
   return { ...fs, default: fs };
 });
+
+/** The temporary name every download is written to. */
+const TEMP = /^\.ternix-[0-9a-f]{12}\.part$/;
 
 const cleanup: (() => void)[] = [];
 afterEach(() => {
   handleHooks.next = undefined;
+  pathHooks.next = undefined;
+  pathHooks.linkFails = undefined;
+  pathHooks.links = 0;
   for (const fn of cleanup.splice(0)) fn();
 });
 
@@ -303,8 +339,9 @@ describe('a folder swapped while a download writes into it', () => {
     }));
     await expect(dest.file(dir, 'x', false)).rejects.toMatchObject({ code: 'unsafe_name' });
     // The open went through the link; what it made is left empty, and nothing else changed.
-    expect(await readdir(outside)).toEqual(['x']);
-    expect((await stat(join(outside, 'x'))).size).toBe(0);
+    const made = await readdir(outside);
+    expect(made).toEqual([expect.stringMatching(TEMP)]);
+    expect((await stat(join(outside, made[0]!))).size).toBe(0);
   });
 
   posixOnly('a file swapped right after the open is refused', async () => {
@@ -313,14 +350,16 @@ describe('a folder swapped while a download writes into it', () => {
     await writeFile(join(outside, 'victim'), 'precious');
     const dest = await LocalDestination.open(root, 'linux', {
       afterOpen: async () => {
-        await unlink(join(root, 'x'));
-        await symlink(join(outside, 'victim'), join(root, 'x'));
+        const [temp] = await readdir(root);
+        await unlink(join(root, temp!));
+        await symlink(join(outside, 'victim'), join(root, temp!));
       },
     });
     await expect(dest.file(dest.root, 'x', false)).rejects.toMatchObject({
       code: 'unsafe_name',
     });
     expect(await readFile(join(outside, 'victim'), 'utf8')).toBe('precious');
+    expect(await readdir(root)).toEqual([expect.stringMatching(TEMP)]);
   });
 
   posixOnly('a parent swapped before the rename into place is refused', async () => {
@@ -346,7 +385,9 @@ describe('a folder swapped while a download writes into it', () => {
     await swap(root, outside)();
     await expect(file.finish()).rejects.toMatchObject({ code: 'unsafe_name' });
     expect(await readdir(outside)).toEqual([]);
-    expect((await stat(join(root, 'd-moved', 'x'))).size).toBe(0);
+    const [temp] = await readdir(join(root, 'd-moved'));
+    expect(temp).toMatch(TEMP);
+    expect((await stat(join(root, 'd-moved', temp!))).size).toBe(0);
   });
 
   posixOnly('a parent swapped before a failed download is cleaned up unlinks nothing', async () => {
@@ -358,7 +399,9 @@ describe('a folder swapped while a download writes into it', () => {
     await file.discard();
     expect(await readFile(join(outside, 'x'), 'utf8')).toBe('precious');
     // What was written is gone from the file that is ours, though its name stays.
-    expect((await stat(join(root, 'd-moved', 'x'))).size).toBe(0);
+    const [temp] = await readdir(join(root, 'd-moved'));
+    expect(temp).toMatch(TEMP);
+    expect((await stat(join(root, 'd-moved', temp!))).size).toBe(0);
   });
 
   posixOnly('the save dialog’s folder swapped before the open is refused too', async () => {
@@ -374,7 +417,9 @@ describe('a folder swapped while a download writes into it', () => {
     await expect(createLocalFile(join(root, 'd'), 'x', false, hooks)).rejects.toMatchObject({
       code: 'unsafe_name',
     });
-    expect((await stat(join(outside, 'x'))).size).toBe(0);
+    const made = await readdir(outside);
+    expect(made).toEqual([expect.stringMatching(TEMP)]);
+    expect((await stat(join(outside, made[0]!))).size).toBe(0);
   });
 });
 
@@ -430,7 +475,127 @@ describe('a folder swapped while a finished or failed download is put away', () 
     await file.discard();
     expect(await readFile(join(outside, 'x'), 'utf8')).toBe('precious');
     // What was written is gone from the file that is ours, though its name stays.
-    expect((await stat(join(root, 'd-moved', 'x'))).size).toBe(0);
+    const [temp] = await readdir(join(root, 'd-moved'));
+    expect(temp).toMatch(TEMP);
+    expect((await stat(join(root, 'd-moved', temp!))).size).toBe(0);
+  });
+});
+
+describe('a finished download is put in place without replacing what it should not', () => {
+  const posixOnly = it.skipIf(process.platform === 'win32');
+
+  /** `root/d` moved to `root/d-moved`, a link to `outside` in its place. */
+  const swap = async (root: string, outside: string) => {
+    await rename(join(root, 'd'), join(root, 'd-moved'));
+    await symlink(outside, join(root, 'd'));
+  };
+
+  /**
+   * The swap between a `link` or `rename`'s two lookups: the first path was found in the real
+   * folder (now `d-moved`), the second is looked up through the link.
+   */
+  const swapBetweenLookups =
+    (root: string, outside: string) =>
+    async ([from, to]: string[]): Promise<string[]> => {
+      await swap(root, outside);
+      return [join(dirname(dirname(from!)), 'd-moved', basename(from!)), to!];
+    };
+
+  async function downloading(name: string, replace: boolean, data = 'downloaded') {
+    const root = tempDir();
+    const outside = tempDir();
+    await mkdir(join(root, 'd'));
+    if (replace) await writeFile(join(root, 'd', name), 'old');
+    const dest = await LocalDestination.open(root, 'linux');
+    const file = await dest.file(join(dest.root, 'd'), name, replace);
+    await file.sink.write(Buffer.from(data), 0);
+    return { root, outside, file };
+  }
+
+  posixOnly('a swap inside a new file’s link replaces nothing outside', async () => {
+    const { root, outside, file } = await downloading('x', false);
+    await writeFile(join(outside, 'x'), 'precious');
+    pathHooks.next = { method: 'link', during: swapBetweenLookups(root, outside) };
+    await expect(file.finish()).rejects.toMatchObject({ code: 'already_exists' });
+    // What the transfer queue does after a failed finish.
+    await file.discard();
+    expect(await readdir(outside)).toEqual(['x']);
+    expect(await readFile(join(outside, 'x'), 'utf8')).toBe('precious');
+  });
+
+  posixOnly('that swap, with the name free outside, only adds a copy and is reported', async () => {
+    const { root, outside, file } = await downloading('x', false);
+    pathHooks.next = { method: 'link', during: swapBetweenLookups(root, outside) };
+    await expect(file.finish()).rejects.toMatchObject({ code: 'unsafe_name' });
+    await file.discard();
+    // The documented residual: a second name for the download's own data.
+    expect(await readdir(outside)).toEqual(['x']);
+    expect(await readFile(join(outside, 'x'), 'utf8')).toBe('downloaded');
+  });
+
+  posixOnly('a swap before a failed download is removed removes nothing outside', async () => {
+    const { root, outside, file } = await downloading('x', false, 'half');
+    await writeFile(join(outside, 'x'), 'precious');
+    pathHooks.next = { method: 'unlink', during: () => swap(root, outside) };
+    await file.discard();
+    expect(await readFile(join(outside, 'x'), 'utf8')).toBe('precious');
+  });
+
+  posixOnly('a swap inside a replacing rename is the documented residual, reported', async () => {
+    const { root, outside, file } = await downloading('x', true);
+    await writeFile(join(outside, 'x'), 'precious');
+    pathHooks.next = { method: 'rename', during: swapBetweenLookups(root, outside) };
+    await expect(file.finish()).rejects.toMatchObject({ code: 'unsafe_name' });
+    await file.discard();
+    // What the README says this window allows: the same name outside is replaced.
+    expect(await readFile(join(outside, 'x'), 'utf8')).toBe('downloaded');
+    expect(await readFile(join(root, 'd-moved', 'x'), 'utf8')).toBe('old');
+  });
+
+  it('a name taken while a new file downloads fails as a conflict and is left alone', async () => {
+    const dir = tempDir();
+    const file = await createLocalFile(dir, 'x', false);
+    await file.sink.write(Buffer.from('downloaded'), 0);
+    // Another program saves under the same name meanwhile; `wx` fails if the name were held.
+    await writeFile(join(dir, 'x'), 'theirs', { flag: 'wx' });
+    await expect(file.finish()).rejects.toMatchObject({ code: 'already_exists' });
+    await file.discard();
+    expect(await readdir(dir)).toEqual(['x']);
+    expect(await readFile(join(dir, 'x'), 'utf8')).toBe('theirs');
+  });
+
+  it('without hard links a new file is renamed into place', async () => {
+    pathHooks.linkFails = 'EPERM';
+    const dir = tempDir();
+    const file = await createLocalFile(dir, 'x', false);
+    await file.sink.write(Buffer.from('downloaded'), 0);
+    await file.finish();
+    expect(pathHooks.links).toBe(1);
+    expect(await readdir(dir)).toEqual(['x']);
+    expect(await readFile(join(dir, 'x'), 'utf8')).toBe('downloaded');
+  });
+
+  it('without hard links a name taken meanwhile is still a conflict, never replaced', async () => {
+    pathHooks.linkFails = 'EPERM';
+    const dir = tempDir();
+    const file = await createLocalFile(dir, 'x', false);
+    await file.sink.write(Buffer.from('downloaded'), 0);
+    await writeFile(join(dir, 'x'), 'theirs', { flag: 'wx' });
+    await expect(file.finish()).rejects.toMatchObject({ code: 'already_exists' });
+    await file.discard();
+    expect(pathHooks.links).toBe(1);
+    expect(await readdir(dir)).toEqual(['x']);
+    expect(await readFile(join(dir, 'x'), 'utf8')).toBe('theirs');
+  });
+
+  it('a link failure that is not about hard links fails the download as it is', async () => {
+    pathHooks.linkFails = 'EACCES';
+    const dir = tempDir();
+    const file = await createLocalFile(dir, 'x', false);
+    await file.sink.write(Buffer.from('downloaded'), 0);
+    await expect(file.finish()).rejects.toMatchObject({ code: 'EACCES' });
+    await file.discard();
+    expect(await readdir(dir)).toEqual([]);
   });
 });
 

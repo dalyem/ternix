@@ -107,10 +107,13 @@ typecheck test` covers everything that does not need the Electron binary).
   no reserved device names, `<>:"|?*`, control characters or trailing dots and spaces) or the
   file is skipped and listed with the reason; every folder written to must resolve to itself
   inside the destination (a symlink in the way is refused, never followed, and the folder and the
-  file are checked again after the open, before the rename into place and before a failed
-  download is removed); new files are created with `O_EXCL`, and a replaced file is written to a
-  temporary file, private (0600) while it is written, that takes the old file's permission bits
-  and is renamed over it once complete, so replacing never widens access. A folder download is
+  file are checked again after the open, before the file is put in place and before a failed
+  download is removed); every download is written to a new temporary file (`O_EXCL`), so a failed
+  one leaves nothing under its name. A new file takes its name through a hard link, which never
+  replaces anything (a name taken meanwhile fails the download as a conflict; a filesystem
+  without hard links falls back to a check and a rename). A replacing download's temporary file
+  is private (0600) while it is written, takes the old file's permission bits and is renamed over
+  it once complete, so replacing never widens access. A folder download is
   walked first, shown as a "Preparing…" transfer that can be cancelled; every entry it visits
   counts against a budget of 100 000, and so does every entry a listing receives (`.` and `..`
   too), so a server cannot make a listing or a walk endless. Preparation (a dialog still open, a
@@ -247,7 +250,7 @@ The renderer is untrusted: anything it can do, an XSS in it could do. So:
 | Local and dynamic forwards listen only on an IP address or `localhost`, never a name to look up                                | `startForward` in `ssh/manager.ts`; the forward editor checks too                           |
 | SFTP takes no local path from the page: uploads from main's open dialog or a drop, downloads into main's save or folder dialog | `ssh/sftp.ts`, `ssh/localFiles.ts`, `uploadDropped` in `src/preload/index.ts`               |
 | Downloaded names are checked (one component, no reserved names), no local symlink is followed, nothing is silently replaced    | `unsafeLocalName`, `LocalDestination` in `ssh/localFiles.ts`                                |
-| Downloaded files are checked again in place (folder resolves to itself, same inode as the open file); replacing keeps modes    | `createIn` in `ssh/localFiles.ts`                                                           |
+| Downloaded files are checked again in place (same inode as the open file); new files are linked in; replacing keeps modes      | `createIn` in `ssh/localFiles.ts`                                                           |
 | SFTP deletes and replacing existing files are confirmed in main's native dialog                                                | `ssh/sftp.ts`                                                                               |
 | Locking unmounts everything but the terminals and clears decrypted state                                                       | `src/renderer/src/screens/Shell.tsx`, `store.ts` (`clearData`)                              |
 | Session on disk only through `safeStorage`; refuses when unavailable                                                           | `src/main/app/secretStore.ts`; login and register check it first                            |
@@ -294,32 +297,48 @@ compromised renderer can still:
 - show misleading information next to a native dialog; the dialog's own text comes from main.
 
 Downloads also have a local race that main can narrow but not close. Node has no `openat`,
-`unlinkat` or `renameat`, so every path operation resolves the chosen folder again, and a check
-by path can never be atomic with the operation after it. A local process that can write to the
-chosen folder (or a folder below it) while a transfer runs, and that swaps a folder for a symlink
-to some folder O the user can write to in the instant between a check and the next system call,
-can still:
+`linkat`, `renameat` or `unlinkat`, so every path operation resolves the chosen folder again, a
+check by path can never be atomic with the operation after it, and a `link` or `rename` looks up
+its two paths one after the other. Everything below needs a local process that can write to the
+chosen folder (or a folder below it) while a transfer runs, and that swaps that folder for a
+symlink to some folder O the user can write to at the right instant. Such a process can still:
 
-- make one empty file (named as the download, or a `.ternix-<random>.part` temporary name) or
-  one empty folder appear in O, between the check and the open or `mkdir`. Main notices right
-  after, stops the download and leaves that entry where it is;
-- delete a file in O that has the same name as a new download, between the last check and the
-  `unlink` that removes the download after it failed or was cancelled. A download that replaces
-  a file only ever removes its own random temporary name;
-- rename `O/.ternix-<random>.part` over the file of the download's name in O, between the last
-  check and the rename into place. That needs a file with that random name to be in O already,
-  which only someone who can write to O could arrange.
+- replace a file in O, when the user chose to replace an existing file. The download is written
+  to a temporary file and renamed over the old one; a swap between the rename's two lookups
+  makes it replace (or create) the file of the download's name in O instead, and the file that
+  was there is lost. Nothing has to be prepared in O. Main checks the name after the rename and
+  reports the download as failed, but cannot undo it;
+- the same for a new download on a filesystem without hard links (FAT, exFAT, some network
+  shares), where main falls back to checking that the name is free and then renaming. There a
+  file that someone puts under the download's name in the chosen folder between that check and
+  the rename is replaced too;
+- put a copy of a new download in O. Elsewhere a new download is published with a hard link,
+  which never replaces or removes an entry: a swap between the link's two lookups makes a second
+  name for the downloaded file in O (only when O has no entry of that name; otherwise nothing
+  happens and the download fails as a conflict). Main checks the name after the link, reports
+  the download as failed and leaves the copy;
+- make one empty `.ternix-<random>.part` file (the temporary file every download is written to)
+  or one empty folder (named as the remote folder) appear in O, between the check and the open
+  or `mkdir`. Main notices right after, stops the download and leaves that entry where it is;
+- leave the complete download under its temporary name wherever it moved the folder, when the
+  swap comes while main closes the file before its last check.
 
-Each of these windows is one gap between system calls: main sets the mode (through the handle)
-and closes the file before its last check, then runs the rename or `unlink` with nothing awaited
-in between. That last check, also run right after the open, requires the folder to still
-resolve to itself inside the destination and the name to still be the file main opened (same
-device and inode, not a link). When it fails, the download stops and the name is left alone.
-What was written is emptied through the handle if the file is still open; a swap during the
-final close leaves the complete file wherever the other process moved the folder. Preparing a
-download or upload (walking folders, making local folders) stops after each wait once its tab
-closes, so no `mkdir` starts after that. All of this needs a local attacker with write access to
-the chosen folder during the transfer.
+Downloads never remove a file under the download's name: a failed or cancelled download, and a
+published one, only ever unlink their own random temporary name, so a swap before that `unlink`
+can only remove a file of that random name in O, which only someone who can write to O could
+have made. Each window is one gap between system calls: main sets the mode (through the handle)
+and closes the file before its last check, then runs the link, rename or unlink with nothing
+awaited in between. That last check, also run right after the open, requires the folder to still
+resolve to itself inside the destination and the temporary name to still be the file main
+opened (same device and inode, not a link); when it fails, the download stops and the name is
+left alone, and what was written is emptied through the handle if the file is still open. A name
+that appears in the chosen folder while a new download runs is never replaced (outside the
+no-hard-link fallback): the download fails as a conflict.
+
+Preparing a download or upload (walking folders, making local folders) checks whether its tab is
+still open after every wait, whether the call succeeded or failed, and before the next system
+call, and a folder it opened as the tab closed is closed without being read. A call already
+running when the tab closes still completes: a folder being made then stays, empty.
 
 The review recommended moving secret editing out of the renderer entirely (a separate,
 minimal window or native forms owned by main). That is out of scope for v1.
