@@ -11,6 +11,7 @@ import type { ItemSnapshot } from '../src/main/ssh/items.js';
 import { SshManager } from '../src/main/ssh/manager.js';
 import { SftpManager, type SftpManagerDeps } from '../src/main/ssh/sftp.js';
 import { TestSshServer } from '../../../packages/ssh/test/helpers.js';
+import type { SftpServerOptions } from '../../../packages/ssh/test/sftpServer.js';
 
 const HOST_ID = '3f1c9a52-8e6b-4d0a-9b7e-0a1b2c3d4e5f';
 const PERSONAL = '9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d';
@@ -53,6 +54,10 @@ interface Options {
   readDelayMs?: number;
   /** Answers for main's message boxes, in order; each gets the request. */
   answers?: ((request: MessageBoxRequest) => { response: number; checkboxChecked?: boolean })[];
+  /** More options for the fake SFTP server. */
+  server?: Partial<SftpServerOptions>;
+  /** Overrides for the manager's dependencies. */
+  deps?: Partial<SftpManagerDeps>;
 }
 
 async function setup(options: Options = {}) {
@@ -64,6 +69,7 @@ async function setup(options: Options = {}) {
       root: remote,
       home: '/',
       delay: (operation) => (operation === 'read' ? (options.readDelayMs ?? 0) : 0),
+      ...options.server,
     },
   });
   cleanup.push(() => server.stop());
@@ -107,6 +113,7 @@ async function setup(options: Options = {}) {
     pickDownloadFile: pick.file,
     pickDownloadFolder: pick.folder,
     progressIntervalMs: 20,
+    ...options.deps,
   });
   return { server, remote, local, ssh, sftp, events, asked, pick, state, confirmNewHosts };
 }
@@ -379,5 +386,215 @@ describe('SFTP transfers', () => {
     await s.ssh.closeAll();
     expect(s.sftp.list()).toEqual([]);
     await vi.waitFor(() => expect(s.server.clients.size).toBe(0));
+  });
+});
+
+describe('SFTP review regressions', () => {
+  /** A promise and its resolver, for a dialog that answers when the test says so. */
+  function deferred<T>() {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>((r) => (resolve = r));
+    return { promise, resolve };
+  }
+
+  const transferEvents = (s: Setup, from: number) =>
+    s.events.slice(from).filter((e) => e.name === 'sftp.transfer');
+
+  it('a download whose folder dialog is open when the tab closes touches nothing', async () => {
+    const s = await setup();
+    const { id } = await connected(s);
+    await mkdir(join(s.remote, 'tree', 'sub'), { recursive: true });
+    await writeFile(join(s.remote, 'tree', 'sub', 'f'), 'x');
+    const dialog = deferred<string | null>();
+    s.pick.folder.mockImplementationOnce(() => dialog.promise);
+    const pending = s.sftp.download(id, ['/tree']);
+    await vi.waitFor(() => expect(s.pick.folder).toHaveBeenCalled());
+    await s.sftp.close(id);
+    const mark = s.events.length;
+    dialog.resolve(s.local);
+    await expect(pending).rejects.toMatchObject({ code: 'cancelled' });
+    expect(await readdir(s.local)).toEqual([]);
+    expect(s.sftp.transfers()).toEqual([]);
+    expect(transferEvents(s, mark)).toEqual([]);
+  });
+
+  it('a save dialog answered after the tab closed queues nothing', async () => {
+    const s = await setup();
+    const { id } = await connected(s);
+    await writeFile(join(s.remote, 'one.txt'), 'x');
+    const dialog = deferred<string | null>();
+    s.pick.file.mockImplementationOnce(() => dialog.promise);
+    const pending = s.sftp.download(id, ['/one.txt']);
+    await vi.waitFor(() => expect(s.pick.file).toHaveBeenCalled());
+    await s.sftp.close(id);
+    const mark = s.events.length;
+    dialog.resolve(join(s.local, 'one.txt'));
+    await expect(pending).rejects.toMatchObject({ code: 'cancelled' });
+    expect(s.sftp.transfers()).toEqual([]);
+    expect(transferEvents(s, mark)).toEqual([]);
+    expect(await readdir(s.local)).toEqual([]);
+  });
+
+  it('a recursive download stops creating folders once its tab closes mid-walk', async () => {
+    const hooks: { onOpendir?: (path: string) => void } = {};
+    const s = await setup({
+      server: {
+        delay: (op, path) => (op === 'opendir' && path.startsWith('/tree/') ? 200 : 0),
+        onRequest: (op, path) => {
+          if (op === 'opendir') hooks.onOpendir?.(path);
+        },
+      },
+    });
+    const { id } = await connected(s);
+    for (const dir of ['a', 'b', 'c']) {
+      await mkdir(join(s.remote, 'tree', dir), { recursive: true });
+      await writeFile(join(s.remote, 'tree', dir, 'f'), dir);
+    }
+    let mark = -1;
+    hooks.onOpendir = (path) => {
+      if (!path.startsWith('/tree/') || mark !== -1) return;
+      mark = s.events.length;
+      void s.sftp.close(id);
+    };
+    await expect(s.sftp.download(id, ['/tree'])).rejects.toMatchObject({ code: 'cancelled' });
+    // The first subfolder was made before its listing; nothing after the tab closed.
+    const made = await readdir(join(s.local, 'tree'));
+    expect(made).toHaveLength(1);
+    expect(await readdir(join(s.local, 'tree', made[0]!))).toEqual([]);
+    expect(s.sftp.transfers()).toEqual([]);
+    expect(transferEvents(s, mark)).toEqual([]);
+  });
+
+  it('a download prepared across a page or account change is dropped', async () => {
+    const generation = { value: 1 };
+    const s = await setup({ deps: { generation: () => generation.value } });
+    const { id } = await connected(s);
+    await mkdir(join(s.remote, 'tree'));
+    await writeFile(join(s.remote, 'tree', 'f'), 'x');
+    const dialog = deferred<string | null>();
+    s.pick.folder.mockImplementationOnce(() => dialog.promise);
+    const pending = s.sftp.download(id, ['/tree']);
+    await vi.waitFor(() => expect(s.pick.folder).toHaveBeenCalled());
+    generation.value++;
+    const mark = s.events.length;
+    dialog.resolve(s.local);
+    await expect(pending).rejects.toMatchObject({ code: 'cancelled' });
+    expect(await readdir(s.local)).toEqual([]);
+    expect(transferEvents(s, mark)).toEqual([]);
+  });
+
+  it('cancelling right after the last byte, before CLOSE is answered, keeps nothing', async () => {
+    const hooks: { onClose?: () => void } = {};
+    const s = await setup({
+      server: {
+        delay: (op) => (op === 'close' ? 300 : 0),
+        onRequest: (op) => {
+          if (op === 'close') hooks.onClose?.();
+        },
+      },
+    });
+    const { id } = await connected(s);
+    await writeFile(join(s.remote, 'f.bin'), randomBytes(200 * 1024));
+    s.pick.file.mockResolvedValueOnce(join(s.local, 'f.bin'));
+    hooks.onClose = () => {
+      const t = s.sftp.transfers()[0];
+      if (t) s.sftp.cancel(t.id);
+    };
+    await s.sftp.download(id, ['/f.bin']);
+    const [t] = await settled(s, 1);
+    expect(t).toMatchObject({ state: 'cancelled', transferred: 200 * 1024 });
+    expect(await readdir(s.local)).toEqual([]);
+  });
+
+  it('cancelling a replacing download after the last byte keeps the old file', async () => {
+    const hooks: { onClose?: () => void } = {};
+    const s = await setup({
+      answers: [() => ({ response: 1 })],
+      server: {
+        delay: (op) => (op === 'close' ? 300 : 0),
+        onRequest: (op) => {
+          if (op === 'close') hooks.onClose?.();
+        },
+      },
+    });
+    const { id } = await connected(s);
+    await writeFile(join(s.remote, 'a.txt'), 'remote');
+    await writeFile(join(s.remote, 'b.txt'), 'remote b');
+    await writeFile(join(s.local, 'a.txt'), 'mine');
+    hooks.onClose = () => {
+      for (const t of s.sftp.transfers()) if (t.name === 'a.txt') s.sftp.cancel(t.id);
+    };
+    await s.sftp.download(id, ['/a.txt', '/b.txt']);
+    const all = await settled(s, 2);
+    expect(all.find((t) => t.name === 'a.txt')?.state).toBe('cancelled');
+    expect(await readFile(join(s.local, 'a.txt'), 'utf8')).toBe('mine');
+    expect((await readdir(s.local)).sort()).toEqual(['a.txt', 'b.txt']);
+  });
+
+  it('empty folders count against the download budget', async () => {
+    const s = await setup({ deps: { maxDownloadEntries: 20 } });
+    const { id } = await connected(s);
+    for (let i = 0; i < 30; i++) await mkdir(join(s.remote, 'tree', `d${i}`), { recursive: true });
+    await expect(s.sftp.download(id, ['/tree'])).rejects.toMatchObject({ code: 'invalid_input' });
+    const made = await readdir(join(s.local, 'tree')).catch(() => []);
+    expect(made.length).toBeLessThan(20);
+    const [row] = s.sftp.transfers();
+    expect(row).toMatchObject({ state: 'failed', direction: 'download' });
+    expect(row?.error).toMatch(/too many/i);
+  });
+
+  it('a listing that never ends counts against the download budget', async () => {
+    const s = await setup({
+      deps: { maxDownloadEntries: 10 },
+      server: { readdirForever: (path) => (path === '/tree' ? ['.', '..'] : undefined) },
+    });
+    const { id } = await connected(s);
+    await mkdir(join(s.remote, 'tree'));
+    await expect(s.sftp.download(id, ['/tree'])).rejects.toMatchObject({
+      code: 'invalid_input',
+    });
+  });
+
+  it('a download being prepared shows a row that can cancel it', async () => {
+    let listingSub = false;
+    const s = await setup({
+      server: {
+        delay: (op, path) => (op === 'opendir' && path === '/tree/sub' ? 1000 : 0),
+        onRequest: (op, path) => {
+          if (op === 'opendir' && path === '/tree/sub') listingSub = true;
+        },
+      },
+    });
+    const { id } = await connected(s);
+    await mkdir(join(s.remote, 'tree', 'sub'), { recursive: true });
+    await writeFile(join(s.remote, 'tree', 'f'), 'x');
+    await writeFile(join(s.remote, 'tree', 'sub', 'g'), 'y');
+    const pending = s.sftp.download(id, ['/tree']);
+    await vi.waitFor(() => expect(s.sftp.transfers()[0]?.state).toBe('preparing'));
+    await vi.waitFor(() => expect(listingSub).toBe(true));
+    const row = s.sftp.transfers()[0]!;
+    expect(row).toMatchObject({ direction: 'download', name: 'tree', remotePath: '/tree' });
+    s.sftp.cancel(row.id);
+    await expect(pending).rejects.toMatchObject({ code: 'cancelled' });
+    expect(s.sftp.transfers()).toEqual([{ ...row, state: 'cancelled' }]);
+    // The walk stopped: the file it found first was not queued.
+    await new Promise((r) => setTimeout(r, 1200));
+    expect(s.sftp.transfers()).toHaveLength(1);
+    expect(await readdir(join(s.local, 'tree'))).toEqual(['sub']);
+  });
+
+  it('a finished preparation leaves only the file rows', async () => {
+    const s = await setup();
+    const { id } = await connected(s);
+    await mkdir(join(s.remote, 'tree'));
+    await writeFile(join(s.remote, 'tree', 'f'), 'x');
+    expect(await s.sftp.download(id, ['/tree'])).toEqual({ queued: 1, skipped: 0 });
+    const all = await settled(s, 1);
+    expect(all.map((t) => [t.name, t.state])).toEqual([['f', 'done']]);
+    expect(
+      s.events.some(
+        (e) => e.name === 'sftp.transfer' && (e.payload as TransferDto).state === 'preparing',
+      ),
+    ).toBe(true);
   });
 });

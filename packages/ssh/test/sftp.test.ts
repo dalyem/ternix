@@ -451,3 +451,126 @@ describe('SFTP channel lifecycle', () => {
     expect((await rejection(session.openSftp())).code).toBe('invalid_state');
   });
 });
+
+describe('SFTP review regressions', () => {
+  it('a tab closed while an upload waits on a local read leaves no unhandled rejection', async () => {
+    const { session, sftp } = await setup();
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => void unhandled.push(reason);
+    process.on('unhandledRejection', onUnhandled);
+    cleanup.push(() => void process.off('unhandledRejection', onUnhandled));
+    const data = randomBytes(MB);
+    const gates: (() => void)[] = [];
+    const source: LocalSource = {
+      size: data.length,
+      async read(buffer, position) {
+        await new Promise<void>((resolve) => gates.push(resolve));
+        if (position >= data.length) return 0;
+        return data.copy(buffer, 0, position, Math.min(data.length, position + buffer.length));
+      },
+    };
+    const upload = sftp.upload(source, '/x.bin', { overwrite: false });
+    await waitFor(() => gates.length === 16, 'every request slot to wait on a local read');
+    await session.close();
+    await waitFor(() => sftp.closed, 'the SFTP channel to close');
+    // One read returns and fails on the closed channel, which stops the transfer; then the rest.
+    gates.shift()!();
+    await new Promise((r) => setTimeout(r, 50));
+    for (const open of gates.splice(0)) open();
+    expect((await rejection(upload)).code).toBe('closed');
+    await new Promise((r) => setTimeout(r, 50));
+    expect(unhandled).toEqual([]);
+  });
+
+  it('uploads intact from a source that returns short reads before the end', async () => {
+    const { sftp, root } = await setup();
+    const data = randomBytes(MB + 123);
+    const source: LocalSource = {
+      size: data.length,
+      async read(buffer, position) {
+        if (position >= data.length) return 0;
+        const end = Math.min(data.length, position + buffer.length, position + 1000);
+        return data.copy(buffer, 0, position, end);
+      },
+    };
+    expect(await sftp.upload(source, '/short.bin', { overwrite: false })).toEqual({
+      bytes: data.length,
+    });
+    expect((await readFile(join(root, 'short.bin'))).equals(data)).toBe(true);
+  });
+
+  it('an upload whose CLOSE fails is reported as failed, not done', async () => {
+    const { sftp, root } = await setup({ deny: (op) => op === 'close' });
+    const failure = await rejection(
+      sftp.upload(bufferSource(Buffer.from('data')), '/c.txt', { overwrite: false }),
+    );
+    expect(failure.code).toBe('permission_denied');
+    await expect(lstat(join(root, 'c.txt'))).rejects.toThrow();
+  });
+
+  it('an upload whose CLOSE goes unanswered fails with timeout', async () => {
+    const { sftp } = await setup({ hang: (op) => op === 'close' }, { requestTimeoutMs: 300 });
+    const failure = await rejection(
+      withTimeout(
+        sftp.upload(bufferSource(Buffer.from('data')), '/c.txt', { overwrite: false }),
+        'the upload to fail',
+      ),
+    );
+    expect(failure.code).toBe('timeout');
+  });
+
+  it('a download cancelled while its CLOSE is pending is cancelled', async () => {
+    const abort = new AbortController();
+    const { sftp, root } = await setup({
+      delay: (op) => (op === 'close' ? 200 : 0),
+      onRequest: (op) => {
+        if (op === 'close') abort.abort();
+      },
+    });
+    await writeFile(join(root, 'f.bin'), randomBytes(100 * 1024));
+    const sink = memorySink();
+    const failure = await rejection(sftp.download('/f.bin', sink, { signal: abort.signal }));
+    expect(failure.code).toBe('cancelled');
+    // Every byte arrived: the cancellation came after the last one.
+    expect(sink.bytes().length).toBe(100 * 1024);
+  });
+
+  it('a listing that never ends counts every answer against its budget', async () => {
+    // Each answer is a round trip; a small budget keeps the test quick.
+    const { sftp, root } = await setup(
+      { readdirForever: (path) => (path === '/dots' ? ['.', '..', '.'] : undefined) },
+      { maxEntries: 10 },
+    );
+    await mkdir(join(root, 'dots'));
+    const failure = await rejection(withTimeout(sftp.list('/dots'), 'the listing to give up'));
+    expect(failure.code).toBe('too_many_entries');
+    expect(failure.message).toMatch(/more than 10 entries/);
+  });
+
+  it('a listing of endless empty batches gives up too', async () => {
+    const { sftp, root } = await setup(
+      { readdirForever: (path) => (path === '/empty' ? [] : undefined) },
+      { maxEntries: 10 },
+    );
+    await mkdir(join(root, 'empty'));
+    const failure = await rejection(withTimeout(sftp.list('/empty'), 'the listing to give up'));
+    expect(failure.code).toBe('too_many_entries');
+  });
+
+  it('a listing stops when its signal aborts', async () => {
+    const abort = new AbortController();
+    let batches = 0;
+    const { sftp, root } = await setup({
+      readdirForever: (path) => (path === '/dots' ? ['.'] : undefined),
+      onRequest: (op) => {
+        if (op === 'readdir' && ++batches === 5) abort.abort();
+      },
+    });
+    await mkdir(join(root, 'dots'));
+    const failure = await rejection(
+      withTimeout(sftp.list('/dots', { signal: abort.signal }), 'the listing to stop'),
+    );
+    expect(failure.code).toBe('cancelled');
+    expect(sftp.closed).toBe(false);
+  });
+});

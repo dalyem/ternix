@@ -37,7 +37,8 @@ export type SftpOperation =
   | 'rmdir'
   | 'remove'
   | 'rename'
-  | 'realpath';
+  | 'realpath'
+  | 'close';
 
 export interface SftpServerOptions {
   /** The real directory remote `/` maps to. */
@@ -54,6 +55,11 @@ export interface SftpServerOptions {
   onRequest?: (operation: SftpOperation, path: string) => void;
   /** Entries per READDIR answer. Default 3, so listings take several round trips. */
   readdirBatch?: number;
+  /**
+   * A hostile server: answer every READDIR of this remote path with these names (never EOF),
+   * instead of the directory's own entries. Undefined serves the directory as usual.
+   */
+  readdirForever?: (path: string) => string[] | undefined;
 }
 
 /** What the server records, for assertions. */
@@ -183,6 +189,15 @@ export function serveSftp(sftp: SFTPWrapper, options: SftpServerOptions): SftpSe
     const h = handleOf(handle);
     serve(reqid, 'readdir', h?.path ?? '', async () => {
       if (h?.kind !== 'dir') throw Object.assign(new Error('bad handle'), { code: 'EBADF' });
+      const forever = options.readdirForever?.(h.path);
+      if (forever) {
+        const attrs = attrsOf(await stat(toLocal(h.path)));
+        sftp.name(
+          reqid,
+          forever.map((name) => ({ filename: name, longname: name, attrs })),
+        );
+        return;
+      }
       if (!h.names) {
         const names = ['.', '..'];
         const dir = await opendir(toLocal(h.path));
@@ -247,11 +262,11 @@ export function serveSftp(sftp: SFTPWrapper, options: SftpServerOptions): SftpSe
   sftp.on('CLOSE', (reqid, handle) => {
     const key = handle.length === 4 ? handle.readUInt32BE() : -1;
     const h = handles.get(key);
-    handles.delete(key);
-    void (async () => {
+    serve(reqid, 'close', h?.path ?? '', async () => {
+      handles.delete(key);
       if (h?.kind === 'file') await h.file.close().catch(() => undefined);
       sftp.status(reqid, h ? STATUS_CODE.OK : STATUS_CODE.FAILURE);
-    })();
+    });
   });
 
   sftp.on('MKDIR', (reqid, path) =>

@@ -1,8 +1,21 @@
 import { mkdtempSync, rmSync } from 'node:fs';
-import { lstat, mkdir, readFile, readdir, readlink, symlink, writeFile } from 'node:fs/promises';
+import {
+  chmod,
+  lstat,
+  mkdir,
+  readFile,
+  readdir,
+  readlink,
+  rename,
+  stat,
+  symlink,
+  unlink,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import type { LocalFileHooks } from '../src/main/ssh/localFiles.js';
 import {
   createLocalFile,
   isInside,
@@ -225,5 +238,143 @@ describe('planUpload', () => {
     expect(plan.dirs).toEqual([['link']]);
     expect(plan.files.map((f) => f.name)).toEqual(['f']);
     expect(plan.skipped).toBe(1);
+  });
+});
+
+describe('a folder swapped while a download writes into it', () => {
+  // The race needs a second local process. Swaps before finish and discard are made by the test
+  // itself; the gap inside opening a file is reached through the hooks.
+  const posixOnly = it.skipIf(process.platform === 'win32');
+
+  /** `root/d` replaced by a link to `outside`; the real folder moves to `root/d-moved`. */
+  const swap = (root: string, outside: string) => async () => {
+    await rename(join(root, 'd'), join(root, 'd-moved'));
+    await symlink(outside, join(root, 'd'));
+  };
+
+  async function setupSwap(hooks: (root: string, outside: string) => LocalFileHooks) {
+    const root = tempDir();
+    const outside = tempDir();
+    await mkdir(join(root, 'd'));
+    const dest = await LocalDestination.open(root, 'linux', hooks(root, outside));
+    return { root, outside, dest, dir: join(dest.root, 'd') };
+  }
+
+  posixOnly('a parent swapped for a link just before the open is refused', async () => {
+    const { outside, dest, dir } = await setupSwap((root, outside) => ({
+      beforeOpen: swap(root, outside),
+    }));
+    await expect(dest.file(dir, 'x', false)).rejects.toMatchObject({ code: 'unsafe_name' });
+    // The open went through the link; what it made is left empty, and nothing else changed.
+    expect(await readdir(outside)).toEqual(['x']);
+    expect((await stat(join(outside, 'x'))).size).toBe(0);
+  });
+
+  posixOnly('a file swapped right after the open is refused', async () => {
+    const root = tempDir();
+    const outside = tempDir();
+    await writeFile(join(outside, 'victim'), 'precious');
+    const dest = await LocalDestination.open(root, 'linux', {
+      afterOpen: async () => {
+        await unlink(join(root, 'x'));
+        await symlink(join(outside, 'victim'), join(root, 'x'));
+      },
+    });
+    await expect(dest.file(dest.root, 'x', false)).rejects.toMatchObject({
+      code: 'unsafe_name',
+    });
+    expect(await readFile(join(outside, 'victim'), 'utf8')).toBe('precious');
+  });
+
+  posixOnly('a parent swapped before the rename into place is refused', async () => {
+    const { root, outside, dest, dir } = await setupSwap(() => ({}));
+    await writeFile(join(dir, 'x'), 'old');
+    await writeFile(join(outside, 'x'), 'precious');
+    const file = await dest.file(dir, 'x', true);
+    await file.sink.write(Buffer.from('downloaded'), 0);
+    await swap(root, outside)();
+    await expect(file.finish()).rejects.toMatchObject({ code: 'unsafe_name' });
+    expect(await readdir(outside)).toEqual(['x']);
+    expect(await readFile(join(outside, 'x'), 'utf8')).toBe('precious');
+    expect(await readFile(join(root, 'd-moved', 'x'), 'utf8')).toBe('old');
+    // The temporary file is ours (same inode as the handle): emptied, never renamed.
+    const temps = (await readdir(join(root, 'd-moved'))).filter((n) => n !== 'x');
+    for (const t of temps) expect((await stat(join(root, 'd-moved', t))).size).toBe(0);
+  });
+
+  posixOnly('a parent swapped before a new file is finished is refused', async () => {
+    const { root, outside, dest, dir } = await setupSwap(() => ({}));
+    const file = await dest.file(dir, 'x', false);
+    await file.sink.write(Buffer.from('downloaded'), 0);
+    await swap(root, outside)();
+    await expect(file.finish()).rejects.toMatchObject({ code: 'unsafe_name' });
+    expect(await readdir(outside)).toEqual([]);
+    expect((await stat(join(root, 'd-moved', 'x'))).size).toBe(0);
+  });
+
+  posixOnly('a parent swapped before a failed download is cleaned up unlinks nothing', async () => {
+    const { root, outside, dest, dir } = await setupSwap(() => ({}));
+    await writeFile(join(outside, 'x'), 'precious');
+    const file = await dest.file(dir, 'x', false);
+    await file.sink.write(Buffer.from('half'), 0);
+    await swap(root, outside)();
+    await file.discard();
+    expect(await readFile(join(outside, 'x'), 'utf8')).toBe('precious');
+    // What was written is gone from the file that is ours, though its name stays.
+    expect((await stat(join(root, 'd-moved', 'x'))).size).toBe(0);
+  });
+
+  posixOnly('the save dialog’s folder swapped before the open is refused too', async () => {
+    const root = tempDir();
+    const outside = tempDir();
+    await mkdir(join(root, 'd'));
+    const hooks: LocalFileHooks = {
+      beforeOpen: async () => {
+        await rename(join(root, 'd'), join(root, 'd-moved'));
+        await symlink(outside, join(root, 'd'));
+      },
+    };
+    await expect(createLocalFile(join(root, 'd'), 'x', false, hooks)).rejects.toMatchObject({
+      code: 'unsafe_name',
+    });
+    expect((await stat(join(outside, 'x'))).size).toBe(0);
+  });
+});
+
+describe('modes of downloaded files', () => {
+  const posixOnly = it.skipIf(process.platform === 'win32');
+
+  posixOnly('replacing a private file never widens it, even while writing', async () => {
+    const dir = tempDir();
+    await writeFile(join(dir, 'secret'), 'old');
+    await chmod(join(dir, 'secret'), 0o600);
+    const file = await createLocalFile(dir, 'secret', true);
+    const temps = (await readdir(dir)).filter((n) => n !== 'secret');
+    expect(temps).toHaveLength(1);
+    expect((await stat(join(dir, temps[0]!))).mode & 0o777).toBe(0o600);
+    await file.sink.write(Buffer.from('new'), 0);
+    await file.finish();
+    expect((await stat(join(dir, 'secret'))).mode & 0o777).toBe(0o600);
+    expect(await readFile(join(dir, 'secret'), 'utf8')).toBe('new');
+  });
+
+  posixOnly('replacing keeps the old file’s permissions, without set-id bits', async () => {
+    const dir = tempDir();
+    await writeFile(join(dir, 'shared'), 'old');
+    await chmod(join(dir, 'shared'), 0o4750);
+    const file = await createLocalFile(dir, 'shared', true);
+    await file.sink.write(Buffer.from('new'), 0);
+    await file.finish();
+    expect((await stat(join(dir, 'shared'))).mode & 0o7777).toBe(0o750);
+  });
+
+  posixOnly('a new file gets the usual mode (umask applies)', async () => {
+    const dir = tempDir();
+    await writeFile(join(dir, 'reference'), '');
+    const file = await createLocalFile(dir, 'fresh', false);
+    await file.finish();
+    expect((await stat(join(dir, 'fresh'))).mode & 0o777).toBe(
+      (await stat(join(dir, 'reference'))).mode & 0o777,
+    );
   });
 });

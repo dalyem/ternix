@@ -63,6 +63,7 @@ export type {
 export type { ForwardListener, ForwardState, ForwardStatus } from './forwards.js';
 export { SftpClient, remoteBaseName, remoteChild } from './sftp.js';
 export type {
+  ListOptions,
   LocalSink,
   LocalSource,
   RemoveOptions,

@@ -57,6 +57,26 @@ export function isInside(root: string, child: string): boolean {
 }
 
 /**
+ * Test seams for the local races a second process could cause: each runs at the point it names,
+ * so a test can change the disk exactly there. Production code never sets them.
+ */
+export interface LocalFileHooks {
+  /** After the folder was checked, before the file is opened. */
+  beforeOpen?: () => Promise<void>;
+  /** After the file was opened, before it is checked. */
+  afterOpen?: () => Promise<void>;
+}
+
+const outsideError = () =>
+  new AppError('unsafe_name', 'That would write outside the chosen folder');
+
+/** `dir` must resolve to itself (no link on the way) and be `root` or below it. */
+async function requireSameFolder(dir: string, root: string): Promise<void> {
+  const real = await realpath(dir).catch(() => undefined);
+  if (real !== dir || !isInside(root, real)) throw outsideError();
+}
+
+/**
  * A folder the user picked for downloads. Every directory and file made through it is checked to
  * be inside it: names are single components, and an existing entry in the way that is a symlink
  * is refused, never followed.
@@ -65,15 +85,20 @@ export class LocalDestination {
   private constructor(
     readonly root: string,
     private readonly platform: NodeJS.Platform,
+    private readonly hooks: LocalFileHooks,
   ) {}
 
   /** `dir` must exist and be a directory; it is resolved once, here. */
-  static async open(dir: string, platform: NodeJS.Platform): Promise<LocalDestination> {
+  static async open(
+    dir: string,
+    platform: NodeJS.Platform,
+    hooks: LocalFileHooks = {},
+  ): Promise<LocalDestination> {
     const root = await realpath(dir);
     if (!(await stat(root)).isDirectory()) {
       throw new AppError('invalid_input', 'The download destination is not a folder');
     }
-    return new LocalDestination(root, platform);
+    return new LocalDestination(root, platform, hooks);
   }
 
   /**
@@ -87,10 +112,12 @@ export class LocalDestination {
     const existing = await lstat(target).catch(() => undefined);
     if (!existing) {
       await mkdir(target);
-      // Made by us just now; check again in case something raced us to it.
+      // Made by us just now; check again in case something raced us to it, or swapped a folder
+      // above it for a link so that the new folder landed somewhere else.
       if (!(await lstat(target)).isDirectory()) {
         throw new AppError('unsafe_name', `"${printable(name)}" changed while it was created`);
       }
+      await this.requireRealDir(target);
       return target;
     }
     if (existing.isSymbolicLink()) {
@@ -113,18 +140,15 @@ export class LocalDestination {
   async file(parent: string, name: string, replace: boolean): Promise<LocalFile> {
     requireSafeName(name, this.platform);
     await this.requireRealDir(parent);
-    return createLocalFile(parent, name, replace);
+    return createIn(parent, this.root, name, replace, this.hooks);
   }
 
   /**
    * `dir` must be the root or below it with no link on the way: resolving it changes nothing. A
    * folder swapped for a link after it was made fails here.
    */
-  private async requireRealDir(dir: string): Promise<void> {
-    const real = await realpath(dir).catch(() => undefined);
-    if (real !== dir || !isInside(this.root, real)) {
-      throw new AppError('unsafe_name', 'That would write outside the chosen folder');
-    }
+  private requireRealDir(dir: string): Promise<void> {
+    return requireSameFolder(dir, this.root);
   }
 }
 
@@ -146,12 +170,39 @@ const CREATE_NEW =
  * even a dangling one) fails with `already_exists`. With `replace`, the data goes to a new
  * temporary file next to it, which replaces the entry on `finish` (a rename replaces a link
  * itself, never its target), so a failed download leaves the old file as it was. A folder is
- * never replaced.
+ * never replaced. `dir` is resolved once, here, and must still resolve to the same folder
+ * whenever the file is checked (see `createIn`).
  */
 export async function createLocalFile(
   dir: string,
   name: string,
   replace: boolean,
+  hooks: LocalFileHooks = {},
+): Promise<LocalFile> {
+  const real = await realpath(dir);
+  return createIn(real, real, name, replace, hooks);
+}
+
+/**
+ * `createLocalFile` in `dir`, a folder that resolves to itself inside `root`. Node has no
+ * `openat`, so every path operation resolves `dir` again, and a local process that can write to
+ * the folder could swap it (or the file) for a link in between. The gaps are kept as small as
+ * Node allows: right after the open, before the rename into place and before removing a failed
+ * download, the folder must still resolve to itself inside `root` and the name must still be the
+ * file the handle has open (same device and inode, not a link). When it is not, the name is left
+ * alone, what the handle has open is emptied (that file is provably ours), and the download fails.
+ *
+ * Modes: a new file is created with 0666 less the umask, like any new file. A temporary file is
+ * 0600 while it is written; on `finish` it takes the permission bits of the file it replaces
+ * (without set-user-ID, set-group-ID or sticky bits), so replacing never widens access. A link
+ * that is replaced is treated as a new file.
+ */
+async function createIn(
+  dir: string,
+  root: string,
+  name: string,
+  replace: boolean,
+  hooks: LocalFileHooks,
 ): Promise<LocalFile> {
   const target = join(dir, name);
   const existing = await lstat(target).catch(() => undefined);
@@ -162,9 +213,12 @@ export async function createLocalFile(
     throw new AppError('already_exists', `"${printable(name)}" is a folder; it is not replaced`);
   }
   const path = existing ? join(dir, `.ternix-${randomBytes(6).toString('hex')}.part`) : target;
+  // The permission bits a replaced file had; undefined for a new file or a replaced link.
+  const keepMode = existing?.isFile() ? existing.mode & 0o777 : undefined;
+  await hooks.beforeOpen?.();
   let handle: FileHandle;
   try {
-    handle = await open(path, CREATE_NEW, 0o666);
+    handle = await open(path, CREATE_NEW, keepMode === undefined ? 0o666 : 0o600);
   } catch (err) {
     if (
       (err as { code?: unknown }).code === 'EEXIST' ||
@@ -180,6 +234,34 @@ export async function createLocalFile(
     closed = true;
     await handle.close();
   };
+  /** Whether `path` is still the file `handle` has open, in the folder that was checked. */
+  let own: Stats;
+  const isOurs = async (): Promise<boolean> => {
+    try {
+      await requireSameFolder(dir, root);
+    } catch {
+      return false;
+    }
+    const now = await lstat(path).catch(() => undefined);
+    return now !== undefined && now.isFile() && now.dev === own.dev && now.ino === own.ino;
+  };
+  /** Empty what the handle has open and fail; the name, maybe someone else's now, is left. */
+  const refuse = async (): Promise<never> => {
+    if (!closed) await handle.truncate(0).catch(() => undefined);
+    await close().catch(() => undefined);
+    throw new AppError(
+      'unsafe_name',
+      `The chosen folder changed while "${printable(name)}" was written; it was not saved`,
+    );
+  };
+  try {
+    own = await handle.stat();
+    await hooks.afterOpen?.();
+  } catch (err) {
+    await close().catch(() => undefined);
+    throw err;
+  }
+  if (!(await isOurs())) await refuse();
   return {
     sink: {
       write: async (data, position) => {
@@ -196,10 +278,16 @@ export async function createLocalFile(
       },
     },
     finish: async () => {
+      if (!(await isOurs())) await refuse();
+      if (keepMode !== undefined) await handle.chmod(keepMode);
       await close();
       if (path !== target) await rename(path, target);
     },
     discard: async () => {
+      if (!(await isOurs())) {
+        await refuse().catch(() => undefined);
+        return;
+      }
       await close().catch(() => undefined);
       await unlink(path).catch(() => undefined);
     },

@@ -1802,7 +1802,8 @@ input.narrow {
 .toasts {
   position: fixed;
   left: 20px;
-  bottom: 20px;
+  /* Above the SFTP transfers panel while it is shown (set by the panel). */
+  bottom: calc(20px + var(--toast-clearance, 0px));
   display: flex;
   flex-direction: column;
   gap: 5px;

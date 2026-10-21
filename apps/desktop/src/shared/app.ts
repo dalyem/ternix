@@ -116,7 +116,9 @@ export interface SftpListingDto {
   entries: SftpEntryDto[];
 }
 
-export type TransferState = 'queued' | 'running' | 'done' | 'failed' | 'cancelled' | 'skipped';
+/** `preparing`: a folder download being walked before its files are queued (it can be cancelled). */
+export type TransferState =
+  'preparing' | 'queued' | 'running' | 'done' | 'failed' | 'cancelled' | 'skipped';
 
 /** One file being copied. Local paths are never sent to the renderer, only names. */
 export interface TransferDto {

@@ -106,9 +106,17 @@ typecheck test` covers everything that does not need the Electron binary).
   names from the server must be one plain component (no `.`/`..`, separators or NUL; on Windows
   no reserved device names, `<>:"|?*`, control characters or trailing dots and spaces) or the
   file is skipped and listed with the reason; every folder written to must resolve to itself
-  inside the destination (a symlink in the way is refused, never followed); new files are
-  created with `O_EXCL`, and a replaced file is written to a temporary file that is renamed over
-  it once complete. An existing file (local or remote) is replaced only after main's "File
+  inside the destination (a symlink in the way is refused, never followed, and the folder and the
+  file are checked again after the open, before the rename into place and before a failed
+  download is removed); new files are created with `O_EXCL`, and a replaced file is written to a
+  temporary file, private (0600) while it is written, that takes the old file's permission bits
+  and is renamed over it once complete, so replacing never widens access. A folder download is
+  walked first, shown as a "Preparing…" transfer that can be cancelled; every entry it visits
+  counts against a budget of 100 000, and so does every entry a listing receives (`.` and `..`
+  too), so a server cannot make a listing or a walk endless. Preparation (a dialog still open, a
+  walk) is dropped when its tab closes, the page is replaced or the account changes. An upload is
+  done only once the server has closed the file (a failed CLOSE fails it), and a transfer
+  cancelled after its last byte but before the CLOSE answer keeps nothing. An existing file (local or remote) is replaced only after main's "File
   already exists" dialog (Skip is the default; "do the same for the other files" applies to that
   transfer). Deletes are confirmed in main's dialog; folders are deleted recursively without
   following symlinks (each entry is `lstat`ed and links are unlinked). The renderer gets file
@@ -239,6 +247,7 @@ The renderer is untrusted: anything it can do, an XSS in it could do. So:
 | Local and dynamic forwards listen only on an IP address or `localhost`, never a name to look up                                | `startForward` in `ssh/manager.ts`; the forward editor checks too                           |
 | SFTP takes no local path from the page: uploads from main's open dialog or a drop, downloads into main's save or folder dialog | `ssh/sftp.ts`, `ssh/localFiles.ts`, `uploadDropped` in `src/preload/index.ts`               |
 | Downloaded names are checked (one component, no reserved names), no local symlink is followed, nothing is silently replaced    | `unsafeLocalName`, `LocalDestination` in `ssh/localFiles.ts`                                |
+| Downloaded files are checked again in place (folder resolves to itself, same inode as the open file); replacing keeps modes    | `createIn` in `ssh/localFiles.ts`                                                           |
 | SFTP deletes and replacing existing files are confirmed in main's native dialog                                                | `ssh/sftp.ts`                                                                               |
 | Locking unmounts everything but the terminals and clears decrypted state                                                       | `src/renderer/src/screens/Shell.tsx`, `store.ts` (`clearData`)                              |
 | Session on disk only through `safeStorage`; refuses when unavailable                                                           | `src/main/app/secretStore.ts`; login and register check it first                            |
@@ -283,6 +292,17 @@ compromised renderer can still:
   picks that in main's dialogs or by dropping files. It can read the files the user drops (it
   could anyway, through the `File` objects);
 - show misleading information next to a native dialog; the dialog's own text comes from main.
+
+Downloads also have a local race that main can narrow but not close. Node has no `openat`, so
+every path operation resolves the chosen folder again. A local process that can write to the
+chosen folder (or a folder below it) while a transfer runs could swap a folder for a symlink in
+the instant between a check and the next operation, and so make one empty file appear outside
+the folder (between the check and the open) or one finished temporary file be renamed outside
+it (between the last check and the rename). Main checks, right after the open, before the rename
+into place and before removing a failed download, that the folder still resolves to itself
+inside the destination and that the name is still the file it has open (same device and inode).
+When it is not, the download stops, the name is left alone and what main opened is emptied. The
+risk needs a local attacker with write access to the chosen folder during the transfer.
 
 The review recommended moving secret editing out of the renderer entirely (a separate,
 minimal window or native forms owned by main). That is out of scope for v1.

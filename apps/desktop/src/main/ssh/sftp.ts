@@ -27,7 +27,13 @@ import type { SshManager } from './manager.js';
 export interface SftpManagerDeps {
   ssh: Pick<
     SshManager,
-    'openSftp' | 'listSftp' | 'reconnectSftp' | 'close' | 'sftpClient' | 'onSftpEnded'
+    | 'openSftp'
+    | 'listSftp'
+    | 'reconnectSftp'
+    | 'close'
+    | 'sftpClient'
+    | 'onSftpEnded'
+    | 'accountGeneration'
   >;
   emit<K extends AppEventName>(name: K, payload: AppEvents[K]): void;
   /** File operations need an unlocked vault, like new connections. */
@@ -43,11 +49,19 @@ export interface SftpManagerDeps {
   pickDownloadFolder(): Promise<string | null>;
   /** How often a running transfer reports progress. Default 200 ms. */
   progressIntervalMs?: number;
+  /**
+   * The generation of the page in the window: an upload or download still being prepared (a
+   * dialog open, a folder being walked) when it changes is dropped. Default: never changes.
+   */
+  generation?: () => number;
+  /** Most entries (folders, files, anything else) one download may visit. Default 100 000. */
+  maxDownloadEntries?: number;
 }
 
 /** Files copied at the same time per SFTP session. */
 const PARALLEL_TRANSFERS = 2;
 const MAX_DOWNLOAD_FILES = 10_000;
+const MAX_DOWNLOAD_ENTRIES = 100_000;
 const MAX_DOWNLOAD_DEPTH = 64;
 /** Finished transfers kept for the panel; the oldest go first. */
 const MAX_FINISHED = 200;
@@ -58,6 +72,20 @@ type Conflict = 'replace' | 'skip';
 /** One upload or download request: conflicts answered "for all" apply to its other files. */
 interface Batch {
   conflict: Conflict | undefined;
+}
+
+/**
+ * An upload or download between the request and its queued files: dialogs, walking folders,
+ * making local folders. It belongs to one session, page and account.
+ */
+interface Preparation {
+  readonly abort: AbortController;
+  /**
+   * Throws `cancelled` once the session's tab is gone, the page or the account changed, or the
+   * user cancelled. Called after every wait and before every change on disk, event or enqueue.
+   */
+  check(): void;
+  end(): void;
 }
 
 interface Job {
@@ -102,6 +130,8 @@ export class SftpManager {
   private readonly jobs = new Map<string, Job>();
   private readonly queued = new Map<string, Job[]>();
   private readonly running = new Map<string, number>();
+  /** Uploads and downloads being prepared, per session. */
+  private readonly preparing = new Map<string, Set<AbortController>>();
   /** Conflict questions, one dialog at a time. */
   private asking: Promise<unknown> = Promise.resolve();
 
@@ -177,25 +207,56 @@ export class SftpManager {
   /** Upload what the user picks in main's open dialog into `remoteDir`. */
   async upload(id: string, remoteDir: string, kind: 'files' | 'folder'): Promise<TransferBatchDto> {
     this.client(id);
-    const paths = await this.deps.pickUploads(kind);
-    if (paths.length === 0) return { queued: 0, skipped: 0 };
-    return this.queueUpload(id, remoteDir, paths);
+    const prep = this.startPreparing(id);
+    try {
+      const paths = await this.deps.pickUploads(kind);
+      prep.check();
+      if (paths.length === 0) return { queued: 0, skipped: 0 };
+      return await this.queueUpload(id, remoteDir, paths, prep);
+    } finally {
+      prep.end();
+    }
   }
 
   /** Upload files dropped on the window; the paths come from the preload, never the page. */
   async uploadDropped(id: string, remoteDir: string, paths: string[]): Promise<TransferBatchDto> {
     this.client(id);
-    return this.queueUpload(id, remoteDir, paths);
+    const prep = this.startPreparing(id);
+    try {
+      return await this.queueUpload(id, remoteDir, paths, prep);
+    } finally {
+      prep.end();
+    }
   }
 
   /**
    * Download remote paths. One file: to where the user saves it in main's save dialog. Several,
-   * or a folder: into a folder the user picks, under the server's names (checked first).
+   * or a folder: into a folder the user picks, under the server's names (checked first). While
+   * folders are walked, a `preparing` row shows it and can cancel it; every entry visited counts
+   * against `maxDownloadEntries`, so a server cannot make the walk endless.
    */
   async download(id: string, paths: string[]): Promise<TransferBatchDto> {
     const sftp = this.client(id);
+    const prep = this.startPreparing(id);
+    try {
+      return await this.prepareDownload(id, sftp, paths, prep);
+    } finally {
+      prep.end();
+    }
+  }
+
+  private async prepareDownload(
+    id: string,
+    sftp: SftpClient,
+    paths: string[],
+    prep: Preparation,
+  ): Promise<TransferBatchDto> {
     const kinds: { path: string; type: 'file' | 'directory' | 'skip' }[] = [];
-    for (const path of paths) kinds.push({ path, type: await this.followedType(sftp, path) });
+    for (const path of paths) {
+      // A tab closed meanwhile fails the lookup; that is a cancellation, not an error.
+      const type = await this.followedType(sftp, path).finally(() => prep.check());
+      kinds.push({ path, type });
+    }
     const batch: Batch = { conflict: undefined };
     const only = kinds.length === 1 ? kinds[0] : undefined;
 
@@ -203,6 +264,7 @@ export class SftpManager {
       const remoteName = remoteBaseName(only.path);
       const suggested = unsafeLocalName(remoteName, this.deps.platform) ? 'download' : remoteName;
       const chosen = await this.deps.pickDownloadFile(suggested);
+      prep.check();
       if (!chosen) return { queued: 0, skipped: 0 };
       // The save dialog asked before replacing an existing file.
       this.enqueue(
@@ -217,8 +279,37 @@ export class SftpManager {
     }
 
     const folder = await this.deps.pickDownloadFolder();
+    prep.check();
     if (!folder) return { queued: 0, skipped: 0 };
     const dest = await LocalDestination.open(folder, this.deps.platform);
+    prep.check();
+
+    // The walk's own row: cancelling it cancels the preparation.
+    const first = kinds[0]?.path ?? '/';
+    const row = this.newJob(
+      id,
+      'download',
+      kinds.length === 1 ? remoteBaseName(first) : `${kinds.length} items`,
+      first,
+      0,
+      async () => 'skipped',
+    );
+    row.abort = prep.abort;
+    row.dto.state = 'preparing';
+    this.jobs.set(row.dto.id, row);
+    this.trim();
+    this.emitNow(row);
+
+    const max = this.deps.maxDownloadEntries ?? MAX_DOWNLOAD_ENTRIES;
+    let visited = 0;
+    const tooMany = () =>
+      new AppError(
+        'invalid_input',
+        `Too many files and folders (more than ${max}); download fewer at a time`,
+      );
+    const visit = () => {
+      if (++visited > max) throw tooMany();
+    };
     const counts = { queued: 0, skipped: 0 };
     const jobs: Job[] = [];
     const addFile = (remote: string, parent: string) => {
@@ -238,9 +329,12 @@ export class SftpManager {
       );
     };
     const walk = async (remote: string, parent: string, depth: number): Promise<void> => {
-      const local = await this.safely(id, 'download', remote, () =>
+      prep.check();
+      visit();
+      const local = await this.safely(id, prep, remote, () =>
         dest.directory(parent, remoteBaseName(remote)),
       );
+      prep.check();
       if (local === undefined) {
         counts.skipped++;
         return;
@@ -249,16 +343,30 @@ export class SftpManager {
         counts.skipped++;
         return;
       }
-      const entries = await this.safely(id, 'download', remote, () => sftp.list(remote));
-      if (entries === undefined) {
+      let entries: SftpEntry[];
+      try {
+        // What is left of the budget bounds the listing (plus one: an empty answer counts too).
+        entries = await sftp.list(remote, {
+          signal: prep.abort.signal,
+          maxEntries: max - visited + 1,
+        });
+      } catch (err) {
+        prep.check();
+        if ((err as { code?: unknown }).code === 'too_many_entries') throw tooMany();
+        this.record(id, 'download', remote, 'skipped', errMessage(err));
         counts.skipped++;
         return;
       }
+      prep.check();
       for (const entry of entries) {
         const type = entry.type === 'symlink' ? entry.targetType : entry.type;
         if (entry.type === 'directory') {
           await walk(entry.path, local, depth + 1);
-        } else if (type === 'file') {
+          prep.check();
+          continue;
+        }
+        visit();
+        if (type === 'file') {
           if (this.checkedName(id, entry.path, counts)) addFile(entry.path, local);
         } else {
           // Links to folders are not followed inside a folder; sockets and devices are not files.
@@ -266,11 +374,29 @@ export class SftpManager {
         }
       }
     };
-    for (const { path, type } of kinds) {
-      if (type === 'directory') await walk(path, dest.root, 0);
-      else if (type === 'file' && this.checkedName(id, path, counts)) addFile(path, dest.root);
-      else if (type !== 'file') counts.skipped++;
+    try {
+      for (const { path, type } of kinds) {
+        if (type === 'directory') {
+          await walk(path, dest.root, 0);
+          prep.check();
+          continue;
+        }
+        visit();
+        if (type === 'file' && this.checkedName(id, path, counts)) addFile(path, dest.root);
+        else if (type !== 'file') counts.skipped++;
+      }
+      prep.check();
+    } catch (err) {
+      if (prep.abort.signal.aborted) {
+        this.setState(row, 'cancelled');
+        throw new AppError('cancelled', 'The download was cancelled', { cause: err });
+      }
+      this.setState(row, 'failed', errMessage(err));
+      throw err;
     }
+    // The walk is over: its row gives way to the files' own rows.
+    this.jobs.delete(row.dto.id);
+    this.deps.emit('sftp.transfers-removed', { ids: [row.dto.id] });
     for (const job of jobs) this.enqueue(id, job);
     counts.queued = jobs.length;
     return counts;
@@ -296,6 +422,32 @@ export class SftpManager {
   }
 
   // Internals
+
+  /** A preparation for `sessionId`, bound to the current page and account. */
+  private startPreparing(sessionId: string): Preparation {
+    const abort = new AbortController();
+    const generation = this.generation();
+    let set = this.preparing.get(sessionId);
+    if (!set) this.preparing.set(sessionId, (set = new Set()));
+    set.add(abort);
+    return {
+      abort,
+      check: () => {
+        if (!abort.signal.aborted && this.generation() !== generation) abort.abort();
+        if (abort.signal.aborted) throw new AppError('cancelled', 'Cancelled');
+      },
+      end: () => {
+        const current = this.preparing.get(sessionId);
+        current?.delete(abort);
+        if (current?.size === 0) this.preparing.delete(sessionId);
+      },
+    };
+  }
+
+  /** Changes when the page in the window or the signed-in account does. */
+  private generation(): string {
+    return `${this.deps.generation?.() ?? 0}:${this.deps.ssh.accountGeneration}`;
+  }
 
   private requireUnlocked(): void {
     if (!this.deps.isUnlocked()) throw new AppError('locked', 'Unlock Ternix first.');
@@ -337,17 +489,18 @@ export class SftpManager {
     return false;
   }
 
-  /** Run a local step; its failure becomes a skipped transfer that says why. */
+  /** Run a local step of a download; its failure becomes a skipped transfer that says why. */
   private async safely<T>(
     id: string,
-    direction: TransferDto['direction'],
+    prep: Preparation,
     remote: string,
     step: () => Promise<T>,
   ): Promise<T | undefined> {
     try {
       return await step();
     } catch (err) {
-      this.record(id, direction, remote, 'skipped', errMessage(err));
+      prep.check();
+      this.record(id, 'download', remote, 'skipped', errMessage(err));
       return undefined;
     }
   }
@@ -379,9 +532,11 @@ export class SftpManager {
     id: string,
     remoteDir: string,
     paths: string[],
+    prep: Preparation,
   ): Promise<TransferBatchDto> {
     const sftp = this.client(id);
     const plan = await planUpload(paths);
+    prep.check();
     const remotePathOf = (dirs: string[], name?: string) =>
       [...dirs, ...(name === undefined ? [] : [name])].reduce(
         (dir, part) => remoteChild(dir, part),
@@ -393,9 +548,11 @@ export class SftpManager {
       try {
         await sftp.mkdir(path);
       } catch (err) {
+        prep.check();
         const existing = await sftp.lstat(path).catch(() => undefined);
         if (existing?.type !== 'directory') throw err;
       }
+      prep.check();
     }
     const batch: Batch = { conflict: undefined };
     for (const file of plan.files) {
@@ -455,6 +612,8 @@ export class SftpManager {
           signal: j.abort.signal,
           onProgress: (p) => this.progress(j, p),
         });
+        // Cancelled after the last byte, while the server closed the file: keep nothing.
+        if (j.abort.signal.aborted) throw new AppError('cancelled', 'Cancelled');
         await file.finish();
       } catch (err) {
         await file.discard();
@@ -604,6 +763,8 @@ export class SftpManager {
   /** The session's tab is gone: stop its transfers and forget them. */
   private dropSession(sessionId: string): void {
     this.queued.delete(sessionId);
+    for (const abort of this.preparing.get(sessionId) ?? []) abort.abort();
+    this.preparing.delete(sessionId);
     const ids: string[] = [];
     for (const job of [...this.jobs.values()]) {
       if (job.dto.sessionId !== sessionId) continue;

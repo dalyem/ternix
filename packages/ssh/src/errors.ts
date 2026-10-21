@@ -19,6 +19,8 @@ export type SshErrorCode =
   | 'already_exists'
   /** SFTP: any other failure the server reported; `message` has its text. */
   | 'sftp_failed'
+  /** SFTP: a listing (or a tree walked through listings) is larger than the caller allows. */
+  | 'too_many_entries'
   /** A transfer or operation the caller aborted. */
   | 'cancelled';
 

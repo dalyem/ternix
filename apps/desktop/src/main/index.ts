@@ -167,6 +167,8 @@ async function start(): Promise<void> {
     isUnlocked: () => client.state === 'unlocked',
     platform: process.platform,
     messageBox,
+    // An upload or download still being prepared when the page is replaced is dropped.
+    generation: () => pages.issue(),
     pickUploads: async (kind) => {
       const options: Electron.OpenDialogOptions = {
         title: kind === 'folder' ? 'Upload folder' : 'Upload files',

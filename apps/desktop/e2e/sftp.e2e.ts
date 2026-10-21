@@ -152,9 +152,16 @@ test('SFTP: browse, upload, download, rename, delete', async () => {
     expect(readFileSync(join(remoteRoot, 'upload.bin')).equals(data)).toBe(true);
   });
 
-  await test.step('screenshot of the SFTP screen', async () => {
+  await test.step('screenshot of the SFTP screen, the toast above the transfers panel', async () => {
     await row(page, 'readme.txt').click();
+    // The upload's toast (shown for 5 s) sits bottom left, where the transfers panel is.
+    const toastBox = page.locator('.toasts');
+    await expect(toastBox.getByText('Uploading 1 file')).toBeVisible();
     await page.waitForTimeout(300);
+    const toasts = await toastBox.boundingBox();
+    const panel = await page.getByTestId('sftp-transfers').boundingBox();
+    expect(toasts && panel).toBeTruthy();
+    expect(toasts!.y + toasts!.height).toBeLessThanOrEqual(panel!.y);
     await page.screenshot({ path: join(ARTIFACTS, 'sftp-browser.png'), type: 'png' });
   });
 

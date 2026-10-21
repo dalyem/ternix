@@ -893,15 +893,45 @@ function MenuItem({
   );
 }
 
+const isActive = (t: TransferDto) =>
+  t.state === 'preparing' || t.state === 'queued' || t.state === 'running';
+
+/**
+ * Toasts sit at the bottom left, where this panel is: while it is on screen, its height goes to
+ * `--toast-clearance` on the root element and the toasts stay above it.
+ */
+function useToastClearance(panel: { current: HTMLElement | null }, shown: boolean): void {
+  useEffect(() => {
+    const el = panel.current;
+    if (!shown || !el) return;
+    const root = document.documentElement;
+    const update = () => root.style.setProperty('--toast-clearance', `${el.offsetHeight}px`);
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(el);
+    return () => {
+      observer.disconnect();
+      root.style.removeProperty('--toast-clearance');
+    };
+  }, [panel, shown]);
+}
+
 function TransfersPanel() {
   const transfers = useStore((s) => s.transfers);
   const sessions = useStore((s) => s.sftpSessions);
   const [open, setOpen] = useState(true);
+  const panel = useRef<HTMLElement>(null);
+  useToastClearance(panel, transfers.length > 0);
   if (transfers.length === 0) return null;
-  const active = transfers.filter((t) => t.state === 'queued' || t.state === 'running').length;
+  const active = transfers.filter(isActive).length;
   const label = (t: TransferDto) => sessions.find((s) => s.id === t.sessionId)?.label ?? '';
   return (
-    <section className="sftp-transfers" aria-label="Transfers" data-testid="sftp-transfers">
+    <section
+      ref={panel}
+      className="sftp-transfers"
+      aria-label="Transfers"
+      data-testid="sftp-transfers"
+    >
       <header>
         <button
           className="sftp-transfers-toggle"
@@ -928,7 +958,7 @@ function TransfersPanel() {
                 : t.state === 'done'
                   ? 100
                   : 0;
-            const running = t.state === 'queued' || t.state === 'running';
+            const running = isActive(t);
             return (
               <li
                 key={t.id}
@@ -962,7 +992,9 @@ function TransfersPanel() {
                       ? `${formatSize(t.transferred)} of ${formatSize(t.total)}`
                       : t.state === 'done'
                         ? formatSize(t.transferred)
-                        : t.state}
+                        : t.state === 'preparing'
+                          ? 'Preparing…'
+                          : t.state}
                     {t.error ? <span className="error-text"> · {t.error}</span> : null}
                   </div>
                 </div>

@@ -367,6 +367,11 @@ export class SshManager {
     await Promise.all([...this.terminals.keys()].map((id) => this.close(id)));
   }
 
+  /** Changes whenever the account leaves (`forgetAccount`), so work started for one can tell. */
+  get accountGeneration(): number {
+    return this.accountEpoch;
+  }
+
   /**
    * The account is leaving (sign-out, expiry, revocation, another sign-in): forget the OS shown
    * to it alone, and drop detections still running for it. Terminals are not touched.

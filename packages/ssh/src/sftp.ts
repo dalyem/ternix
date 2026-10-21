@@ -72,6 +72,13 @@ export interface SftpOptions {
   maxEntries?: number;
 }
 
+export interface ListOptions {
+  /** Stops the listing with `cancelled`. */
+  signal?: AbortSignal;
+  /** Most entries (and empty answers) the server may send. Default: `SftpOptions.maxEntries`. */
+  maxEntries?: number;
+}
+
 export interface RemoveOptions {
   signal?: AbortSignal;
   /** Most entries a recursive delete may remove. Default 100 000. */
@@ -138,6 +145,21 @@ export function remoteChild(dir: string, name: string): string {
 }
 
 const cancelled = () => new SshError('cancelled', 'Cancelled');
+
+/** `wait`, or `cancelled` as soon as `signal` aborts; a late answer is then ignored. */
+function untilAborted<T>(wait: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (!signal) return wait;
+  wait.catch(() => undefined);
+  if (signal.aborted) return Promise.reject(cancelled());
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(cancelled());
+    signal.addEventListener('abort', onAbort, { once: true });
+    void wait.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort));
+  });
+}
+
+/** An error kept while a handle is closed, so the close cannot replace it. */
+type Failure = { error: unknown } | undefined;
 
 /** A counting semaphore: at most `limit` holders at once, the rest wait in order. */
 class Limiter {
@@ -258,42 +280,60 @@ export class SftpClient {
 
   /**
    * The entries of a directory, without `.` and `..`. Each symlink's target is looked up with
-   * `stat` so the caller can tell a link to a directory from a link to a file.
+   * `stat` so the caller can tell a link to a directory from a link to a file. Every entry the
+   * server sends counts against `maxEntries`, the ones left out too, and an answer with none
+   * (ssh2 drops `.` and `..` itself) counts as one: a server that never ends the listing fails it
+   * with `too_many_entries`.
    */
-  async list(path: string): Promise<SftpEntry[]> {
-    const handle = await this.request<Buffer>(path, (cb) => this.sftp.opendir(path, cb));
+  async list(path: string, options: ListOptions = {}): Promise<SftpEntry[]> {
+    const { signal } = options;
+    const max = options.maxEntries ?? this.options.maxEntries ?? DEFAULT_MAX_ENTRIES;
+    const opening = this.request<Buffer>(path, (cb) => this.sftp.opendir(path, cb));
+    let handle: Buffer;
+    try {
+      handle = await untilAborted(opening, signal);
+    } catch (err) {
+      // Cancelled while the server was still opening it: close it once it arrives.
+      if (signal?.aborted) void opening.then((h) => this.closeQuietly(h)).catch(() => undefined);
+      throw err;
+    }
     const entries: SftpEntry[] = [];
-    const max = this.options.maxEntries ?? DEFAULT_MAX_ENTRIES;
+    let received = 0;
+    let failure: Failure;
     try {
       for (;;) {
-        const batch = await this.request<{ filename: string; attrs: Attributes }[] | false>(
-          path,
-          (cb) =>
+        const batch = await untilAborted(
+          this.request<{ filename: string; attrs: Attributes }[] | false>(path, (cb) =>
             this.sftp.readdir(handle, (err, list) => {
               // The end of the listing is a status EOF, not an error.
               if (err && (err as { code?: unknown }).code === 1) return cb(undefined, false);
               cb(err, list);
             }),
+          ),
+          signal,
         );
         if (batch === false) break;
+        received += Math.max(1, batch.length);
+        if (received > max) {
+          throw new SshError('too_many_entries', `${path} has more than ${max} entries`);
+        }
         for (const item of batch) {
           const name = item.filename;
           if (name === '.' || name === '..' || name === '' || name.includes('/')) continue;
           entries.push({ name, path: posix.join(path, name), ...toStat(item.attrs) });
         }
-        if (entries.length > max) {
-          throw new SshError('sftp_failed', `${path} has more than ${max} entries`);
-        }
       }
-    } finally {
-      await this.closeHandle(handle);
+    } catch (error) {
+      failure = { error };
     }
+    await this.finishHandle(handle, path, failure);
     const links = entries.filter((e) => e.type === 'symlink');
     await eachLimited(links, STAT_CONCURRENCY, async (entry) => {
+      if (signal?.aborted) throw cancelled();
       try {
-        entry.targetType = (await this.stat(entry.path)).type;
+        entry.targetType = (await untilAborted(this.stat(entry.path), signal)).type;
       } catch (err) {
-        if (this.isClosed) throw err;
+        if (this.isClosed || signal?.aborted) throw err;
         entry.targetType = 'missing';
       }
     });
@@ -335,8 +375,8 @@ export class SftpClient {
   /**
    * Copy a remote file into `sink`. Up to 16 read requests are in flight; each chunk is written
    * (and the write awaited) before its slot asks for more, so memory stays bounded however slow
-   * the sink is. Waits in the transfer queue first. Rejects with `cancelled` once `signal` aborts;
-   * the caller removes what was written.
+   * the sink is. Waits in the transfer queue first. Rejects with `cancelled` once `signal` aborts,
+   * even after the last byte while the file is being closed; the caller removes what was written.
    */
   async download(remotePath: string, sink: LocalSink, options: TransferOptions = {}) {
     const { signal } = options;
@@ -346,6 +386,8 @@ export class SftpClient {
       const handle = await this.request<Buffer>(remotePath, (cb) =>
         this.sftp.open(remotePath, 'r', cb),
       );
+      const progress = { transferred: 0, total: 0 };
+      let failure: Failure;
       try {
         const st = toStat(
           await this.request<Stats>(remotePath, (cb) => this.sftp.fstat(handle, cb)),
@@ -353,7 +395,7 @@ export class SftpClient {
         if (st.type === 'directory') {
           throw new SshError('sftp_failed', `${remotePath} is a directory`);
         }
-        const progress = { transferred: 0, total: st.size };
+        progress.total = st.size;
         let next = 0;
         let ended = false;
         await this.inParallel(signal, async (guard, stopped) => {
@@ -388,10 +430,12 @@ export class SftpClient {
             if (got < CHUNK_BYTES) ended = true;
           }
         });
-        return { bytes: progress.transferred };
-      } finally {
-        await this.closeHandle(handle);
+      } catch (error) {
+        failure = { error };
       }
+      await this.finishHandle(handle, remotePath, failure);
+      if (signal?.aborted) throw cancelled();
+      return { bytes: progress.transferred };
     } finally {
       release();
     }
@@ -399,7 +443,8 @@ export class SftpClient {
 
   /**
    * Copy `source` to a remote file. Without `overwrite`, an existing file fails with
-   * `already_exists` (the file is opened with `O_EXCL`). A failed or cancelled upload removes
+   * `already_exists` (the file is opened with `O_EXCL`). The upload is done once the server has
+   * closed the file: a failed or unanswered CLOSE fails it. A failed or cancelled upload removes
    * the partial file when the channel still works. Waits in the transfer queue first.
    */
   async upload(source: LocalSource, remotePath: string, options: UploadOptions) {
@@ -418,35 +463,44 @@ export class SftpClient {
       const progress = { transferred: 0, total: source.size };
       let next = 0;
       let ended = false;
-      let failure: unknown;
+      let failure: Failure;
       try {
         await this.inParallel(signal, async (guard, stopped) => {
           const buffer = Buffer.allocUnsafe(CHUNK_BYTES);
           while (!ended && !stopped()) {
             const position = next;
             next += CHUNK_BYTES;
-            // Not raced: once the transfer settles, no local read is still running.
-            const n = await source.read(buffer, position);
-            if (n <= 0) {
-              ended = true;
-              break;
+            // Fill the chunk: a local read can return less than asked before the end, and a
+            // short chunk sent as it is would leave a hole in the remote file.
+            let got = 0;
+            while (got < CHUNK_BYTES) {
+              // Not raced: once the transfer settles, no local read is still running.
+              const n = await source.read(buffer.subarray(got), position + got);
+              // Stopped while reading (cancelled, failed, the channel closed): send nothing more.
+              if (stopped()) return;
+              if (n <= 0) break;
+              got += n;
             }
+            if (got < CHUNK_BYTES) ended = true;
+            if (got === 0) break;
             await guard(
               this.request<void>(remotePath, (cb) =>
-                this.sftp.write(handle, buffer, 0, n, position, (err) => cb(err)),
+                this.sftp.write(handle, buffer, 0, got, position, (err) => cb(err)),
               ),
             );
-            progress.transferred += n;
+            progress.transferred += got;
             options.onProgress?.({ ...progress });
           }
         });
-      } catch (err) {
-        failure = err;
+      } catch (error) {
+        failure = { error };
       }
-      await this.closeHandle(handle);
-      if (failure !== undefined) {
+      try {
+        await this.finishHandle(handle, remotePath, failure);
+        if (signal?.aborted) throw cancelled();
+      } catch (err) {
         if (!this.isClosed) await this.removeFile(remotePath).catch(() => undefined);
-        throw failure;
+        throw err;
       }
       return { bytes: progress.transferred };
     } finally {
@@ -458,7 +512,7 @@ export class SftpClient {
    * Run `REQUESTS_IN_FLIGHT` copies of `worker` until all return. The first failure (or the
    * abort) stops the others: `guard` rejects every remote wait that is still pending (a late
    * answer from the server is ignored), and `stopped` tells a worker to quit before its next
-   * local read or write.
+   * local read or write, and after each local read.
    */
   private async inParallel(
     signal: AbortSignal | undefined,
@@ -477,6 +531,8 @@ export class SftpClient {
     if (signal?.aborted) throw cancelled();
     signal?.addEventListener('abort', onAbort, { once: true });
     const guard = <T>(wait: Promise<T>): Promise<T> => {
+      // Observed even when nobody awaits it: a request that fails after the stop is expected.
+      wait.catch(() => undefined);
       if (stopped !== undefined) return Promise.reject(stopped);
       return Promise.race([wait, stopping]);
     };
@@ -513,7 +569,21 @@ export class SftpClient {
     await this.request<void>(path, (cb) => this.sftp.rmdir(path, cb));
   }
 
-  private closeHandle(handle: Buffer): Promise<void> {
+  /**
+   * Close `handle` once the work on it is over. After a `failure`, that failure is what the caller
+   * gets and the close only cleans up. Otherwise the close is part of the result: a server can
+   * report a write error only when it closes the file, so a failed or unanswered CLOSE (or a
+   * channel that closed first) fails the operation.
+   */
+  private async finishHandle(handle: Buffer, path: string, failure: Failure): Promise<void> {
+    if (failure) {
+      await this.closeQuietly(handle);
+      throw failure.error;
+    }
+    await this.request<void>(path, (cb) => this.sftp.close(handle, cb));
+  }
+
+  private closeQuietly(handle: Buffer): Promise<void> {
     if (this.isClosed) return Promise.resolve();
     return this.request<void>('', (cb) => this.sftp.close(handle, cb)).catch(() => undefined);
   }
