@@ -26,8 +26,17 @@ export {
 } from './knownHosts.js';
 export type { HostKeyCheck, HostKeyStatus, NewKnownHost } from './knownHosts.js';
 export { SshSession, defaultAgentPath } from './session.js';
+export {
+  OS_PROBE_COMMAND,
+  OS_PROBE_MAX_BYTES,
+  OS_PROBE_TIMEOUT_MS,
+  osFromIdent,
+  osFromProbe,
+  parseOsRelease,
+} from './os.js';
 export type {
   CloseReason,
+  DetectOsOptions,
   HopInfo,
   HostKeyInfo,
   KeyboardInteractiveRequest,

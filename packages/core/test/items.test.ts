@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { ITEM_TYPES, itemPayloadSchema } from '../src/index.js';
+import { HOST_OS, ITEM_TYPES, hostPayloadSchema, itemPayloadSchema } from '../src/index.js';
 import { ITEM_ID, NOW, OTHER_ITEM_ID, VAULT_ID } from './helpers.js';
 
 const base = { schema: 1, updated_at: NOW };
@@ -83,6 +83,7 @@ describe('item payload schema', () => {
       agent_forwarding: true,
       color: '#ff0000',
       notes: 'hi',
+      os: 'debian',
     };
     expect(itemPayloadSchema.parse(host)).toEqual(host);
   });
@@ -115,5 +116,27 @@ describe('item payload schema', () => {
     for (const sample of bad) {
       expect(itemPayloadSchema.safeParse(sample).success, JSON.stringify(sample)).toBe(false);
     }
+  });
+
+  it('accepts every known operating system on a host', () => {
+    for (const os of HOST_OS) {
+      expect(hostPayloadSchema.parse({ ...valid.host, os }).os).toBe(os);
+    }
+  });
+
+  it('reads an operating system it does not know as unset, keeping the rest of the host', () => {
+    for (const os of ['haiku', 'Ubuntu', '', 42, null, { id: 'ubuntu' }]) {
+      const parsed = itemPayloadSchema.safeParse({ ...valid.host, os, notes: 'kept' });
+      expect(parsed.success, JSON.stringify(os)).toBe(true);
+      if (!parsed.success || parsed.data.type !== 'host') throw new Error('not a host');
+      expect(parsed.data.os).toBeUndefined();
+      expect(parsed.data.notes).toBe('kept');
+      // Written back, the unknown value is gone rather than stored as an explicit null.
+      expect(JSON.parse(JSON.stringify(parsed.data))).not.toHaveProperty('os');
+    }
+  });
+
+  it('leaves a host without an operating system without the field', () => {
+    expect(hostPayloadSchema.parse(valid.host)).not.toHaveProperty('os');
   });
 });

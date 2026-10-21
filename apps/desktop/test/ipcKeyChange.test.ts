@@ -37,7 +37,11 @@ const fp = (publicKey: string): string => fingerprint(fromB64(publicKey));
 const idOf = (t: Registered): string => t.client.account!.user.id;
 
 function ipcFor(t: Registered) {
-  const ssh = { cancelAllPrompts: vi.fn(), closeAll: vi.fn(async () => undefined) };
+  const ssh = {
+    cancelAllPrompts: vi.fn(),
+    closeAll: vi.fn(async () => undefined),
+    displayItems: <T>(vault: T) => vault,
+  };
   // The user approves every native trust dialog here; ipcSecurity.test.ts covers declining.
   const messageBox = vi.fn(async () => ({ response: 1, checkboxChecked: false }));
   const handlers = createHandlers({

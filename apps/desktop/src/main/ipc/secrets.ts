@@ -76,3 +76,16 @@ export function mergeSecrets(draft: ItemDraftInput, stored: ItemPayload | undefi
   }
   return out as ItemDraft;
 }
+
+/**
+ * A host's `os` is detected by main when it connects, and the editor does not show it: a draft
+ * without one keeps the stored value, unless the address changed (then it is another machine,
+ * possibly, and the next connection detects it again).
+ */
+export function keepDetectedOs(draft: ItemDraft, stored: ItemPayload | undefined): ItemDraft {
+  if (draft.type !== 'host' || 'os' in draft || stored?.type !== 'host' || !stored.os) {
+    return draft;
+  }
+  if (draft.address.trim().toLowerCase() !== stored.address.trim().toLowerCase()) return draft;
+  return { ...draft, os: stored.os };
+}

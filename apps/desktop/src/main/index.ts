@@ -145,6 +145,9 @@ async function start(): Promise<void> {
     confirmHostKey: (facts, signal) => confirmHostKey(messageBox, facts, signal),
     confirmNewHosts: (route, signal) => confirmNewHosts(messageBox, route, signal),
     agentPath: defaultAgentPath(process.platform, process.env),
+    detectHostOs: () => settings.get().detectHostOs,
+    vaultRole: (vaultId) => client.listVaults().find((v) => v.id === vaultId)?.role,
+    log: (message) => console.warn(`[ternix] ${message}`),
   });
 
   /** Keys are gone when this returns; the promise settles once pending cache writes are stored. */

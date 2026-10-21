@@ -3,11 +3,10 @@ import { useMemo, useState } from 'react';
 import { call } from '../api.js';
 import { BIND_ADDRESS_MESSAGE, looksLikeLocalBindAddress } from '../../../shared/forwards.js';
 import { groupDefaultPort } from '../../../shared/groups.js';
-import { type PayloadOf, tileColor, TILE_COLORS } from '../items.js';
+import { type PayloadOf, TILE_COLORS } from '../items.js';
 import { type EditorTarget, useStore } from '../store.js';
 import { Button, Checkbox, FormCard, Notice, Select, TextArea, TextField } from '../ui.js';
-import { Tile } from '../cards.js';
-import { Server } from 'lucide-react';
+import { HostTile } from '../cards.js';
 import {
   EditorFrame,
   ItemSelect,
@@ -116,7 +115,7 @@ function HostEditor({ target }: { target: EditorTarget }) {
         <>
           <FormCard title="Address">
             <div className="address-row">
-              <Tile color={tileColor(label.trim() || 'host', color || undefined)} icon={Server} />
+              <HostTile label={label.trim() || 'host'} color={color || undefined} os={h?.os} />
               <TextField
                 label="Address"
                 value={address}

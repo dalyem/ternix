@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { ItemPayload } from '@ternix/core/items';
+import type { HostOs, ItemPayload } from '@ternix/core/items';
+import type { VaultRole } from '@ternix/core/protocol';
 import type {
   HostKeyInfo,
   KeyboardInteractiveRequest,
@@ -83,6 +84,7 @@ class FakeSession {
     return () => undefined;
   }
   startForward = vi.fn(async () => undefined);
+  detectOs = vi.fn(async (): Promise<HostOs | undefined> => undefined);
   emit(status: SessionStatus) {
     for (const l of [...this.statusListeners]) l(status);
   }
@@ -118,20 +120,27 @@ const keyboard: KeyboardInteractiveRequest = {
 
 function setup(
   options: {
-    snapshot?: ItemSnapshot;
+    snapshot?: ItemSnapshot | (() => ItemSnapshot);
     confirm?: (facts: HostKeyFacts, signal: AbortSignal) => Promise<HostKeyDecision>;
     /** The "Connect to a new host?" dialog; approves by default. */
     confirmNew?: (route: RouteHop[], signal: AbortSignal) => Promise<boolean>;
     keyboardTimeoutMs?: number;
+    detectHostOs?: () => boolean;
+    vaultRole?: (vaultId: string) => VaultRole | undefined;
+    putItem?: () => Promise<unknown>;
   } = {},
 ) {
   const sessions: FakeSession[] = [];
   const events: { name: AppEventName; payload: unknown }[] = [];
-  const putItem = vi.fn(async () => ({}));
+  const putItem = vi.fn(options.putItem ?? (async () => ({})));
+  const log = vi.fn();
   const confirmHostKey = vi.fn(options.confirm ?? (async () => 'reject' as HostKeyDecision));
   const confirmNewHosts = vi.fn(options.confirmNew ?? (async () => true));
   const manager = new SshManager({
-    snapshot: () => options.snapshot ?? snapshotWith(),
+    snapshot: () =>
+      typeof options.snapshot === 'function'
+        ? options.snapshot()
+        : (options.snapshot ?? snapshotWith()),
     putItem,
     emit: <K extends AppEventName>(name: K, payload: AppEvents[K]) =>
       void events.push({ name, payload }),
@@ -148,12 +157,15 @@ function setup(
     ...(options.keyboardTimeoutMs !== undefined
       ? { keyboardTimeoutMs: options.keyboardTimeoutMs }
       : {}),
+    ...(options.detectHostOs ? { detectHostOs: options.detectHostOs } : {}),
+    ...(options.vaultRole ? { vaultRole: options.vaultRole } : {}),
+    log,
   });
   const session = async (index = 0) => {
     await vi.waitFor(() => expect(sessions[index]?.hooks).toBeDefined());
     return sessions[index]!;
   };
-  return { manager, sessions, session, events, putItem, confirmHostKey, confirmNewHosts };
+  return { manager, sessions, session, events, putItem, log, confirmHostKey, confirmNewHosts };
 }
 
 afterEach(() => {
@@ -548,5 +560,187 @@ describe('SshManager attaching a page', () => {
     expect(manager.attach(tab.id)).toEqual({ displayReset: false });
     manager.detachAll();
     expect(manager.attach(tab.id)).toEqual({ displayReset: false });
+  });
+});
+
+/** A shell that stays open and drops input. */
+function openShellStream(): ShellStream {
+  return {
+    write: () => undefined,
+    resize: () => undefined,
+    onData: () => () => undefined,
+    onExit: () => () => undefined,
+    close: () => undefined,
+  };
+}
+
+describe('SshManager operating system detection', () => {
+  const snapshotWithOs = (os?: HostOs): ItemSnapshot => {
+    const snap = snapshotWith();
+    const host = snap.lookup.get(HOST_ID)!;
+    const payload = (os ? { ...host, os } : host) as ItemPayload;
+    snap.lookup.set(HOST_ID, payload);
+    snap.records.set(HOST_ID, { vaultId: PERSONAL, itemId: HOST_ID, payload });
+    return snap;
+  };
+
+  /** Open the host, let it sign in and open a shell, with `detected` as the probe's answer. */
+  async function connectWith(
+    detected: HostOs | undefined | Promise<HostOs | undefined>,
+    options: Parameters<typeof setup>[0] = {},
+  ) {
+    const env = setup({ detectHostOs: () => true, vaultRole: () => 'owner', ...options });
+    const opened = env.manager.open(HOST_ID, 80, 24);
+    const s = await env.session();
+    s.openShell.mockImplementation(async () => openShellStream());
+    s.detectOs.mockImplementation(() => Promise.resolve(detected));
+    s.connected.resolve();
+    await vi.waitFor(() =>
+      expect(env.manager.list().find((t) => t.id === opened.id)?.state).toBe('ready'),
+    );
+    return { ...env, s, id: opened.id };
+  }
+
+  it('writes a changed OS once, from main’s copy with its secrets', async () => {
+    const { s, putItem } = await connectWith('ubuntu', { snapshot: snapshotWithOs('debian') });
+    await vi.waitFor(() => expect(putItem).toHaveBeenCalledTimes(1));
+    expect(s.detectOs).toHaveBeenCalledTimes(1);
+    const [vaultId, itemId, draft] = putItem.mock.calls[0] as unknown as [
+      string,
+      string,
+      Record<string, unknown>,
+    ];
+    expect(vaultId).toBe(PERSONAL);
+    expect(itemId).toBe(HOST_ID);
+    expect(draft).toMatchObject({
+      type: 'host',
+      label: 'box',
+      address: 'box.example.com',
+      username: 'me',
+      password: 'pw-SECRET',
+      os: 'ubuntu',
+    });
+    // The client stamps the write time; main does not pass the old one along.
+    expect(draft).not.toHaveProperty('updated_at');
+  });
+
+  it('writes an OS on a host that had none', async () => {
+    const { putItem } = await connectWith('alpine');
+    await vi.waitFor(() => expect(putItem).toHaveBeenCalledTimes(1));
+    expect(putItem.mock.calls[0]).toEqual([
+      PERSONAL,
+      HOST_ID,
+      expect.objectContaining({ os: 'alpine', password: 'pw-SECRET' }),
+    ]);
+  });
+
+  it('writes nothing when the OS is unchanged or unknown', async () => {
+    const same = await connectWith('debian', { snapshot: snapshotWithOs('debian') });
+    await vi.waitFor(() => expect(same.s.detectOs).toHaveBeenCalled());
+    const unknown = await connectWith(undefined, { snapshot: snapshotWithOs('debian') });
+    await vi.waitFor(() => expect(unknown.s.detectOs).toHaveBeenCalled());
+    await new Promise((r) => setTimeout(r, 20));
+    expect(same.putItem).not.toHaveBeenCalled();
+    expect(unknown.putItem).not.toHaveBeenCalled();
+  });
+
+  it('only shows the OS on this device for a viewer, and never writes', async () => {
+    const { manager, putItem, events } = await connectWith('fedora', {
+      vaultRole: () => 'viewer',
+    });
+    await vi.waitFor(() =>
+      expect(events).toContainEqual({
+        name: 'client.items-changed',
+        payload: { vaultId: PERSONAL },
+      }),
+    );
+    expect(putItem).not.toHaveBeenCalled();
+    const host = snapshotWith().records.get(HOST_ID)!;
+    const item = {
+      id: HOST_ID,
+      vaultId: PERSONAL,
+      seq: 1,
+      keyVersion: 1,
+      updatedAt: now,
+      updatedBy: 'u',
+      payload: host.payload,
+    };
+    const shown = manager.displayItems({ vaultId: PERSONAL, items: [item], unreadable: [] });
+    expect(shown.items[0]!.payload).toMatchObject({ type: 'host', os: 'fedora' });
+    // Another vault's item with the same ID is not touched, and the original is not mutated.
+    const other = manager.displayItems({ vaultId: 'other', items: [item], unreadable: [] });
+    expect(other.items[0]!.payload).not.toHaveProperty('os');
+    expect(item.payload).not.toHaveProperty('os');
+    // Signing out forgets it.
+    await manager.closeAll();
+    const after = manager.displayItems({ vaultId: PERSONAL, items: [item], unreadable: [] });
+    expect(after.items[0]!.payload).not.toHaveProperty('os');
+  });
+
+  it('does not detect when the setting is off, or for a quick connect', async () => {
+    const off = await connectWith('ubuntu', { detectHostOs: () => false });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(off.s.detectOs).not.toHaveBeenCalled();
+    expect(off.putItem).not.toHaveBeenCalled();
+
+    const env = setup({ detectHostOs: () => true, vaultRole: () => 'owner' });
+    const opened = env.manager.quickConnect('me@quick.example.com', undefined, 80, 24);
+    const s = await env.session();
+    s.openShell.mockImplementation(async () => openShellStream());
+    s.detectOs.mockResolvedValue('ubuntu');
+    s.connected.resolve();
+    await vi.waitFor(() =>
+      expect(env.manager.list().find((t) => t.id === opened.id)?.state).toBe('ready'),
+    );
+    await new Promise((r) => setTimeout(r, 20));
+    expect(s.detectOs).not.toHaveBeenCalled();
+    expect(env.putItem).not.toHaveBeenCalled();
+  });
+
+  it('never holds up the terminal, and a failing write only reaches the log', async () => {
+    const answer = deferred<HostOs | undefined>();
+    const { putItem, log, manager, id } = await connectWith(answer.promise, {
+      putItem: async () => {
+        throw new Error('offline');
+      },
+    });
+    // The tab is ready while the probe is still out.
+    expect(manager.list().find((t) => t.id === id)?.state).toBe('ready');
+    answer.resolve('arch');
+    await vi.waitFor(() => expect(log).toHaveBeenCalledTimes(1));
+    expect(putItem).toHaveBeenCalledTimes(1);
+    expect(String(log.mock.calls[0]![0])).toContain('offline');
+  });
+
+  it('a vault locked by the time the probe answers writes nothing', async () => {
+    let locked = false;
+    const answer = deferred<HostOs | undefined>();
+    const { putItem, log } = await connectWith(answer.promise, {
+      snapshot: () => {
+        if (locked) throw new Error('The vault is locked');
+        return snapshotWith();
+      },
+    });
+    locked = true;
+    answer.resolve('arch');
+    await vi.waitFor(() => expect(log).toHaveBeenCalledTimes(1));
+    expect(putItem).not.toHaveBeenCalled();
+  });
+
+  it('probes once when several tabs of the host connect together', async () => {
+    const answer = deferred<HostOs | undefined>();
+    const env = setup({ detectHostOs: () => true, vaultRole: () => 'owner' });
+    env.manager.open(HOST_ID, 80, 24);
+    env.manager.open(HOST_ID, 80, 24);
+    for (const index of [0, 1]) {
+      const s = await env.session(index);
+      s.openShell.mockImplementation(async () => openShellStream());
+      s.detectOs.mockImplementation(() => answer.promise);
+      s.connected.resolve();
+    }
+    await vi.waitFor(() => expect(env.manager.list().every((t) => t.state === 'ready')).toBe(true));
+    answer.resolve('nixos');
+    await vi.waitFor(() => expect(env.putItem).toHaveBeenCalledTimes(1));
+    expect(env.sessions.reduce((n, s) => n + s.detectOs.mock.calls.length, 0)).toBe(1);
   });
 });

@@ -10,16 +10,8 @@ import {
   Folder,
 } from 'lucide-react';
 import { useMemo, useState } from 'react';
-import { EntityCard, Tile } from '../cards.js';
-import {
-  byLabel,
-  canWrite,
-  describeHost,
-  type ItemOf,
-  itemsOfType,
-  tileColor,
-  vaultTitle,
-} from '../items.js';
+import { EntityCard, HostTile, Tile } from '../cards.js';
+import { byLabel, canWrite, describeHost, type ItemOf, itemsOfType, vaultTitle } from '../items.js';
 import {
   closeEditor,
   type ItemView,
@@ -190,7 +182,7 @@ export function HostsView() {
         key={host.id}
         testId={`host-${p.label}`}
         selected={selectedId === host.id}
-        tile={<Tile color={tileColor(p.label, p.color)} icon={Server} />}
+        tile={<HostTile label={p.label} color={p.color} os={p.os} />}
         title={<span className="entity-title-text">{p.label}</span>}
         sub={describeHost(p)}
         meta={

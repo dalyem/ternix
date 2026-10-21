@@ -13,7 +13,7 @@ import type { SshManager } from '../ssh/manager.js';
 import type { Handlers } from './dispatch.js';
 import { type PageGate, type SessionNotices, stalePageError } from './pageGate.js';
 import { itemDraftSchema } from './schemas.js';
-import { mergeSecrets, redactItems, redactWrite, secretsOf } from './secrets.js';
+import { keepDetectedOs, mergeSecrets, redactItems, redactWrite, secretsOf } from './secrets.js';
 
 export interface HandlerDeps {
   client: TernixClient;
@@ -88,7 +88,7 @@ export function createHandlers(deps: HandlerDeps): Handlers {
   const allItems = (): ListedVaultItemsDto[] =>
     client.listVaults().map((vault) => {
       try {
-        return redactItems(client.listItems(vault.id));
+        return redactItems(ssh.displayItems(client.listItems(vault.id)));
       } catch {
         return { vaultId: vault.id, items: [], unreadable: [] };
       }
@@ -256,7 +256,9 @@ export function createHandlers(deps: HandlerDeps): Handlers {
       if (draft.type === 'known_host' || stored?.payload.type === 'known_host') {
         throw new AppError('forbidden', 'Known hosts are saved when you accept a host key.');
       }
-      const parsed = itemDraftSchema.safeParse(mergeSecrets(draft, stored?.payload));
+      const parsed = itemDraftSchema.safeParse(
+        keepDetectedOs(mergeSecrets(draft, stored?.payload), stored?.payload),
+      );
       if (!parsed.success) {
         const issue = parsed.error.issues[0];
         const where = issue && issue.path.length > 0 ? ` (${issue.path.join('.')})` : '';

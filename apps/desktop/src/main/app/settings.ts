@@ -13,6 +13,7 @@ import { Serial, writeFileAtomic } from './fsUtil.js';
 export const settingsSchema = z.object({
   autoLockMinutes: z.number().int().min(0).max(MAX_AUTO_LOCK_MINUTES),
   terminalFontSize: z.number().int().min(MIN_FONT_SIZE).max(MAX_FONT_SIZE),
+  detectHostOs: z.boolean(),
 });
 
 export const settingsPatchSchema = settingsSchema.partial().strict();
@@ -35,12 +36,12 @@ export class SettingsStore {
       // Missing or unreadable: defaults.
     }
     const object = stored && typeof stored === 'object' ? (stored as Record<string, unknown>) : {};
-    const next = { ...DEFAULT_SETTINGS };
+    const next: Record<keyof AppSettings, unknown> = { ...DEFAULT_SETTINGS };
     for (const key of Object.keys(DEFAULT_SETTINGS) as (keyof AppSettings)[]) {
       const field = settingsSchema.shape[key].safeParse(object[key]);
       if (field.success) next[key] = field.data;
     }
-    this.current = next;
+    this.current = next as AppSettings;
     return this.get();
   }
 

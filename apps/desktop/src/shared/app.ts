@@ -11,9 +11,18 @@ export interface AppSettings {
   /** Minutes of system idle time before the vault locks; 0 turns auto-lock off. */
   autoLockMinutes: number;
   terminalFontSize: number;
+  /**
+   * After a saved host connects, run one read-only command there to learn its operating system
+   * (for the host's icon) and store it on the host.
+   */
+  detectHostOs: boolean;
 }
 
-export const DEFAULT_SETTINGS: AppSettings = { autoLockMinutes: 15, terminalFontSize: 14 };
+export const DEFAULT_SETTINGS: AppSettings = {
+  autoLockMinutes: 15,
+  terminalFontSize: 14,
+  detectHostOs: true,
+};
 export const MIN_FONT_SIZE = 8;
 export const MAX_FONT_SIZE = 32;
 export const MAX_AUTO_LOCK_MINUTES = 24 * 60;

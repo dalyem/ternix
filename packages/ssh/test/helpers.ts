@@ -100,10 +100,21 @@ export interface TestUser {
   interactive?: { prompts: { prompt: string; echo: boolean }[]; answers: string[] };
 }
 
+/** How the test server answers an `exec` request. */
+export type ExecReply =
+  | 'refuse'
+  /** Accept and never answer, to exercise timeouts. */
+  | 'hang'
+  | { stdout?: string | Buffer; stderr?: string; code?: number };
+
 export interface TestServerOptions {
   users: Record<string, TestUser>;
   hostKey?: KeyPair;
   banner?: string;
+  /** Software and comments of the identification line, after `SSH-2.0-`. */
+  ident?: string;
+  /** Answer `exec` requests; without it they are refused. */
+  exec?: (command: string) => ExecReply;
   /** Never answer authentication requests, to exercise the sign-in timeout. */
   stallAuth?: boolean;
   /**
@@ -138,6 +149,11 @@ export class TestSshServer {
   connections = 0;
   /** Everything typed into any shell. */
   shellInput = '';
+  /** Commands of `exec` requests, with whether a PTY was asked for on that channel. */
+  readonly execs: { command: string; pty: boolean }[] = [];
+  /** Exec channels whose stdin the client ended, and exec channels the client closed. */
+  execStdinEnded = 0;
+  execClosed = 0;
   private readonly dialed = new Set<Socket>();
 
   private constructor(
@@ -157,6 +173,7 @@ export class TestSshServer {
       {
         hostKeys: [hostKey.private],
         ...(options.banner ? { banner: options.banner } : {}),
+        ...(options.ident ? { ident: options.ident } : {}),
         // The server never surfaces keepalive pings, only its debug log does.
         debug: (message: string) => {
           if (message.includes('GLOBAL_REQUEST (keepalive@openssh.com)')) {
@@ -263,9 +280,26 @@ export class TestSshServer {
           this.agentForwardRequests.push(Date.now());
           acceptAgent?.();
         });
+        let pty = false;
         session.on('pty', (acceptPty, _reject, info) => {
+          pty = true;
           this.ptys.push({ term: info.term, cols: info.cols, rows: info.rows });
           acceptPty?.();
+        });
+        session.on('exec', (acceptExec, rejectExec, info) => {
+          this.execs.push({ command: info.command, pty });
+          const reply = options.exec?.(info.command) ?? 'refuse';
+          if (reply === 'refuse') return void rejectExec?.();
+          const stream = acceptExec();
+          stream.on('end', () => (this.execStdinEnded += 1));
+          stream.on('close', () => (this.execClosed += 1));
+          stream.on('error', () => undefined);
+          stream.resume();
+          if (reply === 'hang') return;
+          if (reply.stderr) stream.stderr.write(reply.stderr);
+          if (reply.stdout) stream.write(reply.stdout);
+          stream.exit(reply.code ?? 0);
+          stream.end();
         });
         session.on('window-change', (acceptWindow, _reject, info) => {
           this.windows.push({ cols: info.cols, rows: info.rows });
