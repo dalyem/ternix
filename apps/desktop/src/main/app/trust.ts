@@ -127,7 +127,7 @@ export interface RouteHop {
 const INVISIBLE =
   // eslint-disable-next-line no-control-regex
   /[\u0000-\u001f\u007f-\u009f\u00ad\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/g;
-const visible = (text: string) =>
+export const visible = (text: string) =>
   text.replace(INVISIBLE, (c) => `\\u{${(c.codePointAt(0) ?? 0).toString(16)}}`);
 
 /**

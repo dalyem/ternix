@@ -10,13 +10,15 @@ import { byLabel, itemsOfType, vaultTitle } from './items.js';
 import {
   closeTerminal,
   openEditor,
+  openSftp,
   reconnectTerminal,
   reportError,
+  SFTP_TAB,
   toast,
   useStore,
 } from './store.js';
 import { Badge, Button, EmptyState } from './ui.js';
-import { Braces, Copy, Plus, Search, Waypoints } from 'lucide-react';
+import { Braces, Copy, FolderTree, Plus, Search, Waypoints } from 'lucide-react';
 
 const isMac = navigator.userAgent.includes('Mac');
 const FONT_FAMILY =
@@ -267,6 +269,17 @@ function TerminalPane({
         >
           Forwards{dto.forwards.length > 0 ? ` (${dto.forwards.length})` : ''}
         </Button>
+        {dto.hostId ? (
+          <Button
+            variant="ghost"
+            size="md"
+            icon={FolderTree}
+            title="Browse this host's files in a new SFTP session"
+            onClick={() => void openSftp(dto.hostId!)}
+          >
+            SFTP
+          </Button>
+        ) : null}
         <Button
           variant="ghost"
           size="md"
@@ -476,7 +489,10 @@ export function TerminalHost() {
   const fontSize = useStore((s) => s.settings.terminalFontSize);
   const [panels, setPanels] = useState<Record<string, 'snippets' | 'forwards' | null>>({});
   return (
-    <div className="terminal-host" style={{ display: activeTab ? 'flex' : 'none' }}>
+    <div
+      className="terminal-host"
+      style={{ display: activeTab && activeTab !== SFTP_TAB ? 'flex' : 'none' }}
+    >
       {terminals.map((t) => (
         <TerminalPane
           key={t.id}

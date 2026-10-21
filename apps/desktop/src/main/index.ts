@@ -19,12 +19,13 @@ import {
   EVENT_CHANNEL,
   PAGE_CHANNEL,
   RPC_CHANNEL,
+  SFTP_DROP_CHANNEL,
   TERMINAL_CHANNEL_PREFIX,
   type RpcResult,
 } from '../shared/ipc.js';
 import { AutoLock } from './app/autoLock.js';
 import { deriveKeysInWorker } from './app/derive.js';
-import { AppError } from './app/errors.js';
+import { AppError, errorToDto } from './app/errors.js';
 import { installMenu } from './app/menu.js';
 import { handleAppScheme, registerAppScheme } from './app/protocol.js';
 import { QuitGuard } from './app/quit.js';
@@ -44,10 +45,11 @@ import {
 import { JsonFileCacheStore, TernixClient } from './client/index.js';
 import { createDispatcher } from './ipc/dispatch.js';
 import { createHandlers } from './ipc/handlers.js';
-import { PageGate, SessionNotices } from './ipc/pageGate.js';
-import { rpcSchemas } from './ipc/schemas.js';
+import { PageGate, SessionNotices, stalePageError } from './ipc/pageGate.js';
+import { rpcSchemas, sftpDropSchema } from './ipc/schemas.js';
 import { snapshotItems } from './ssh/items.js';
 import { SshManager } from './ssh/manager.js';
+import { SftpManager } from './ssh/sftp.js';
 
 const MAX_KEY_FILE_BYTES = 256 * 1024;
 /** How long quitting waits for SSH sessions to close, and then for the cache to be written. */
@@ -158,6 +160,53 @@ async function start(): Promise<void> {
     log: (message) => console.warn(`[ternix] ${message}`),
   });
 
+  // Every local path the SFTP browser reads or writes comes from these dialogs (or a drop).
+  const sftp = new SftpManager({
+    ssh,
+    emit,
+    isUnlocked: () => client.state === 'unlocked',
+    platform: process.platform,
+    messageBox,
+    pickUploads: async (kind) => {
+      const options: Electron.OpenDialogOptions = {
+        title: kind === 'folder' ? 'Upload folder' : 'Upload files',
+        buttonLabel: 'Upload',
+        properties:
+          kind === 'folder'
+            ? ['openDirectory']
+            : ['openFile', 'multiSelections', 'showHiddenFiles'],
+      };
+      const result = mainWindow
+        ? await dialog.showOpenDialog(mainWindow, options)
+        : await dialog.showOpenDialog(options);
+      return result.canceled ? [] : result.filePaths;
+    },
+    pickDownloadFile: async (defaultName) => {
+      const options: Electron.SaveDialogOptions = {
+        title: 'Download',
+        buttonLabel: 'Download',
+        defaultPath: join(app.getPath('downloads'), defaultName),
+        properties: ['showOverwriteConfirmation', 'createDirectory'],
+      };
+      const result = mainWindow
+        ? await dialog.showSaveDialog(mainWindow, options)
+        : await dialog.showSaveDialog(options);
+      return result.canceled || !result.filePath ? null : result.filePath;
+    },
+    pickDownloadFolder: async () => {
+      const options: Electron.OpenDialogOptions = {
+        title: 'Download to folder',
+        buttonLabel: 'Download here',
+        defaultPath: app.getPath('downloads'),
+        properties: ['openDirectory', 'createDirectory'],
+      };
+      const result = mainWindow
+        ? await dialog.showOpenDialog(mainWindow, options)
+        : await dialog.showOpenDialog(options);
+      return result.canceled ? null : (result.filePaths[0] ?? null);
+    },
+  });
+
   /** Keys are gone when this returns; the promise settles once pending cache writes are stored. */
   const lockVault = (): Promise<void> => {
     if (client.state !== 'unlocked') return Promise.resolve();
@@ -194,6 +243,7 @@ async function start(): Promise<void> {
     client,
     settings,
     ssh,
+    sftp,
     secrets,
     serverAddress,
     notices,
@@ -246,23 +296,46 @@ async function start(): Promise<void> {
     event.returnValue = ours ? pages.issue() : 0;
   });
 
-  ipcMain.handle(RPC_CHANNEL, async (event, page: unknown, method: unknown, arg: unknown) => {
-    // Only our own window, top frame, showing our own page, may call in.
+  /** Only our own window, top frame, showing our own page, may call in. */
+  const fromOurPage = (event: Electron.IpcMainInvokeEvent): boolean => {
     const frame = event.senderFrame;
-    const trusted =
+    return (
       mainWindow !== null &&
       event.sender === mainWindow.webContents &&
       frame !== null &&
       frame === event.sender.mainFrame &&
-      isAppUrl(frame.url, appUrls());
-    if (!trusted) {
-      const denied: RpcResult<never> = {
-        ok: false,
-        error: { name: 'AppError', code: 'forbidden', message: 'Request refused' },
-      };
-      return denied;
-    }
+      isAppUrl(frame.url, appUrls())
+    );
+  };
+  const denied: RpcResult<never> = {
+    ok: false,
+    error: { name: 'AppError', code: 'forbidden', message: 'Request refused' },
+  };
+
+  ipcMain.handle(RPC_CHANNEL, async (event, page: unknown, method: unknown, arg: unknown) => {
+    if (!fromOurPage(event)) return denied;
     return dispatch(page, method, arg);
+  });
+
+  // Dropped files: the preload sends their paths (page scripts only hand it `File` objects).
+  ipcMain.handle(SFTP_DROP_CHANNEL, async (event, page: unknown, arg: unknown) => {
+    if (!fromOurPage(event)) return denied;
+    if (!pages.isCurrent(page)) {
+      return { ok: false, error: errorToDto(stalePageError()) } satisfies RpcResult<never>;
+    }
+    const parsed = sftpDropSchema.safeParse(arg);
+    if (!parsed.success) {
+      return {
+        ok: false,
+        error: { name: 'ValidationError', code: 'invalid_input', message: 'Invalid drop' },
+      } satisfies RpcResult<never>;
+    }
+    try {
+      const { id, remoteDir, paths } = parsed.data;
+      return { ok: true, value: await sftp.uploadDropped(id, remoteDir, paths) };
+    } catch (err) {
+      return { ok: false, error: errorToDto(err) } satisfies RpcResult<never>;
+    }
   });
 
   const openWindow = () => {

@@ -5,6 +5,8 @@ import type { AuthenticationType, Connection, ServerChannel } from 'ssh2';
 import { itemPayloadSchema } from '@ternix/core/items';
 import type { ItemPayload, ItemPayloadInput } from '@ternix/core/items';
 import type { ResolvedConnection } from '../src/index.js';
+import { serveSftp } from './sftpServer.js';
+import type { SftpServerLog, SftpServerOptions } from './sftpServer.js';
 
 const { Server, utils } = ssh2;
 
@@ -124,6 +126,8 @@ export interface TestServerOptions {
    * return undefined to refuse. Lets a test pretend a host is only reachable through this server.
    */
   route?: (host: string, port: number) => { host: string; port: number } | undefined;
+  /** Serve the SFTP subsystem from a real directory; without it, SFTP is refused. */
+  sftp?: SftpServerOptions;
 }
 
 /** An in-process SSH server on 127.0.0.1 that records what clients do. */
@@ -160,6 +164,8 @@ export class TestSshServer {
   /** Exec channels whose stdin the client ended, and exec channels the client closed. */
   execStdinEnded = 0;
   execClosed = 0;
+  /** One log per SFTP channel the server accepted. */
+  readonly sftpSessions: SftpServerLog[] = [];
   private readonly dialed = new Set<Socket>();
 
   private constructor(
@@ -327,6 +333,10 @@ export class TestSshServer {
         session.on('shell', (acceptShell) => {
           if (agent) this.agentForwardChannels.push('shell');
           this.runShell(acceptShell());
+        });
+        session.on('sftp', (acceptSftp, rejectSftp) => {
+          if (!options.sftp) return void rejectSftp?.();
+          this.sftpSessions.push(serveSftp(acceptSftp(), options.sftp));
         });
       });
 

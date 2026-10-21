@@ -10,7 +10,17 @@ export type SshErrorCode =
   | 'timeout'
   | 'channel_failed'
   | 'forward_failed'
-  | 'closed';
+  | 'closed'
+  /** SFTP: the path does not exist. */
+  | 'not_found'
+  /** SFTP: the server refused the operation on this path. */
+  | 'permission_denied'
+  /** SFTP: something is already there (an upload that may not overwrite, a new folder). */
+  | 'already_exists'
+  /** SFTP: any other failure the server reported; `message` has its text. */
+  | 'sftp_failed'
+  /** A transfer or operation the caller aborted. */
+  | 'cancelled';
 
 export interface SshErrorOptions {
   /** Index into the hop list (jump hosts first, target last), when the failure belongs to one hop. */

@@ -5,6 +5,7 @@ import {
   Cloud,
   CloudOff,
   FingerprintPattern,
+  FolderTree,
   KeyRound,
   Layers,
   Loader,
@@ -21,7 +22,15 @@ import { type ReactNode, useEffect, useLayoutEffect, useRef, useState } from 're
 import type { HostOs } from '@ternix/core/items';
 import { itemsOfType, vaultTitle } from '../items.js';
 import { OsGlyph } from '../osIcons.js';
-import { closeTerminal, type NavView, reportError, setState, useStore } from '../store.js';
+import {
+  closeTerminal,
+  type NavView,
+  reportError,
+  setState,
+  SFTP_TAB,
+  showSftp,
+  useStore,
+} from '../store.js';
 import { Badge, ConfirmDialog, RoleBadge } from '../ui.js';
 import { TerminalHost } from '../terminal.js';
 import { ItemEditor } from '../editors/index.js';
@@ -29,6 +38,7 @@ import { ForwardsView, KeychainView, KnownHostsView, SnippetsView } from './List
 import { HostsView } from './Hosts.js';
 import { SettingsView } from './Settings.js';
 import { SharingView } from './Sharing.js';
+import { SftpView } from './Sftp.js';
 import { call } from '../api.js';
 
 const NAV: { id: NavView; label: string; icon: typeof Server }[] = [
@@ -208,9 +218,11 @@ function TitleBar() {
       : 'Offline: showing saved data';
   const vaultCount = filter === 'all' ? vaults.length : 1;
   const initial = (account?.user.name ?? '?').trim().charAt(0).toUpperCase();
+  const sftpCount = useStore((s) => s.sftpSessions.length);
+  const onTerminal = activeTab !== null && activeTab !== SFTP_TAB;
 
   return (
-    <header className="titlebar" data-terminal={activeTab !== null ? '' : undefined}>
+    <header className="titlebar" data-terminal={onTerminal ? '' : undefined}>
       <div className="tab-scroll" ref={scroller} role="tablist" aria-label="Tabs">
         <div className="vault-tab">
           <button
@@ -236,6 +248,17 @@ function TitleBar() {
             <ChevronDown size={14} aria-hidden />
           </button>
         </div>
+        <button
+          role="tab"
+          aria-selected={activeTab === SFTP_TAB}
+          className={`tab tab-sftp ${activeTab === SFTP_TAB ? 'active' : ''}`}
+          onClick={() => showSftp()}
+          data-testid="sftp-tab"
+        >
+          <FolderTree size={14} aria-hidden />
+          <span>SFTP</span>
+          {sftpCount > 0 ? <span className="tab-count">{sftpCount}</span> : null}
+        </button>
         {terminals.map((t) => {
           const host = t.hostId ? itemById.get(t.hostId)?.payload : undefined;
           const os = host?.type === 'host' ? host.os : undefined;
@@ -380,6 +403,7 @@ export function Shell({ locked }: { locked: boolean }) {
         {locked || activeTab !== null ? null : <Sidebar />}
         <main className="main">
           {locked ? null : <Views />}
+          {locked || activeTab !== SFTP_TAB ? null : <SftpView />}
           <TerminalHost />
         </main>
         {locked ? null : <ItemEditor />}

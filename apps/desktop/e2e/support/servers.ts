@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import ssh2 from 'ssh2';
 import { OS_PROBE_COMMAND } from '@ternix/ssh';
+import { serveSftp } from '../../../../packages/ssh/test/sftpServer.js';
 
 const { Server, utils } = ssh2;
 
@@ -194,12 +195,15 @@ interface FakeSshd {
 
 /**
  * An `ssh2` server with a tiny fake shell (password auth, `echo`, `exit`) and port forwarding.
- * `exec` is refused, except the OS probe when `probeOutput` is set: then it prints that.
+ * `exec` is refused, except the OS probe when `probeOutput` is set: then it prints that. With
+ * `sftpRoot`, the SFTP subsystem serves that directory as `/` (the same server the
+ * `@ternix/ssh` tests use); without it, SFTP is refused.
  */
 async function startFakeSshd(
   port: number,
   authorizedKeys: readonly ssh2.ParsedKey[],
   probeOutput?: string,
+  sftpRoot?: string,
 ): Promise<FakeSshd> {
   const hostKey = utils.generateKeyPairSync('ed25519');
   const wire = (utils.parseKey(hostKey.public) as ssh2.ParsedKey).getPublicSSH();
@@ -244,6 +248,10 @@ async function startFakeSshd(
         const session = accept();
         session.on('pty', (acceptPty) => acceptPty?.());
         session.on('window-change', (acceptResize) => acceptResize?.());
+        session.on('sftp', (acceptSftp, rejectSftp) => {
+          if (sftpRoot === undefined) return void rejectSftp?.();
+          serveSftp(acceptSftp(), { root: sftpRoot });
+        });
         session.on('exec', (acceptExec, rejectExec, info) => {
           if (probeOutput === undefined || info.command !== OS_PROBE_COMMAND) {
             return void rejectExec?.();
@@ -308,6 +316,8 @@ export async function startSshTarget(
   options: {
     /** What the fake server prints for the OS probe (ignored for a real sshd). */
     probeOutput?: string;
+    /** A directory the fake server's SFTP serves as `/` (ignored for a real sshd). */
+    sftpRoot?: string;
   } = {},
 ): Promise<SshTarget> {
   const external = process.env['E2E_SSH_ADDRESS'];
@@ -332,7 +342,7 @@ export async function startSshTarget(
   const pair = utils.generateKeyPairSync('ed25519', { comment: 'e2e' });
   // Shared with every restart of the server, so keys authorized later survive a host key rotation.
   const authorized = [utils.parseKey(pair.public) as ssh2.ParsedKey];
-  let current = await startFakeSshd(port, authorized, options.probeOutput);
+  let current = await startFakeSshd(port, authorized, options.probeOutput, options.sftpRoot);
   const target: SshTarget = {
     address: '127.0.0.1',
     port,
@@ -348,7 +358,7 @@ export async function startSshTarget(
     },
     rotateHostKey: async () => {
       await current.stop();
-      current = await startFakeSshd(port, authorized, options.probeOutput);
+      current = await startFakeSshd(port, authorized, options.probeOutput, options.sftpRoot);
       target.fingerprint = current.fingerprint;
     },
     stop: () => current.stop(),

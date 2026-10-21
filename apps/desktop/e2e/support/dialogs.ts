@@ -123,3 +123,71 @@ export async function answerDialog(
   );
   return shown;
 }
+
+/**
+ * Main's open and save dialogs (SFTP uploads and downloads) cannot be clicked either. Replace
+ * them with stubs that answer from a queue the test fills with `answerFileDialog`; a dialog with
+ * no queued answer is cancelled. Every request is recorded for `askedFileDialogs`.
+ */
+export async function stubFileDialogs(app: ElectronApplication): Promise<void> {
+  await app.evaluate(({ dialog }) => {
+    interface FileDialogs {
+      answers: string[][];
+      asked: { kind: 'open' | 'save'; title: string; properties: string[] }[];
+    }
+    const state: FileDialogs = { answers: [], asked: [] };
+    (globalThis as unknown as { __ternixFileDialogs: FileDialogs }).__ternixFileDialogs = state;
+    const optionsOf = (args: unknown[]) =>
+      (args.length > 1 ? args[1] : args[0]) as {
+        title?: string;
+        properties?: string[];
+      };
+    dialog.showOpenDialog = (async (...args: unknown[]) => {
+      const options = optionsOf(args);
+      state.asked.push({
+        kind: 'open',
+        title: options.title ?? '',
+        properties: options.properties ?? [],
+      });
+      const paths = state.answers.shift();
+      return { canceled: !paths, filePaths: paths ?? [] };
+    }) as typeof dialog.showOpenDialog;
+    dialog.showSaveDialog = (async (...args: unknown[]) => {
+      const options = optionsOf(args);
+      state.asked.push({
+        kind: 'save',
+        title: options.title ?? '',
+        properties: options.properties ?? [],
+      });
+      const paths = state.answers.shift();
+      return paths?.[0]
+        ? { canceled: false, filePath: paths[0] }
+        : { canceled: true, filePath: '' };
+    }) as typeof dialog.showSaveDialog;
+  });
+}
+
+/** The paths the next open or save dialog answers with (a save dialog uses the first). */
+export async function answerFileDialog(app: ElectronApplication, paths: string[]): Promise<void> {
+  await app.evaluate((_electron, answer) => {
+    (
+      globalThis as unknown as { __ternixFileDialogs: { answers: string[][] } }
+    ).__ternixFileDialogs.answers.push(answer);
+  }, paths);
+}
+
+/** Every open or save dialog main showed so far. */
+export function askedFileDialogs(
+  app: ElectronApplication,
+): Promise<{ kind: 'open' | 'save'; title: string; properties: string[] }[]> {
+  return app.evaluate(
+    () =>
+      (
+        globalThis as unknown as {
+          __ternixFileDialogs: {
+            asked: { kind: 'open' | 'save'; title: string; properties: string[] }[];
+          };
+        }
+      ).__ternixFileDialogs.asked,
+  );
+}

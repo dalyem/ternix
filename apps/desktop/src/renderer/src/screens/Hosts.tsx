@@ -1,6 +1,7 @@
 import {
   Eye,
   FolderOpen,
+  FolderTree,
   FolderPlus,
   Pencil,
   Play,
@@ -17,6 +18,7 @@ import {
   type ItemView,
   openEditor,
   openHost,
+  openSftp,
   quickConnect,
   useStore,
 } from '../store.js';
@@ -205,6 +207,15 @@ export function HostsView() {
               onClick={() => {
                 closeEditor();
                 void openHost(host.id);
+              }}
+            />
+            <IconButton
+              icon={FolderTree}
+              label="Open SFTP"
+              size="sm"
+              onClick={() => {
+                closeEditor();
+                void openSftp(host.id);
               }}
             />
             <IconButton

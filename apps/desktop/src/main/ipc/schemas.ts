@@ -1,3 +1,4 @@
+import { isAbsolute } from 'node:path';
 import { z, type ZodType, type ZodTypeDef } from 'zod';
 import {
   groupPayloadSchema,
@@ -35,6 +36,18 @@ const terminalSize = {
   cols: z.number().int().min(1).max(1000),
   rows: z.number().int().min(1).max(1000),
 };
+
+/** A path on the SFTP server: any POSIX path but NUL, bounded. */
+const remotePath = z
+  .string()
+  .min(1)
+  .max(4096)
+  .refine((value) => !value.includes('\0'), 'Paths cannot contain NUL');
+const absoluteRemotePath = remotePath.refine(
+  (value) => value.startsWith('/'),
+  'Remote paths must be absolute',
+);
+const remotePaths = z.array(absoluteRemotePath).min(1).max(10_000);
 
 const none = z.undefined();
 const obj = <T extends z.ZodRawShape>(shape: T) => z.object(shape).strict();
@@ -189,4 +202,37 @@ export const rpcSchemas: Schemas = {
   }),
   'ssh.forward.start': obj({ id, forwardId: id }),
   'ssh.forward.stop': obj({ id, forwardId: id }),
+
+  'sftp.list': none,
+  'sftp.open': obj({ hostId: id }),
+  'sftp.reconnect': obj({ id }),
+  'sftp.close': obj({ id }),
+  'sftp.readdir': obj({ id, path: remotePath }),
+  'sftp.mkdir': obj({ id, path: absoluteRemotePath }),
+  'sftp.rename': obj({ id, from: absoluteRemotePath, to: absoluteRemotePath }),
+  'sftp.remove': obj({ id, paths: remotePaths }),
+  'sftp.upload': obj({ id, remoteDir: absoluteRemotePath, kind: z.enum(['files', 'folder']) }),
+  'sftp.download': obj({ id, paths: remotePaths }),
+  'sftp.transfers': none,
+  'sftp.cancelTransfer': obj({ transferId: id }),
+  'sftp.clearTransfers': none,
 };
+
+/**
+ * Paths of files dropped on the SFTP browser (`SFTP_DROP_CHANNEL`). Only the preload sends these;
+ * main still checks that each is an absolute local path.
+ */
+export const sftpDropSchema = obj({
+  id,
+  remoteDir: absoluteRemotePath,
+  paths: z
+    .array(
+      z
+        .string()
+        .min(1)
+        .max(4096)
+        .refine((value) => !value.includes('\0') && isAbsolute(value), 'Not an absolute path'),
+    )
+    .min(1)
+    .max(1000),
+});
