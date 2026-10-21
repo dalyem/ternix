@@ -6,6 +6,8 @@ import type {
   CreatedInviteDto,
   DeviceDto,
   ErrorDto,
+  GeneratedKeyDto,
+  GenerateKeyInput,
   InviteDto,
   ItemDraftInput,
   ItemSecretsDto,
@@ -147,6 +149,11 @@ export interface RpcMethods {
     ListedWriteResultDto
   >;
   'items.delete': Rpc<{ vaultId: string; itemId: string }, ListedWriteResultDto>;
+  /**
+   * Generate an SSH key in main (the private key never reaches the renderer) and save it as an
+   * `ssh_key` item. Returns the redacted item with its public key and fingerprint.
+   */
+  'keys.generate': Rpc<GenerateKeyInput, GeneratedKeyDto>;
 
   'ssh.list': Rpc<void, TerminalDto[]>;
   'ssh.open': Rpc<{ hostId: string; cols: number; rows: number }, TerminalDto>;

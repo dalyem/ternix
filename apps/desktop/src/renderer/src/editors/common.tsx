@@ -192,6 +192,7 @@ export function ItemSelect<T extends ItemType>({
   exclude,
   disabled,
   noneLabel = 'None',
+  create,
 }: {
   label: string;
   type: T;
@@ -202,6 +203,8 @@ export function ItemSelect<T extends ItemType>({
   exclude?: ReadonlySet<string>;
   disabled?: boolean;
   noneLabel?: string;
+  /** An action under the picker, for example "Generate new key…". Hidden when disabled. */
+  create?: { label: string; onClick: () => void };
 }) {
   const items = useStore((s) => s.items);
   const vaultById = useStore((s) => s.vaultById);
@@ -214,37 +217,46 @@ export function ItemSelect<T extends ItemType>({
   const foreign = selected && selected.vaultId !== targetVaultId;
   const targetVault = vaultById.get(targetVaultId);
   return (
-    <Field
-      label={label}
-      hint={
-        dangling ? (
-          'This item was deleted or is not readable; it is treated as unset.'
-        ) : foreign && targetVault?.kind === 'shared' ? (
-          <span className="warn">
-            Lives in {vaultTitle(vaultById.get(selected.vaultId))}. Other members of{' '}
-            {vaultTitle(targetVault)} who cannot read that vault will not see it.
-          </span>
-        ) : undefined
-      }
-    >
-      {(id) => (
-        <select
-          id={id}
-          value={value}
-          disabled={disabled}
-          onChange={(e) => onChange(e.target.value)}
-        >
-          <option value="">{noneLabel}</option>
-          {dangling ? <option value={value}>(missing item)</option> : null}
-          {options.map((i) => (
-            <option key={i.id} value={i.id}>
-              {labelOf(i.payload)}
-              {vaultCount > 1 ? ` — ${vaultTitle(vaultById.get(i.vaultId))}` : ''}
-            </option>
-          ))}
-        </select>
-      )}
-    </Field>
+    <>
+      <Field
+        label={label}
+        hint={
+          dangling ? (
+            'This item was deleted or is not readable; it is treated as unset.'
+          ) : foreign && targetVault?.kind === 'shared' ? (
+            <span className="warn">
+              Lives in {vaultTitle(vaultById.get(selected.vaultId))}. Other members of{' '}
+              {vaultTitle(targetVault)} who cannot read that vault will not see it.
+            </span>
+          ) : undefined
+        }
+      >
+        {(id) => (
+          <select
+            id={id}
+            value={value}
+            disabled={disabled}
+            onChange={(e) => onChange(e.target.value)}
+          >
+            <option value="">{noneLabel}</option>
+            {dangling ? <option value={value}>(missing item)</option> : null}
+            {options.map((i) => (
+              <option key={i.id} value={i.id}>
+                {labelOf(i.payload)}
+                {vaultCount > 1 ? ` — ${vaultTitle(vaultById.get(i.vaultId))}` : ''}
+              </option>
+            ))}
+          </select>
+        )}
+      </Field>
+      {create && !disabled ? (
+        <div className="field-action">
+          <Button variant="quiet" size="sm" onClick={create.onClick}>
+            {create.label}
+          </Button>
+        </div>
+      ) : null}
+    </>
   );
 }
 

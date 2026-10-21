@@ -25,6 +25,16 @@ export {
   preferredHostKeyAlgorithms,
 } from './knownHosts.js';
 export type { HostKeyCheck, HostKeyStatus, NewKnownHost } from './knownHosts.js';
+export {
+  ECDSA_BITS,
+  RSA_BITS,
+  cleanComment,
+  describePrivateKey,
+  fingerprintOfPublicKey,
+  generateSshKey,
+  samePublicKey,
+} from './keys.js';
+export type { GenerateKeyOptions, GeneratedKey, KeyInfo, KeySpec } from './keys.js';
 export { SshSession, defaultAgentPath } from './session.js';
 export {
   OS_PROBE_COMMAND,

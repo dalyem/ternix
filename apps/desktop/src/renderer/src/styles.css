@@ -1866,3 +1866,19 @@ input.narrow {
 .toast-info > svg {
   color: var(--blue-light);
 }
+
+/* ---------- Generated keys ---------- */
+.contents {
+  display: contents;
+}
+.field-action {
+  margin: -8px 0 12px 2px;
+}
+.public-key-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: -4px 0 14px;
+  font-size: 12px;
+}

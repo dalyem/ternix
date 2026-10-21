@@ -113,3 +113,24 @@ channel is closed) and the probe gives up after 5 s. The output is untrusted: on
 `KEY=value` lines with plain or simply quoted values count. When the probe is refused, times out
 or says nothing, the identification line decides; when neither knows, the result is `undefined`.
 The command runs on the remote host and shows up in its logs like any other `ssh host command`.
+
+## Generating keys
+
+`generateSshKey({ spec, comment, passphrase })` makes an OpenSSH key pair (Ed25519 by default;
+`{ type: 'rsa', bits }` with 2048, 3072 or 4096, default 4096; `{ type: 'ecdsa', bits }` with 256,
+384 or 521, default 256) and returns `{ privateKey, publicKey, keyType, fingerprint }`: the PEM,
+the `authorized_keys` line (with the comment), the SSH algorithm name and the `SHA256:...`
+fingerprint. The key search runs on libuv's thread pool, so a 4096-bit RSA key does not block the
+event loop. A passphrase encrypts the private key with aes256-ctr and 16 bcrypt rounds, as
+`ssh-keygen` does.
+
+ssh2's generator now and then returns an Ed25519 key its own `parseKey` rejects (about 1 in 256:
+it strips every leading zero byte of the public key, so a public key that starts with `0x00` is one
+byte short). So every draw is read back before it is returned: the private key must parse with the
+passphrase, be of the requested type, and sign data that the public line verifies. A draw that
+fails is thrown away and drawn again; sixteen failures in a row throw `SshError('invalid_key')`.
+
+`describePrivateKey(privateKey, passphrase?)` gives the same `{ keyType, publicKey, fingerprint }`
+for a key that already exists (OpenSSH or PEM; the comment is the one stored in the key) and throws
+`SshError` `invalid_key`, `passphrase_required` or `bad_passphrase`. `samePublicKey` and
+`fingerprintOfPublicKey` work on `authorized_keys` lines.

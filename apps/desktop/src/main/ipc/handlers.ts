@@ -12,8 +12,16 @@ import { confirmMember, type MemberAction, type MessageBox } from '../app/trust.
 import type { SshManager } from '../ssh/manager.js';
 import type { Handlers } from './dispatch.js';
 import { type PageGate, type SessionNotices, stalePageError } from './pageGate.js';
+import { generateKeyDraft, withPublicKey } from './keys.js';
 import { itemDraftSchema } from './schemas.js';
-import { keepDetectedOs, mergeSecrets, redactItems, redactWrite, secretsOf } from './secrets.js';
+import {
+  keepDetectedOs,
+  mergeSecrets,
+  redactItem,
+  redactItems,
+  redactWrite,
+  secretsOf,
+} from './secrets.js';
 
 export interface HandlerDeps {
   client: TernixClient;
@@ -259,7 +267,10 @@ export function createHandlers(deps: HandlerDeps): Handlers {
         throw new AppError('forbidden', 'Known hosts are saved when you accept a host key.');
       }
       const parsed = itemDraftSchema.safeParse(
-        keepDetectedOs(mergeSecrets(draft, stored?.payload), stored?.payload),
+        withPublicKey(
+          keepDetectedOs(mergeSecrets(draft, stored?.payload), stored?.payload),
+          stored?.payload,
+        ),
       );
       if (!parsed.success) {
         const issue = parsed.error.issues[0];
@@ -273,6 +284,38 @@ export function createHandlers(deps: HandlerDeps): Handlers {
     },
     'items.delete': async ({ vaultId, itemId }) =>
       redactWrite(await client.deleteItem(vaultId, itemId)),
+    'keys.generate': async (input) => {
+      // Generation takes a while (RSA 4096 seconds): the page, the session and the account
+      // must still be the ones that asked when the key is ready to be saved.
+      const page = deps.pages.issue();
+      const accountId = client.account?.user.id;
+      const vault = client.getVault(input.vaultId);
+      if (vault.error !== null || vault.role === 'viewer') {
+        throw new AppError('forbidden', 'You cannot add keys to this vault.');
+      }
+      const { key, draft } = await generateKeyDraft(input);
+      if (
+        !deps.pages.isCurrent(page) ||
+        client.state !== 'unlocked' ||
+        client.account?.user.id !== accountId
+      ) {
+        throw new AppError(
+          'cancelled',
+          'The session changed while the key was generated; it was not saved.',
+        );
+      }
+      const parsed = itemDraftSchema.parse(draft);
+      const written = await client.putItem(input.vaultId, undefined, parsed);
+      if (written.status !== 'saved' || !written.item) {
+        throw new AppError('conflict', 'The key could not be saved. Try again.');
+      }
+      return {
+        item: redactItem(written.item),
+        keyType: key.keyType,
+        publicKey: key.publicKey,
+        fingerprint: key.fingerprint,
+      };
+    },
 
     'ssh.list': async () => ssh.list(),
     'ssh.open': async ({ hostId, cols, rows }) => ssh.open(hostId, cols, rows),

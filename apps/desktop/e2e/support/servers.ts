@@ -177,6 +177,8 @@ export interface SshTarget {
   fingerprint: string | undefined;
   /** In-process server only: a key pair whose public half the server accepts for `username`. */
   userKey: { privateKey: string; publicKey: string } | undefined;
+  /** In-process server only: also accept this OpenSSH public key line for `username`. */
+  authorizeKey(publicKey: string): void;
   /** In-process server only: restart on the same port with a different host key. */
   rotateHostKey(): Promise<void>;
   stop(): Promise<void>;
@@ -196,10 +198,9 @@ interface FakeSshd {
  */
 async function startFakeSshd(
   port: number,
-  authorizedKey: string,
+  authorizedKeys: readonly ssh2.ParsedKey[],
   probeOutput?: string,
 ): Promise<FakeSshd> {
-  const allowed = utils.parseKey(authorizedKey) as ssh2.ParsedKey;
   const hostKey = utils.generateKeyPairSync('ed25519');
   const wire = (utils.parseKey(hostKey.public) as ssh2.ParsedKey).getPublicSSH();
   const fingerprint = `SHA256:${createHash('sha256').update(wire).digest('base64').replace(/=+$/, '')}`;
@@ -212,10 +213,11 @@ async function startFakeSshd(
       if (ctx.method === 'password' && ctx.username === USERNAME && ctx.password === PASSWORD) {
         ctx.accept();
       } else if (ctx.method === 'publickey' && ctx.username === USERNAME) {
-        const sameKey =
-          ctx.key.algo === allowed.type &&
-          Buffer.compare(ctx.key.data, allowed.getPublicSSH()) === 0;
-        if (!sameKey) return ctx.reject(['password']);
+        const allowed = authorizedKeys.find(
+          (key) =>
+            ctx.key.algo === key.type && Buffer.compare(ctx.key.data, key.getPublicSSH()) === 0,
+        );
+        if (!allowed) return ctx.reject(['password']);
         // Without a signature the client only asks whether the key would be accepted.
         if (
           ctx.signature &&
@@ -317,6 +319,9 @@ export async function startSshTarget(
       password: process.env['E2E_SSH_PASSWORD'] ?? '',
       fingerprint: undefined,
       userKey: undefined,
+      authorizeKey: () => {
+        throw new Error('A real sshd cannot authorize a key from the test');
+      },
       rotateHostKey: async () => {
         throw new Error('A real sshd cannot rotate its host key from the test');
       },
@@ -325,7 +330,9 @@ export async function startSshTarget(
   }
   const port = await freePort();
   const pair = utils.generateKeyPairSync('ed25519', { comment: 'e2e' });
-  let current = await startFakeSshd(port, pair.public, options.probeOutput);
+  // Shared with every restart of the server, so keys authorized later survive a host key rotation.
+  const authorized = [utils.parseKey(pair.public) as ssh2.ParsedKey];
+  let current = await startFakeSshd(port, authorized, options.probeOutput);
   const target: SshTarget = {
     address: '127.0.0.1',
     port,
@@ -333,9 +340,15 @@ export async function startSshTarget(
     password: PASSWORD,
     fingerprint: current.fingerprint,
     userKey: { privateKey: pair.private, publicKey: pair.public },
+    authorizeKey: (publicKey) => {
+      const key = utils.parseKey(publicKey.trim());
+      const first = Array.isArray(key) ? key[0] : key;
+      if (!first || first instanceof Error) throw new Error('Not an OpenSSH public key line');
+      authorized.push(first);
+    },
     rotateHostKey: async () => {
       await current.stop();
-      current = await startFakeSshd(port, pair.public, options.probeOutput);
+      current = await startFakeSshd(port, authorized, options.probeOutput);
       target.fingerprint = current.fingerprint;
     },
     stop: () => current.stop(),

@@ -18,6 +18,7 @@ import {
   secretDraft,
   useSecret,
 } from './common.js';
+import { GenerateKeyDialog, PublicKeyMeta } from './keys.js';
 
 const COLORS = ['', ...TILE_COLORS];
 
@@ -66,6 +67,7 @@ function HostEditor({ target }: { target: EditorTarget }) {
   const password = useSecret(target, 'password');
   const [identityId, setIdentityId] = useState(h?.identity_id ?? '');
   const [keyId, setKeyId] = useState(h?.key_id ?? '');
+  const [generatingKey, setGeneratingKey] = useState(false);
   const [jumpId, setJumpId] = useState(h?.jump_host_id ?? '');
   const [snippetId, setSnippetId] = useState(h?.startup_snippet_id ?? '');
   const [keepalive, setKeepalive] = useState(
@@ -208,7 +210,15 @@ function HostEditor({ target }: { target: EditorTarget }) {
               onChange={setKeyId}
               targetVaultId={vaultId}
               disabled={readOnly}
+              create={{ label: 'Generate new key…', onClick: () => setGeneratingKey(true) }}
             />
+            {generatingKey ? (
+              <GenerateKeyDialog
+                vaultId={vaultId}
+                onClose={() => setGeneratingKey(false)}
+                onGenerated={setKeyId}
+              />
+            ) : null}
           </FormCard>
           <FormCard title="Advanced">
             <ItemSelect
@@ -369,6 +379,7 @@ function IdentityEditor({ target }: { target: EditorTarget }) {
   const [username, setUsername] = useState(i?.username ?? '');
   const password = useSecret(target, 'password');
   const [keyId, setKeyId] = useState(i?.key_id ?? '');
+  const [generatingKey, setGeneratingKey] = useState(false);
   return (
     <EditorFrame
       target={target}
@@ -411,7 +422,15 @@ function IdentityEditor({ target }: { target: EditorTarget }) {
               onChange={setKeyId}
               targetVaultId={vaultId}
               disabled={readOnly}
+              create={{ label: 'Generate new key…', onClick: () => setGeneratingKey(true) }}
             />
+            {generatingKey ? (
+              <GenerateKeyDialog
+                vaultId={vaultId}
+                onClose={() => setGeneratingKey(false)}
+                onGenerated={setKeyId}
+              />
+            ) : null}
           </FormCard>
         </>
       )}
@@ -501,13 +520,20 @@ function KeyEditor({ target }: { target: EditorTarget }) {
             />
           </FormCard>
           <FormCard title="Public key">
-            <TextField
+            <TextArea
               label="Public key (optional)"
               value={publicKey}
               onChange={setPublicKey}
               disabled={readOnly}
-              spellCheck={false}
+              mono
+              rows={3}
+              hint={
+                publicKey.trim() === ''
+                  ? 'Leave empty to fill it in from the private key when you save.'
+                  : undefined
+              }
             />
+            <PublicKeyMeta publicKey={publicKey} />
           </FormCard>
         </>
       )}

@@ -10,7 +10,13 @@ import {
 } from '@ternix/core/items';
 import { publicKeySchema, uuidSchema, vaultRoleSchema } from '@ternix/core/protocol';
 import type { RpcMethodName, RpcMethods } from '../../shared/ipc.js';
-import type { ItemDraft, ItemDraftInput } from '../../shared/types.js';
+import {
+  ECDSA_KEY_BITS,
+  RSA_KEY_BITS,
+  type GenerateKeyInput,
+  type ItemDraft,
+  type ItemDraftInput,
+} from '../../shared/types.js';
 import { settingsPatchSchema } from '../app/settings.js';
 
 /**
@@ -65,6 +71,27 @@ export const itemDraftInputSchema: ZodType<ItemDraftInput, ZodTypeDef, unknown> 
     portForwardPayloadSchema.omit({ updated_at: true }),
     knownHostPayloadSchema.omit({ updated_at: true }),
   ]);
+
+const keyBase = {
+  vaultId: id,
+  label: name,
+  comment: text(200).optional(),
+  passphrase: z.string().min(1).max(1024).optional(),
+};
+const sizes = <T extends readonly [number, ...number[]]>(allowed: T, fallback: T[number]) =>
+  z
+    .custom<T[number]>((value) => allowed.includes(value as number), 'Unsupported key size')
+    .default(fallback);
+
+/** `keys.generate`: Ed25519 unless `type` says otherwise; only the sizes the UI offers. */
+const generateKeySchema: ZodType<GenerateKeyInput, ZodTypeDef, unknown> = z.discriminatedUnion(
+  'type',
+  [
+    obj({ ...keyBase, type: z.literal('ed25519').optional() }),
+    obj({ ...keyBase, type: z.literal('rsa'), bits: sizes(RSA_KEY_BITS, 4096) }),
+    obj({ ...keyBase, type: z.literal('ecdsa'), bits: sizes(ECDSA_KEY_BITS, 256) }),
+  ],
+);
 
 type Schemas = {
   [K in RpcMethodName]: ZodType<RpcMethods[K]['in'], ZodTypeDef, unknown>;
@@ -142,6 +169,7 @@ export const rpcSchemas: Schemas = {
   'items.reveal': obj({ vaultId: id, itemId: id }),
   'items.put': obj({ vaultId: id, itemId: id.optional(), draft: itemDraftInputSchema }),
   'items.delete': obj({ vaultId: id, itemId: id }),
+  'keys.generate': generateKeySchema,
 
   'ssh.list': none,
   'ssh.open': obj({ hostId: id, ...terminalSize }),

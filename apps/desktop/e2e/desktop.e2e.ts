@@ -482,6 +482,138 @@ test('packaged app: setup, register, host, host key, terminal, forwards, snippet
     await expectTerminalLine(page, 'keyauth');
   });
 
+  await test.step('a pasted private key gets its public key from main', async () => {
+    if (!target.userKey) return;
+    await page.getByRole('tab', { name: 'Vaults' }).click();
+    await nav(page, /^Keychain/).click();
+    await page
+      .locator('.entity-card', { hasText: 'e2e-key' })
+      .getByRole('button', { name: 'Edit' })
+      .click();
+    const editor = page.getByRole('region', { name: /Edit SSH key/ });
+    await expect(editor.getByLabel('Public key (optional)')).toHaveValue(
+      target.userKey.publicKey.trim(),
+    );
+    await expect(editor.locator('.public-key-meta .fingerprint')).toHaveText(/^SHA256:/);
+    await editor.getByRole('button', { name: 'Cancel' }).click();
+  });
+
+  await test.step('generate a passphrase-protected key in the Keychain; its public key signs in', async () => {
+    if (!target.userKey) return; // the real sshd cannot be told to accept a new key
+    const passphrase = 'gen-pass-8c1f';
+    await page.getByRole('tab', { name: 'Vaults' }).click();
+    await nav(page, /^Keychain/).click();
+    await page.getByRole('button', { name: 'Generate key' }).click();
+    const form = page.getByRole('dialog', { name: 'Generate SSH key' });
+    await form.getByLabel('Name', { exact: true }).fill('gen-key');
+    await form.getByLabel('Passphrase (optional)').fill(passphrase);
+    await form.getByLabel('Repeat passphrase').fill(`${passphrase}x`);
+    await expect(form.getByRole('button', { name: 'Generate' })).toBeDisabled();
+    await form.getByLabel('Repeat passphrase').fill(passphrase);
+    await form.getByRole('button', { name: 'Generate' }).click();
+
+    const done = page.getByRole('dialog', { name: 'Key generated' });
+    await expect(done).toBeVisible({ timeout: 30_000 });
+    const publicKey = await done.getByLabel('Public key').inputValue();
+    expect(publicKey).toMatch(/^ssh-ed25519 \S+ gen-key$/);
+    const fingerprint = (await done.locator('.fingerprint').textContent()) ?? '';
+    expect(fingerprint).toMatch(/^SHA256:[A-Za-z0-9+/]{43}$/);
+    await done.getByRole('button', { name: 'Copy public key' }).click();
+    expect(await app.evaluate(({ clipboard }) => clipboard.readText())).toBe(publicKey);
+
+    // Neither the private key nor the passphrase ever reached the page.
+    const text = await pageText(page);
+    expect(text).not.toContain('PRIVATE KEY');
+    expect(text).not.toContain(passphrase);
+    const listed = JSON.stringify(await invoke(page, 'items.all'));
+    expect(listed).toContain('"has_private_key":true');
+    expect(listed).not.toContain('PRIVATE KEY');
+    expect(listed).not.toContain(passphrase);
+    await done.getByRole('button', { name: 'Done' }).click();
+    await expect(done).toHaveCount(0);
+
+    const card = page.locator('.entity-card', { hasText: 'gen-key' });
+    await expect(card).toContainText('Ed25519 · Passphrase protected');
+    await card.getByRole('button', { name: 'Edit' }).click();
+    const editor = page.getByRole('region', { name: /Edit SSH key/ });
+    await expect(editor.getByLabel('Public key (optional)')).toHaveValue(publicKey);
+    // The editor works the fingerprint out from the line itself; it matches main's.
+    await expect(editor.locator('.public-key-meta .fingerprint')).toHaveText(fingerprint);
+    await editor.getByRole('button', { name: 'Cancel' }).click();
+
+    target.authorizeKey(publicKey);
+    await nav(page, /^Hosts/).click();
+    await page.getByTestId('new-host').click();
+    await page.getByLabel('Label', { exact: true }).fill('gen-box');
+    await page.getByLabel('Address', { exact: true }).fill(target.address);
+    await page.getByLabel('Port', { exact: true }).fill(String(target.port));
+    await page.getByLabel('Username', { exact: true }).fill(target.username);
+    await page.getByLabel('SSH key').selectOption({ label: 'gen-key' });
+    await page.getByRole('button', { name: 'Save' }).click();
+    await page.getByTestId('host-gen-box').getByRole('button', { name: 'Connect' }).click();
+    await expect(page.getByTestId('terminal-tab')).toHaveCount(4);
+    await expectConnected(page);
+    await typeInTerminal(page, "echo gen''auth");
+    await expectTerminalLine(page, 'genauth');
+  });
+
+  await test.step('generate a key from the host editor’s key picker and connect with it', async () => {
+    if (!target.userKey) return;
+    await page.getByRole('tab', { name: 'Vaults' }).click();
+    await nav(page, /^Hosts/).click();
+    await page.getByTestId('new-host').click();
+    await page.getByLabel('Label', { exact: true }).fill('picker-box');
+    await page.getByLabel('Address', { exact: true }).fill(target.address);
+    await page.getByLabel('Port', { exact: true }).fill(String(target.port));
+    await page.getByLabel('Username', { exact: true }).fill(target.username);
+
+    // Escape closes the dialog and leaves the editor open.
+    await page.getByRole('button', { name: 'Generate new key…' }).click();
+    const form = page.getByRole('dialog', { name: 'Generate SSH key' });
+    await expect(form).toBeVisible();
+    await page.keyboard.press('Escape');
+    await expect(form).toHaveCount(0);
+    await expect(page.getByRole('region', { name: 'New host' })).toBeVisible();
+
+    await page.getByRole('button', { name: 'Generate new key…' }).click();
+    await form.getByLabel('Name', { exact: true }).fill('picker-key');
+    await form.getByLabel('Type').selectOption('ecdsa');
+    await form.getByLabel('Curve').selectOption('384');
+    // Enter in the dialog generates the key; it does not save the host behind it.
+    await form.getByLabel('Name', { exact: true }).press('Enter');
+    const done = page.getByRole('dialog', { name: 'Key generated' });
+    await expect(done).toBeVisible({ timeout: 30_000 });
+    const publicKey = await done.getByLabel('Public key').inputValue();
+    expect(publicKey).toMatch(/^ecdsa-sha2-nistp384 \S+ picker-key$/);
+    target.authorizeKey(publicKey);
+    await done.getByRole('button', { name: 'Done' }).click();
+    await expect(page.getByTestId('host-picker-box')).toHaveCount(0);
+
+    // The new key is selected in the picker.
+    await expect(page.getByLabel('SSH key').locator('option:checked')).toHaveText('picker-key');
+    await page.getByRole('button', { name: 'Save' }).click();
+    await page.getByTestId('host-picker-box').getByRole('button', { name: 'Connect' }).click();
+    await expect(page.getByTestId('terminal-tab')).toHaveCount(5);
+    await expectConnected(page);
+    await typeInTerminal(page, "echo pick''auth");
+    await expectTerminalLine(page, 'pickauth');
+  });
+
+  await test.step('keys.generate rejects bad requests in main', async () => {
+    const vaultId = '3f1c9a52-8e6b-4d0a-9b7e-0a1b2c3d4e5f';
+    for (const arg of [
+      { vaultId, label: 'k', type: 'rsa', bits: 512 },
+      { vaultId, label: 'k', type: 'dsa' },
+      { vaultId, label: 'k', privateKey: 'x' },
+      { vaultId, label: '' },
+    ]) {
+      expect(await invoke(page, 'keys.generate', arg)).toMatchObject({
+        ok: false,
+        error: { code: 'invalid_input' },
+      });
+    }
+  });
+
   await test.step('locking unmounts editors and drops revealed secrets', async () => {
     const body = 'LOCKTEST-SECRET-KEY-BODY';
     await page.getByRole('tab', { name: 'Vaults' }).click();

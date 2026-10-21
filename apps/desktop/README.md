@@ -106,6 +106,22 @@ typecheck test` covers everything that does not need the Electron binary).
   the stored value, `null` or `''` clears it (see `ItemDraftInput` in `src/shared/types.ts`).
   `known_host` items cannot be created or changed through `items.put` (only deleted); main
   writes them after the host-key dialog.
+- **Generating SSH keys.** Keychain → "Generate key", and "Generate new key…" under the SSH key
+  picker of the host and identity editors (which selects the new key). `keys.generate` runs in
+  main: it draws an Ed25519 (default), RSA (2048, 3072 or 4096 bits; 4096 by default) or ECDSA
+  (P-256, P-384, P-521) key with `@ternix/ssh` (`src/keys.ts`) off the event loop, optionally
+  encrypts it with a passphrase (aes256-ctr, 16 bcrypt rounds, as `ssh-keygen` does), checks that
+  it parses back and that the private key signs what the public line verifies, and saves it as an
+  `ssh_key` item in the chosen vault. The renderer gets the redacted item plus the public line and
+  the SHA256 fingerprint, shows them with a Copy button, and never sees the private key or the
+  passphrase. A generation that outlives its page, session or account saves nothing (`cancelled`).
+  ssh2's generator emits about one Ed25519 key in 256 that its own parser rejects (it strips every
+  leading zero byte of the public key), which is why the read-back check exists: such a draw is
+  discarded and drawn again. A private key saved without a public key (pasted or imported, with its
+  passphrase if it has one) gets its public line derived in main; a stored public key that belongs
+  to another key (the private key was replaced) is replaced; a key main cannot read is saved as
+  before. Key editors and the Keychain show the key type, the public key, its fingerprint and a
+  Copy button.
 - **Locking.** The vault locks on the auto-lock timeout (settings, default 15 minutes of system
   idle time via `powerMonitor.getSystemIdleTime`), when the computer suspends, when the screen
   locks, from "Lock now", and when the window is closed (macOS keeps the app running).
@@ -187,6 +203,7 @@ The renderer is untrusted: anything it can do, an XSS in it could do. So:
 | Opening a link from a terminal needs http(s) and a native confirmation                                                         | `shell.openLink` in `src/main/index.ts` (`openLink`)                                        |
 | Host keys, adding members, accepting and verifying member keys: answered in main's native dialog, default deny; no IPC answer  | `src/main/app/trust.ts`, `ssh/manager.ts`, `ipc/handlers.ts`                                |
 | Item lists carry no secret fields; one item at a time through `items.reveal`; untouched secrets kept on edit                   | `src/main/ipc/secrets.ts`, `handlers.ts`                                                    |
+| SSH keys are generated in main; the renderer gets the public key and fingerprint, never the private key or passphrase          | `keys.generate` in `handlers.ts`, `src/main/ipc/keys.ts`, `packages/ssh/src/keys.ts`        |
 | `known_host` items written only by main after the host-key dialog                                                              | `items.put` in `handlers.ts`                                                                |
 | `server.probe`, `server.remember`, `auth.login`, `auth.register` only while signed out, never from a page logging out          | `choosingServer` in `handlers.ts`, `src/main/app/serverAddress.ts`                          |
 | Leaving a session reloads the window; requests from the page before the reload are refused (`stale_page`)                      | `src/main/ipc/pageGate.ts`, `PAGE_CHANNEL` in `src/preload/index.ts`                        |
@@ -306,7 +323,7 @@ during registration (through a proxy that swaps the key), the sign-in form shows
 with "Back". Native dialogs are answered through `e2e/support/dialogs.ts`, which replaces
 `dialog.showMessageBox` in the main process through the Node inspector (only the e2e package
 has that fuse on; the app has no hook for it). It also covers sharing (the verified/unverified badges and
-the mark-verified flow) and a malicious server: the test rewrites a member's `public_key` in
+the mark-verified flow), generating keys (a passphrase-protected Ed25519 key from the Keychain and an ECDSA key from the host editor's picker; the in-process SSH server is told to accept each public key through `target.authorizeKey`, and the app connects with it) and a malicious server: the test rewrites a member's `public_key` in
 the server's SQLite database and checks that removal and rotation open the key change dialog,
 send nothing until the new fingerprint is accepted, and then go through. By default the SSH server is an in-process `ssh2` server
 with a fake shell; set `E2E_SSH_ADDRESS`, `E2E_SSH_PORT`, `E2E_SSH_USER` and `E2E_SSH_PASSWORD`

@@ -5,6 +5,7 @@ import {
   IdCard,
   KeyRound,
   Pencil,
+  Sparkles,
   Trash2,
   Waypoints,
 } from 'lucide-react';
@@ -22,6 +23,7 @@ import {
 } from '../items.js';
 import { type ItemView, openEditor, reportError, toast, useStore } from '../store.js';
 import { Badge, Button, ConfirmDialog, EmptyState, IconButton } from '../ui.js';
+import { GenerateKeyDialog, keyTypeName } from '../editors/keys.js';
 import { useCreateVault } from './Hosts.js';
 
 function useScoped(): ItemView[] {
@@ -128,6 +130,7 @@ export function KeychainView() {
   const identities = itemsOfType(visible, 'identity').sort(byLabel);
   const keys = itemsOfType(visible, 'ssh_key').sort(byLabel);
   const vaultArg = createVault ? { vaultId: createVault } : {};
+  const [generating, setGenerating] = useState(false);
   return (
     <ListFrame
       emptyIcon={KeyRound}
@@ -143,6 +146,9 @@ export function KeychainView() {
           >
             New SSH key
           </Button>
+          <Button size="md" icon={Sparkles} onClick={() => setGenerating(true)}>
+            Generate key
+          </Button>
           <Button
             size="md"
             variant="ghost"
@@ -151,6 +157,9 @@ export function KeychainView() {
           >
             New identity
           </Button>
+          {generating ? (
+            <GenerateKeyDialog vaultId={createVault} onClose={() => setGenerating(false)} />
+          ) : null}
         </>
       }
     >
@@ -162,7 +171,14 @@ export function KeychainView() {
               item={k}
               type="ssh_key"
               tile={<Tile icon={KeyRound} />}
-              sub={k.payload.has_passphrase ? 'Passphrase protected' : 'No passphrase'}
+              sub={
+                <>
+                  {keyTypeName(k.payload.public_key)
+                    ? `${keyTypeName(k.payload.public_key)} · `
+                    : ''}
+                  {k.payload.has_passphrase ? 'Passphrase protected' : 'No passphrase'}
+                </>
+              }
             />
           ))}
         </Section>
