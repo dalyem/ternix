@@ -58,7 +58,7 @@ import type {
 } from '../../shared/types.js';
 import { CoalescingCacheStore, type CoalescingOptions } from './coalescing.js';
 import { TypedEmitter } from './emitter.js';
-import { VaultEngine } from './engine.js';
+import { type PutItemOptions, type SkippedWriteDto, VaultEngine } from './engine.js';
 import {
   CancelledError,
   isApiError,
@@ -89,7 +89,12 @@ import type { CacheStore, SecretStore } from './stores.js';
 export * from './errors.js';
 export { CoalescingCacheStore, type CoalescingOptions, DEFAULT_COALESCING } from './coalescing.js';
 export { type KeyPin, PinStore } from './pins.js';
-export { chunkBatch, MAX_ROTATION_ATTEMPTS } from './engine.js';
+export {
+  chunkBatch,
+  MAX_ROTATION_ATTEMPTS,
+  type PutItemOptions,
+  type SkippedWriteDto,
+} from './engine.js';
 export type { FetchLike } from './http.js';
 export type {
   RealtimeOptions,
@@ -1027,8 +1032,24 @@ export class TernixClient {
   }
 
   /** Create (`itemId` undefined) or update an item. Needs the server. */
-  putItem(vaultId: string, itemId: string | undefined, draft: ItemDraft): Promise<WriteResultDto> {
-    return this.requireEngine().putItem(vaultId, itemId, draft);
+  putItem(vaultId: string, itemId: string | undefined, draft: ItemDraft): Promise<WriteResultDto>;
+  /** A background update of an item; see `PutItemOptions`. */
+  putItem(
+    vaultId: string,
+    itemId: string,
+    draft: ItemDraft,
+    options: PutItemOptions,
+  ): Promise<WriteResultDto | SkippedWriteDto>;
+  putItem(
+    vaultId: string,
+    itemId: string | undefined,
+    draft: ItemDraft,
+    options?: PutItemOptions,
+  ): Promise<WriteResultDto | SkippedWriteDto> {
+    const engine = this.requireEngine();
+    return options && itemId !== undefined
+      ? engine.putItem(vaultId, itemId, draft, options)
+      : engine.putItem(vaultId, itemId, draft);
   }
 
   deleteItem(vaultId: string, itemId: string): Promise<WriteResultDto> {

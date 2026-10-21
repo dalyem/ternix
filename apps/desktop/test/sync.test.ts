@@ -211,6 +211,82 @@ describe('client conflict rule', () => {
   });
 });
 
+describe('background writes', () => {
+  async function stale() {
+    const a = await registerUser(server, { realtime: false });
+    const b = await loginUser(server, a.email, a.password, { realtime: false });
+    const vaultId = a.personalVaultId;
+    const created = await a.client.putItem(vaultId, undefined, snippet('original'));
+    await b.client.sync();
+    return { a, b, vaultId, id: created.item!.id, seq: created.item!.seq };
+  }
+
+  it('updates the version it was built from and keeps its updated_at', async () => {
+    const { a, vaultId, id, seq } = await stale();
+    const before = a.client.getItem(vaultId, id)!.payload;
+    a.clock.offsetMs = HOUR;
+    const res = await a.client.putItem(vaultId, id, snippet('tagged'), {
+      background: { baseSeq: seq },
+    });
+    expect(res.status).toBe('saved');
+    const after = a.client.getItem(vaultId, id)!;
+    expect(labelOf(after)).toBe('tagged');
+    expect(after.payload.updated_at).toBe(before.updated_at);
+  });
+
+  it('is skipped on a conflict, without a retry, and leaves the newer version alone', async () => {
+    const { a, b, vaultId, id, seq } = await stale();
+    await b.client.putItem(vaultId, id, snippet('from b'));
+    a.clock.offsetMs = HOUR; // would win the conflict rule as a normal write
+    const puts = a.spy.count('PUT', `/items/${id}`);
+    const res = await a.client.putItem(vaultId, id, snippet('background'), {
+      background: { baseSeq: seq },
+    });
+    expect(res).toEqual({ id, status: 'skipped', item: null });
+    expect(a.spy.count('PUT', `/items/${id}`)).toBe(puts + 1);
+    // This device learned the server's version; the server still has B's.
+    expect(labelOf(a.client.getItem(vaultId, id))).toBe('from b');
+    await b.client.sync();
+    expect(labelOf(b.client.getItem(vaultId, id))).toBe('from b');
+  });
+
+  it('is skipped on a tombstone and never revives the item', async () => {
+    const { a, b, vaultId, id, seq } = await stale();
+    await b.client.deleteItem(vaultId, id);
+    a.clock.offsetMs = HOUR;
+    const res = await a.client.putItem(vaultId, id, snippet('background'), {
+      background: { baseSeq: seq },
+    });
+    expect(res.status).toBe('skipped');
+    expect(a.client.getItem(vaultId, id)).toBeNull();
+    await b.client.sync();
+    expect(b.client.getItem(vaultId, id)).toBeNull();
+    // Once this device knows of the delete, nothing is sent at all.
+    const puts = a.spy.count('PUT', `/items/${id}`);
+    expect(
+      (await a.client.putItem(vaultId, id, snippet('again'), { background: { baseSeq: seq } }))
+        .status,
+    ).toBe('skipped');
+    expect(a.spy.count('PUT', `/items/${id}`)).toBe(puts);
+  });
+
+  it('sends nothing for a version this device has moved past, or an item it does not have', async () => {
+    const { a, b, vaultId, id, seq } = await stale();
+    await b.client.putItem(vaultId, id, snippet('from b'));
+    await a.client.sync();
+    const before = a.spy.calls.length;
+    const moved = await a.client.putItem(vaultId, id, snippet('x'), {
+      background: { baseSeq: seq },
+    });
+    const missing = await a.client.putItem(vaultId, crypto.randomUUID(), snippet('x'), {
+      background: { baseSeq: 1 },
+    });
+    expect([moved.status, missing.status]).toEqual(['skipped', 'skipped']);
+    expect(a.spy.calls.length).toBe(before);
+    expect(labelOf(a.client.getItem(vaultId, id))).toBe('from b');
+  });
+});
+
 describe('batch import', () => {
   it('imports more than MAX_BATCH_OPS items in chunks', async () => {
     const a = await registerUser(server, { realtime: false });

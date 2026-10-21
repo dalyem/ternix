@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { isIP } from 'node:net';
 import {
   type HostOs,
+  hostOsSchema,
   hostPayloadSchema,
   type ItemPayload,
   type KnownHostPayload,
@@ -40,7 +41,20 @@ import { parseQuickTarget } from './quick.js';
 export interface SshManagerDeps {
   /** Decrypted items of every readable vault; throws when the vault is locked. */
   snapshot(): ItemSnapshot;
-  putItem(vaultId: string, itemId: string | undefined, draft: ItemDraft): Promise<unknown>;
+  /**
+   * Create or update an item. `background` marks a write main makes by itself (the detected
+   * OS): the client's `PutItemOptions.background`, which never wins a conflict.
+   */
+  putItem(
+    vaultId: string,
+    itemId: string | undefined,
+    draft: ItemDraft,
+    options?: { background: { baseSeq: number } },
+  ): Promise<unknown>;
+  /** Fetch a vault's newest items from the server. When absent, the snapshot is used as it is. */
+  pullVault?: (vaultId: string) => Promise<void>;
+  /** Who is signed in (server and user ID), or undefined when nobody is. */
+  accountId?: () => string | undefined;
   emit<K extends AppEventName>(name: K, payload: AppEvents[K]): void;
   /** Terminal output for the renderer; false when no window is there to receive it. */
   sendTerminal(id: string, data: Uint8Array): boolean;
@@ -117,6 +131,28 @@ interface Terminal {
   rows: number;
 }
 
+/** Where a connection went: the host item's address (trimmed, lowercased) and port. */
+interface Destination {
+  address: string;
+  port: number;
+}
+
+const destinationOf = (address: string, port: number): Destination => ({
+  address: address.trim().toLowerCase(),
+  port,
+});
+
+const sameDestination = (a: Destination, b: Destination) =>
+  a.address === b.address && a.port === b.port;
+
+/** An operating system detected on a host this account may only read. */
+interface OsOverride {
+  account: string | undefined;
+  vaultId: string;
+  destination: Destination;
+  os: HostOs;
+}
+
 /** A question waiting for the user, bound to the connection attempt that asked it. */
 type Pending =
   | {
@@ -170,9 +206,12 @@ export class SshManager {
   private readonly detecting = new Set<string>();
   /**
    * Operating systems detected on hosts this account may not write (viewer): shown on this device
-   * only, never synced. Keyed by host item ID.
+   * only, never synced, and only to the account that detected them while the host still points
+   * where it was detected. Keyed by host item ID.
    */
-  private readonly osOverrides = new Map<string, { vaultId: string; os: HostOs }>();
+  private readonly osOverrides = new Map<string, OsOverride>();
+  /** Bumped when the account changes: detections started before then are dropped. */
+  private accountEpoch = 0;
 
   constructor(private readonly deps: SshManagerDeps) {}
 
@@ -277,19 +316,37 @@ export class SshManager {
   }
 
   async closeAll(): Promise<void> {
-    // Called on sign-out too: the next account must not see this one's local overrides.
-    this.osOverrides.clear();
+    this.forgetAccount();
     await Promise.all([...this.terminals.keys()].map((id) => this.close(id)));
+  }
+
+  /**
+   * The account is leaving (sign-out, expiry, revocation, another sign-in): forget the OS shown
+   * to it alone, and drop detections still running for it. Terminals are not touched.
+   */
+  forgetAccount(): void {
+    this.accountEpoch++;
+    this.osOverrides.clear();
   }
 
   /** A vault's items as this device shows them: hosts carry an OS detected for a viewer. */
   displayItems(vault: VaultItemsDto): VaultItemsDto {
     if (this.osOverrides.size === 0) return vault;
+    const account = this.deps.accountId?.();
     return {
       ...vault,
       items: vault.items.map((item) => {
         const override = this.osOverrides.get(item.id);
-        if (!override || override.vaultId !== vault.vaultId || item.payload.type !== 'host') {
+        if (
+          !override ||
+          override.account !== account ||
+          override.vaultId !== vault.vaultId ||
+          item.payload.type !== 'host' ||
+          !sameDestination(
+            override.destination,
+            destinationOf(item.payload.address, item.payload.port),
+          )
+        ) {
           return item;
         }
         return { ...item, payload: { ...item.payload, os: override.os } };
@@ -512,6 +569,8 @@ export class SshManager {
       if (current()) this.fail(t, err);
       return;
     }
+    // Where this attempt goes, for OS detection; no credentials.
+    const target = { address: settings.address, port: settings.port };
     t.label = settings.label;
     t.target = `${settings.username}@${settings.address}:${settings.port}`;
     t.specs = new Map(settings.portForwards.map((p) => [p.id, p]));
@@ -659,7 +718,9 @@ export class SshManager {
       });
       this.pump(t);
       this.publish(t);
-      if (t.source.kind === 'host') this.detectOs(t.source.hostId, session);
+      if (t.source.kind === 'host') {
+        this.detectOs(t.source.hostId, session, live, destinationOf(target.address, target.port));
+      }
     } catch (err) {
       // Signed in but no shell (or any other late failure): end this attempt's connection,
       // its prompts and its output before the tab reads closed.
@@ -674,14 +735,29 @@ export class SshManager {
 
   /**
    * Learn the host's operating system in the background, once the shell is open: nothing waits
-   * for it and failures only reach the log.
+   * for it and failures only reach the log. The answer is used only while this attempt is still
+   * the tab's, the account is the same, and the host item still points where it connected.
    */
-  private detectOs(hostId: string, session: SshSession): void {
+  private detectOs(
+    hostId: string,
+    session: SshSession,
+    live: () => boolean,
+    destination: Destination,
+  ): void {
     if (!this.deps.detectHostOs?.() || this.detecting.has(hostId)) return;
     this.detecting.add(hostId);
+    const epoch = this.accountEpoch;
+    const account = this.deps.accountId?.();
+    const stillValid = () =>
+      live() && this.accountEpoch === epoch && this.deps.accountId?.() === account;
     void session
       .detectOs()
-      .then((os) => (os ? this.recordOs(hostId, os) : undefined))
+      .then((detected) => {
+        // The engine parses untrusted output; only a value of the closed list goes further.
+        const os = hostOsSchema.safeParse(detected);
+        if (!os.success || !stillValid()) return undefined;
+        return this.recordOs(hostId, os.data, { account, destination, stillValid });
+      })
       .catch((err: unknown) =>
         this.deps.log?.(
           `Could not record the operating system of host ${hostId}: ${errMessage(err)}`,
@@ -692,27 +768,57 @@ export class SshManager {
 
   /**
    * Store a detected operating system on the host item when it differs from the stored one: one
-   * normal write from main's own decrypted copy (secrets included; the renderer is not involved).
-   * Someone who may not write the vault sees it on this device only.
+   * background write built from the newest copy of the item, pulled first (secrets included; the
+   * renderer is not involved). It never overrides another write: when the item changed in the
+   * meantime it is skipped, and the next connection tries again. Someone who may not write the
+   * vault sees it on this device only.
    */
-  private async recordOs(hostId: string, os: HostOs): Promise<void> {
-    const record = this.deps.snapshot().records.get(hostId);
-    if (record?.payload.type !== 'host') return;
+  private async recordOs(
+    hostId: string,
+    os: HostOs,
+    context: { account: string | undefined; destination: Destination; stillValid: () => boolean },
+  ): Promise<void> {
+    const before = this.deps.snapshot().records.get(hostId);
+    if (before?.payload.type !== 'host') return;
+    const role = this.deps.vaultRole?.(before.vaultId);
+    const writer = role === 'owner' || role === 'editor';
+    if (writer) await this.deps.pullVault?.(before.vaultId);
+    if (!context.stillValid()) return;
+    const record = writer ? this.deps.snapshot().records.get(hostId) : before;
+    if (record?.payload.type !== 'host' || record.vaultId !== before.vaultId) return;
     const { vaultId, payload } = record;
+    // The host now points somewhere else: what was detected is not about it.
+    if (!sameDestination(context.destination, destinationOf(payload.address, payload.port))) {
+      return;
+    }
     if (payload.os === os) {
       if (this.osOverrides.delete(hostId)) this.deps.emit('client.items-changed', { vaultId });
       return;
     }
-    const role = this.deps.vaultRole?.(vaultId);
-    if (role !== 'owner' && role !== 'editor') {
-      if (this.osOverrides.get(hostId)?.os === os) return;
-      this.osOverrides.set(hostId, { vaultId, os });
+    if (!writer) {
+      const existing = this.osOverrides.get(hostId);
+      if (
+        existing?.os === os &&
+        existing.account === context.account &&
+        existing.vaultId === vaultId &&
+        sameDestination(existing.destination, context.destination)
+      ) {
+        return;
+      }
+      this.osOverrides.set(hostId, {
+        account: context.account,
+        vaultId,
+        destination: context.destination,
+        os,
+      });
       this.deps.emit('client.items-changed', { vaultId });
       return;
     }
     this.osOverrides.delete(hostId);
     const { updated_at: _stamp, ...draft } = payload;
-    await this.deps.putItem(vaultId, hostId, { ...draft, os } as ItemDraft);
+    await this.deps.putItem(vaultId, hostId, { ...draft, os } as ItemDraft, {
+      background: { baseSeq: record.seq },
+    });
   }
 
   /**

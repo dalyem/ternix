@@ -57,6 +57,7 @@ import type {
   WriteResultDto,
 } from '../../shared/types.js';
 import {
+  ApiError,
   isApiError,
   MemberKeyChangedError,
   OfflineError,
@@ -74,6 +75,26 @@ import type { CacheStore } from './stores.js';
 const MAX_WRITE_ATTEMPTS = 5;
 /** Rotation attempts (each refreshes members and items) before `RotationError`. */
 export const MAX_ROTATION_ATTEMPTS = 5;
+
+/** Options of `putItem`. */
+export interface PutItemOptions {
+  /**
+   * A write the app makes by itself (a detected host OS), never one a person asked for. It
+   * updates the item only while it is still at `baseSeq`, the version the draft was made from,
+   * and keeps that version's `updated_at`, so an edit a person makes on any device wins the
+   * conflict rule against it. It never creates an item or revives a deleted one, and it is not
+   * retried: a `409` of any kind (conflict, tombstone, key version) leaves the server as it is
+   * and returns `{status: 'skipped'}`.
+   */
+  background: { baseSeq: number };
+}
+
+/** A background write that was not made (see `PutItemOptions.background`). */
+export interface SkippedWriteDto {
+  id: string;
+  status: 'skipped';
+  item: null;
+}
 const MAX_VAULT_NAME_LENGTH = 200;
 
 export interface EngineDeps {
@@ -696,7 +717,18 @@ export class VaultEngine {
   }
 
   /** One PUT or DELETE with conflict handling. */
-  private async writeOne(vaultId: string, w: PendingWrite): Promise<WriteResultDto> {
+  private async writeOne(vaultId: string, w: PendingWrite): Promise<WriteResultDto>;
+  /** A background put: a `409` of any kind skips the write instead of applying the rule. */
+  private async writeOne(
+    vaultId: string,
+    w: PendingWrite,
+    background: true,
+  ): Promise<WriteResultDto | SkippedWriteDto>;
+  private async writeOne(
+    vaultId: string,
+    w: PendingWrite,
+    background = false,
+  ): Promise<WriteResultDto | SkippedWriteDto> {
     const { http } = this.deps;
     let refreshedForKey = false;
     for (let attempt = 0; attempt < MAX_WRITE_ATTEMPTS; attempt++) {
@@ -720,6 +752,15 @@ export class VaultEngine {
         }
         outcome = { item, status: 'saved', payload: w.payload ?? null };
       } catch (err) {
+        if (background && err instanceof ApiError && err.status === 409) {
+          // Learn the newer version the server has; the write itself is not made.
+          const local = this.vaults.get(vaultId);
+          if (err.current && !this.closed && local && this.applyItem(local, err.current)) {
+            this.persistItems(local);
+            this.deps.emit('items-changed', { vaultId });
+          }
+          return { id: w.id, status: 'skipped', item: null };
+        }
         if (isApiError(err, 'conflict') && err.current) {
           const decision = await this.decide(vaultId, w, err.current);
           if (decision.retry) {
@@ -764,9 +805,24 @@ export class VaultEngine {
     vaultId: string,
     itemId: string | undefined,
     draft: ItemDraft,
-  ): Promise<WriteResultDto> {
+  ): Promise<WriteResultDto>;
+  async putItem(
+    vaultId: string,
+    itemId: string,
+    draft: ItemDraft,
+    options: PutItemOptions,
+  ): Promise<WriteResultDto | SkippedWriteDto>;
+  async putItem(
+    vaultId: string,
+    itemId: string | undefined,
+    draft: ItemDraft,
+    options?: PutItemOptions,
+  ): Promise<WriteResultDto | SkippedWriteDto> {
     const state = this.writable(vaultId);
     const id = this.checkId(itemId ?? randomUUID());
+    if (options?.background) {
+      return this.putInBackground(state, id, draft, options.background.baseSeq);
+    }
     const payload = this.preparePayload(draft, this.deps.now().toISOString());
     const baseSeq = state.items.get(id)?.seq ?? null;
     if (baseSeq === null && state.items.size >= MAX_LIVE_ITEMS_PER_VAULT) {
@@ -778,6 +834,24 @@ export class VaultEngine {
     const write: PendingWrite = { op: 'put', id, baseSeq, at: payload.updated_at, payload };
     this.encryptPending(state, [write]);
     return this.writeOne(vaultId, write);
+  }
+
+  private async putInBackground(
+    state: VaultState,
+    id: string,
+    draft: ItemDraft,
+    baseSeq: number,
+  ): Promise<WriteResultDto | SkippedWriteDto> {
+    const skipped: SkippedWriteDto = { id, status: 'skipped', item: null };
+    // An update of the version the draft was made from, nothing else: no create, no revive.
+    const live = state.items.get(id);
+    if (!live || live.seq !== baseSeq) return skipped;
+    const base = this.readItem(state, live);
+    if (!('payload' in base)) return skipped;
+    const payload = this.preparePayload(draft, base.payload.updated_at);
+    const write: PendingWrite = { op: 'put', id, baseSeq, at: payload.updated_at, payload };
+    this.encryptPending(state, [write]);
+    return this.writeOne(state.vault.id, write, true);
   }
 
   async deleteItem(vaultId: string, itemId: string): Promise<WriteResultDto> {

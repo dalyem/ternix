@@ -679,6 +679,22 @@ describe('agent forwarding', () => {
     expect(warnings).toEqual([]);
   });
 
+  it('asks on the shell channel only, never on the OS probe', async () => {
+    const srv = await server({
+      users: { alice: { password: 'pw' } },
+      exec: () => ({ stdout: 'Linux\nID=debian\n' }),
+    });
+    const session = newSession({ agentPath: '/nonexistent/agent.sock' });
+    await session.connect(connection({ port: srv.port, agentForwarding: true }), trustAll);
+    // The probe first: a connection-wide request would go out on its channel.
+    expect(await session.detectOs()).toBe('debian');
+    await session.openShell({ cols: 80, rows: 24 });
+    expect(await session.detectOs()).toBe('debian');
+    await waitFor(() => srv.agentForwardChannels.length > 0, 'the agent forwarding request');
+    expect(srv.agentForwardChannels).toEqual(['shell']);
+    expect(srv.execs).toHaveLength(2);
+  });
+
   it('warns and does not forward when no agent is available', async () => {
     const srv = await server({ users: { alice: { password: 'pw' } } });
     const warnings: string[] = [];

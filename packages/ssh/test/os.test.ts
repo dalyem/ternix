@@ -133,6 +133,15 @@ describe('osFromProbe', () => {
     expect(osFromProbe(hostile)).toBe('linux');
   });
 
+  it.each(['__proto__', 'constructor', 'toString', 'hasOwnProperty', 'valueOf'])(
+    'an ID of %s names nothing (no prototype lookups)',
+    (token) => {
+      expect(osFromProbe(`Linux\nID=${token}\n`)).toBe('linux');
+      expect(osFromProbe(`ID=${token}\nID_LIKE="${token} debian"\n`)).toBe('debian');
+      expect(osFromProbe(`ID=${token}\nID_LIKE=${token}\n`)).toBeUndefined();
+    },
+  );
+
   it('keeps the first ID and ignores tokens with odd characters in ID_LIKE', () => {
     expect(parseOsRelease('ID=alpine\nID=ubuntu\n')).toEqual({ id: 'alpine', idLike: [] });
     expect(parseOsRelease('ID_LIKE="Ubuntu ../etc debian"\n')).toEqual({
@@ -232,6 +241,18 @@ describe('SshSession.detectOs', () => {
       exec: () => ({ stdout: 'Darwin\n', stderr: 'cat: /etc/os-release: No such file', code: 1 }),
     });
     expect(await session.detectOs()).toBe('macos');
+  });
+
+  it('closes a probe channel the server accepts only after the timeout', async () => {
+    const { server, session } = await connected({ ident: 'OpenSSH_9.8', exec: () => 'hold' });
+    expect(await session.detectOs({ timeoutMs: 200 })).toBeUndefined();
+    await waitFor(() => server.heldExecs.length === 1, 'the held exec request');
+    server.releaseExecs();
+    await waitFor(() => server.execClosed === 1, 'the late probe channel to close', 2_000);
+    // The connection is unharmed: a shell still opens and echoes.
+    const shell = await session.openShell({ cols: 80, rows: 24 });
+    shell.write('still here\n');
+    await waitFor(() => server.shellInput.includes('still here'), 'the shell to be live');
   });
 
   it('is unknown, without throwing, on a session that is not connected', async () => {

@@ -4,6 +4,8 @@ import type { TernixClient } from '../client/index.js';
 export interface ItemRecord {
   vaultId: string;
   itemId: string;
+  /** The server version the payload is, for writes that must not override a newer one. */
+  seq: number;
   payload: ItemPayload;
 }
 
@@ -34,7 +36,12 @@ export function snapshotItems(client: VaultReader): ItemSnapshot {
     for (const item of client.listItems(vault.id).items) {
       if (lookup.has(item.id)) continue;
       lookup.set(item.id, item.payload);
-      records.set(item.id, { vaultId: vault.id, itemId: item.id, payload: item.payload });
+      records.set(item.id, {
+        vaultId: vault.id,
+        itemId: item.id,
+        seq: item.seq,
+        payload: item.payload,
+      });
     }
   }
   return { lookup, records, personalVaultId };

@@ -87,6 +87,13 @@ Items (unlocked)
   the protocol limits before sending, and resolve conflicts with the protocol's rule: the
   result `status` is `saved` or `dropped` (the server kept a newer version). Writes need
   the server and throw `OfflineError` without it; there is no offline queue.
+- `putItem(vaultId, id, draft, {background: {baseSeq}})`: a write the app makes by itself,
+  such as the operating system detected on a host. It updates the item only while it is
+  still at `baseSeq` (the version the draft was built from) and keeps that version's
+  `updated_at`, so any edit a person makes, on this device or another, wins the conflict rule
+  against it. It never creates an item or revives a deleted one, and it is never retried: any
+  `409` (conflict, tombstone, key version) leaves the server unchanged and the result is
+  `{status: 'skipped', item: null}`. The caller tries again later from fresh data.
 - `sync()`, `refreshVaults()`, `pullVault(id)`: realtime calls these by itself.
 
 Cache writes: item documents (items and `since` cursor together) are held in memory and

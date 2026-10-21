@@ -39,6 +39,7 @@ const idOf = (t: Registered): string => t.client.account!.user.id;
 function ipcFor(t: Registered) {
   const ssh = {
     cancelAllPrompts: vi.fn(),
+    forgetAccount: vi.fn(),
     closeAll: vi.fn(async () => undefined),
     displayItems: <T>(vault: T) => vault,
   };

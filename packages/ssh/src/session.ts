@@ -9,6 +9,7 @@ import type {
   KeyboardInteractiveCallback,
   ParsedKey,
   Prompt,
+  ShellOptions as Ssh2ShellOptions,
 } from 'ssh2';
 import type { HostOs, KnownHostPayload } from '@ternix/core/items';
 import { errorMessage, SshError } from './errors.js';
@@ -286,6 +287,13 @@ function remoteIdent(client: Ssh2Client): string | undefined {
  * arrived); rejects when the server refuses the channel or the command, or on timeout.
  */
 function runOsProbe(client: Ssh2Client, timeoutMs: number): Promise<string> {
+  const closeChannel = (channel: ClientChannel) => {
+    try {
+      channel.close();
+    } catch {
+      channel.destroy();
+    }
+  };
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let size = 0;
@@ -295,13 +303,7 @@ function runOsProbe(client: Ssh2Client, timeoutMs: number): Promise<string> {
       if (done) return;
       done = true;
       clearTimeout(timer);
-      if (channel) {
-        try {
-          channel.close();
-        } catch {
-          channel.destroy();
-        }
-      }
+      if (channel) closeChannel(channel);
       if (err !== undefined) reject(err instanceof Error ? err : new Error(String(err)));
       else resolve(Buffer.concat(chunks).toString('utf8'));
     };
@@ -309,9 +311,10 @@ function runOsProbe(client: Ssh2Client, timeoutMs: number): Promise<string> {
     try {
       client.exec(OS_PROBE_COMMAND, (err, stream) => {
         if (err) return finish(err);
-        channel = stream;
-        if (done) return finish();
         stream.on('error', () => undefined);
+        // Accepted after the timeout: nobody reads it, so it would stay open on the server.
+        if (done) return closeChannel(stream);
+        channel = stream;
         stream.stderr.on('data', () => undefined);
         stream.on('data', (chunk: Buffer) => {
           if (done) return;
@@ -431,6 +434,8 @@ export class SshSession {
   private runtimeError: SshError | undefined;
   private shutdownPromise: Promise<void> | undefined;
   private targetIdent: string | undefined;
+  /** Whether the shell asks for agent forwarding (the host has it on and an agent exists). */
+  private forwardAgent = false;
 
   constructor(private readonly options: SessionOptions = {}) {}
 
@@ -502,10 +507,15 @@ export class SshSession {
 
   async openShell(options: ShellOptions): Promise<ShellStream> {
     const client = this.requireReady();
+    // ssh2 reads `agentForward` from a channel's options; its type definitions omit it.
+    const channelOptions: Ssh2ShellOptions & { agentForward: boolean } = {
+      agentForward: this.forwardAgent,
+    };
     const channel = await new Promise<ClientChannel>((resolve, reject) => {
       try {
         client.shell(
           { term: options.term ?? 'xterm-256color', cols: options.cols, rows: options.rows },
+          channelOptions,
           (err, stream) => (err ? reject(err) : resolve(stream)),
         );
       } catch (err) {
@@ -858,8 +868,11 @@ export class SshSession {
       if (algorithms) config.algorithms = { serverHostKey: algorithms };
       if (info.isTarget && settings.agentForwarding) {
         if (this.options.agentPath) {
+          // The agent serves the server's requests; forwarding is asked for on the shell's
+          // channel only (`openShell`). ssh2's connection-wide `agentForward` would ask on every
+          // session channel, the OS probe's included.
           config.agent = this.options.agentPath;
-          config.agentForward = true;
+          this.forwardAgent = true;
         } else {
           hooks.onWarning?.(
             'Agent forwarding is on, but no SSH agent was found; continuing without it',

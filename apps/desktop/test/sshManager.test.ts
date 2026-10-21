@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { HostOs, ItemPayload } from '@ternix/core/items';
 import type { VaultRole } from '@ternix/core/protocol';
 import type {
@@ -12,11 +12,22 @@ import type {
   SshSession,
 } from '@ternix/ssh';
 import type { AppEventName, AppEvents, HostKeyDecision } from '../src/shared/app.js';
+import type { ItemDraft } from '../src/shared/types.js';
 import type { HostKeyFacts, RouteHop } from '../src/main/app/trust.js';
-import type { ItemSnapshot } from '../src/main/ssh/items.js';
-import { SshManager } from '../src/main/ssh/manager.js';
+import type { TernixClient } from '../src/main/client/index.js';
+import { type ItemSnapshot, snapshotItems } from '../src/main/ssh/items.js';
+import { SshManager, type SshManagerDeps } from '../src/main/ssh/manager.js';
 import { looksLikeLocalBindAddress } from '../src/shared/forwards.js';
-import { deferred } from './helpers.js';
+import {
+  closeClients,
+  deferred,
+  HOUR,
+  loginUser,
+  registerUser,
+  startServer,
+  type TestServer,
+  waitFor,
+} from './helpers.js';
 
 const HOST_ID = '3f1c9a52-8e6b-4d0a-9b7e-0a1b2c3d4e5f';
 const PERSONAL = '9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d';
@@ -47,7 +58,7 @@ function snapshotWith(extra: [string, ItemPayload][] = []): ItemSnapshot {
   return {
     lookup: new Map(entries),
     records: new Map(
-      entries.map(([id, payload]) => [id, { vaultId: PERSONAL, itemId: id, payload }]),
+      entries.map(([id, payload]) => [id, { vaultId: PERSONAL, itemId: id, seq: 1, payload }]),
     ),
     personalVaultId: PERSONAL,
   };
@@ -127,12 +138,14 @@ function setup(
     keyboardTimeoutMs?: number;
     detectHostOs?: () => boolean;
     vaultRole?: (vaultId: string) => VaultRole | undefined;
-    putItem?: () => Promise<unknown>;
+    putItem?: SshManagerDeps['putItem'];
+    pullVault?: SshManagerDeps['pullVault'];
+    accountId?: () => string | undefined;
   } = {},
 ) {
   const sessions: FakeSession[] = [];
   const events: { name: AppEventName; payload: unknown }[] = [];
-  const putItem = vi.fn(options.putItem ?? (async () => ({})));
+  const putItem = vi.fn<SshManagerDeps['putItem']>(options.putItem ?? (async () => ({})));
   const log = vi.fn();
   const confirmHostKey = vi.fn(options.confirm ?? (async () => 'reject' as HostKeyDecision));
   const confirmNewHosts = vi.fn(options.confirmNew ?? (async () => true));
@@ -159,6 +172,8 @@ function setup(
       : {}),
     ...(options.detectHostOs ? { detectHostOs: options.detectHostOs } : {}),
     ...(options.vaultRole ? { vaultRole: options.vaultRole } : {}),
+    ...(options.pullVault ? { pullVault: options.pullVault } : {}),
+    ...(options.accountId ? { accountId: options.accountId } : {}),
     log,
   });
   const session = async (index = 0) => {
@@ -580,7 +595,7 @@ describe('SshManager operating system detection', () => {
     const host = snap.lookup.get(HOST_ID)!;
     const payload = (os ? { ...host, os } : host) as ItemPayload;
     snap.lookup.set(HOST_ID, payload);
-    snap.records.set(HOST_ID, { vaultId: PERSONAL, itemId: HOST_ID, payload });
+    snap.records.set(HOST_ID, { vaultId: PERSONAL, itemId: HOST_ID, seq: 1, payload });
     return snap;
   };
 
@@ -605,11 +620,14 @@ describe('SshManager operating system detection', () => {
     const { s, putItem } = await connectWith('ubuntu', { snapshot: snapshotWithOs('debian') });
     await vi.waitFor(() => expect(putItem).toHaveBeenCalledTimes(1));
     expect(s.detectOs).toHaveBeenCalledTimes(1);
-    const [vaultId, itemId, draft] = putItem.mock.calls[0] as unknown as [
+    const [vaultId, itemId, draft, options] = putItem.mock.calls[0] as unknown as [
       string,
       string,
       Record<string, unknown>,
+      unknown,
     ];
+    // A background write: never wins a conflict, only updates the version it was built from.
+    expect(options).toEqual({ background: { baseSeq: 1 } });
     expect(vaultId).toBe(PERSONAL);
     expect(itemId).toBe(HOST_ID);
     expect(draft).toMatchObject({
@@ -631,6 +649,7 @@ describe('SshManager operating system detection', () => {
       PERSONAL,
       HOST_ID,
       expect.objectContaining({ os: 'alpine', password: 'pw-SECRET' }),
+      { background: { baseSeq: 1 } },
     ]);
   });
 
@@ -742,5 +761,301 @@ describe('SshManager operating system detection', () => {
     answer.resolve('nixos');
     await vi.waitFor(() => expect(env.putItem).toHaveBeenCalledTimes(1));
     expect(env.sessions.reduce((n, s) => n + s.detectOs.mock.calls.length, 0)).toBe(1);
+  });
+  const hostItem = (payload: ItemPayload) => ({
+    id: HOST_ID,
+    vaultId: PERSONAL,
+    seq: 1,
+    keyVersion: 1,
+    updatedAt: now,
+    updatedBy: 'u',
+    payload,
+  });
+  const shownOs = (manager: SshManager, payload = snapshotWith().records.get(HOST_ID)!.payload) => {
+    const shown = manager.displayItems({
+      vaultId: PERSONAL,
+      items: [hostItem(payload)],
+      unreadable: [],
+    });
+    const p = shown.items[0]!.payload;
+    return p.type === 'host' ? p.os : undefined;
+  };
+
+  it.each(['__proto__', 'constructor', 'toString', 'hasOwnProperty', 'beos'])(
+    'drops a detected value outside the closed list (%s), for writers and viewers',
+    async (value) => {
+      const writer = await connectWith(value as HostOs);
+      const viewer = await connectWith(value as HostOs, { vaultRole: () => 'viewer' });
+      await vi.waitFor(() => expect(writer.s.detectOs).toHaveBeenCalled());
+      await vi.waitFor(() => expect(viewer.s.detectOs).toHaveBeenCalled());
+      await new Promise((r) => setTimeout(r, 20));
+      expect(writer.putItem).not.toHaveBeenCalled();
+      expect(viewer.events.map((e) => e.name)).not.toContain('client.items-changed');
+      expect(shownOs(viewer.manager)).toBeUndefined();
+    },
+  );
+
+  it('shows a viewer’s OS to that account only: an expired session’s next account sees none', async () => {
+    let account: string | undefined = 'server user-a';
+    const viewer = await connectWith('fedora', {
+      vaultRole: () => 'viewer',
+      accountId: () => account,
+    });
+    await vi.waitFor(() => expect(shownOs(viewer.manager)).toBe('fedora'));
+    // The session expires (terminals stay open) and someone else signs in to the same vault.
+    account = undefined;
+    expect(shownOs(viewer.manager)).toBeUndefined();
+    account = 'server user-b';
+    expect(shownOs(viewer.manager)).toBeUndefined();
+    // Even if the first account comes back, the expiry forgot it.
+    viewer.manager.forgetAccount();
+    account = 'server user-a';
+    expect(shownOs(viewer.manager)).toBeUndefined();
+  });
+
+  it('drops a detection that was still running when the account changed', async () => {
+    let account: string | undefined = 'server user-a';
+    const answer = deferred<HostOs | undefined>();
+    const writer = await connectWith(answer.promise, { accountId: () => account });
+    const viewer = await connectWith(answer.promise, {
+      vaultRole: () => 'viewer',
+      accountId: () => account,
+    });
+    writer.manager.forgetAccount();
+    viewer.manager.forgetAccount();
+    account = 'server user-b';
+    answer.resolve('arch');
+    await new Promise((r) => setTimeout(r, 20));
+    expect(writer.putItem).not.toHaveBeenCalled();
+    expect(shownOs(viewer.manager)).toBeUndefined();
+  });
+
+  it('writes nothing when the host’s address or port changed while the probe ran', async () => {
+    for (const change of [{ address: 'other.example.com' }, { port: 2222 }]) {
+      let changed = false;
+      const answer = deferred<HostOs | undefined>();
+      const env = await connectWith(answer.promise, {
+        snapshot: () => {
+          const snap = snapshotWith();
+          if (!changed) return snap;
+          const payload = { ...snap.lookup.get(HOST_ID)!, ...change } as ItemPayload;
+          snap.lookup.set(HOST_ID, payload);
+          snap.records.set(HOST_ID, { vaultId: PERSONAL, itemId: HOST_ID, seq: 2, payload });
+          return snap;
+        },
+      });
+      changed = true;
+      answer.resolve('arch');
+      await new Promise((r) => setTimeout(r, 20));
+      expect(env.putItem).not.toHaveBeenCalled();
+    }
+  });
+
+  it('a case or whitespace difference in the address is the same destination', async () => {
+    const env = await connectWith('arch', {
+      snapshot: () => {
+        const snap = snapshotWith();
+        const payload = { ...snap.lookup.get(HOST_ID)!, address: ' Box.Example.COM ' };
+        snap.lookup.set(HOST_ID, payload as ItemPayload);
+        snap.records.set(HOST_ID, {
+          vaultId: PERSONAL,
+          itemId: HOST_ID,
+          seq: 1,
+          payload: payload as ItemPayload,
+        });
+        return snap;
+      },
+    });
+    await vi.waitFor(() => expect(env.putItem).toHaveBeenCalledTimes(1));
+  });
+
+  it('a viewer’s OS is not shown once the host points somewhere else', async () => {
+    const viewer = await connectWith('fedora', { vaultRole: () => 'viewer' });
+    const payload = snapshotWith().records.get(HOST_ID)!.payload;
+    await vi.waitFor(() => expect(shownOs(viewer.manager, payload)).toBe('fedora'));
+    expect(
+      shownOs(viewer.manager, { ...payload, address: 'elsewhere.example.com' } as ItemPayload),
+    ).toBeUndefined();
+    expect(shownOs(viewer.manager, { ...payload, port: 2200 } as ItemPayload)).toBeUndefined();
+  });
+
+  it('drops the answer of an attempt a reconnect replaced', async () => {
+    const answer = deferred<HostOs | undefined>();
+    const env = await connectWith(answer.promise);
+    env.manager.reconnect(env.id, 80, 24);
+    answer.resolve('arch');
+    await new Promise((r) => setTimeout(r, 20));
+    expect(env.putItem).not.toHaveBeenCalled();
+  });
+
+  it('drops the answer once the tab is closed', async () => {
+    const answer = deferred<HostOs | undefined>();
+    const env = await connectWith(answer.promise);
+    await env.manager.close(env.id);
+    answer.resolve('arch');
+    await new Promise((r) => setTimeout(r, 20));
+    expect(env.putItem).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Detection writing through a real client and server, wired as main wires it: a person's edit,
+ * here or on another device, must never be lost to the background write.
+ */
+describe('SshManager operating system write-back, against the server', () => {
+  let server: TestServer;
+  beforeEach(async () => {
+    server = await startServer();
+  });
+  afterEach(async () => {
+    await closeClients();
+    await server.close();
+  });
+
+  /** A payload as a draft with `changes`, as an editor sends it. */
+  const edit = (payload: ItemPayload, changes: Record<string, unknown>) => {
+    const { updated_at: _stamp, ...rest } = payload;
+    return { ...rest, ...changes } as ItemDraft;
+  };
+
+  /** One account on two devices without realtime, so neither sees the other's writes unasked. */
+  async function twoDevices() {
+    const a = await registerUser(server, { realtime: false });
+    const b = await loginUser(server, a.email, a.password, { realtime: false });
+    const vaultId = a.personalVaultId;
+    const created = await a.client.putItem(vaultId, undefined, {
+      type: 'host',
+      label: 'box',
+      address: 'box.example.com',
+      username: 'me',
+      password: 'pw-original',
+    });
+    const hostId = created.item!.id;
+    await b.client.pullVault(vaultId);
+    return { a, b, vaultId, hostId };
+  }
+
+  /** The manager as main builds it, on `client`; every tab's probe answers `detected`. */
+  function managerOn(client: TernixClient, detected: HostOs | undefined) {
+    const sessions: FakeSession[] = [];
+    const log = vi.fn();
+    const manager = new SshManager({
+      snapshot: () => snapshotItems(client),
+      putItem: (vaultId, itemId, draft, options) =>
+        options && itemId !== undefined
+          ? client.putItem(vaultId, itemId, draft, options)
+          : client.putItem(vaultId, itemId, draft),
+      pullVault: (vaultId) => client.pullVault(vaultId),
+      accountId: () => client.account?.user.id,
+      vaultRole: (vaultId) => client.listVaults().find((v) => v.id === vaultId)?.role,
+      detectHostOs: () => true,
+      emit: () => undefined,
+      sendTerminal: () => true,
+      hasWindow: () => true,
+      confirmHostKey: async () => 'reject',
+      confirmNewHosts: async () => true,
+      agentPath: undefined,
+      log,
+      createSession: (o) => {
+        const s = new FakeSession(o);
+        s.openShell.mockImplementation(async () => openShellStream());
+        s.detectOs.mockImplementation(async () => detected);
+        s.connected.resolve();
+        sessions.push(s);
+        return s as unknown as SshSession;
+      },
+    });
+    return { manager, sessions, log };
+  }
+
+  const serverCopy = async (reader: TernixClient, vaultId: string, hostId: string) => {
+    await reader.pullVault(vaultId);
+    return reader.getItem(vaultId, hostId)?.payload ?? null;
+  };
+
+  it('keeps another device’s edit this device has not pulled yet, and still records the OS', async () => {
+    const { a, b, vaultId, hostId } = await twoDevices();
+    const before = b.client.getItem(vaultId, hostId)!.payload;
+    await b.client.putItem(vaultId, hostId, edit(before, { password: 'pw-from-b' }));
+
+    const env = managerOn(a.client, 'ubuntu');
+    env.manager.open(hostId, 80, 24);
+    const after = await waitFor(async () => {
+      const p = await serverCopy(b.client, vaultId, hostId);
+      return p?.type === 'host' && p.os === 'ubuntu' ? p : undefined;
+    }, 'the detected OS on the server');
+    expect(after).toMatchObject({ password: 'pw-from-b', label: 'box' });
+    expect(env.log).not.toHaveBeenCalled();
+  });
+
+  it('keeps an edit that lands between its pull and its write', async () => {
+    const { a, b, vaultId, hostId } = await twoDevices();
+    // This device's clock runs ahead: a normal write would win the conflict rule.
+    a.clock.offsetMs = HOUR;
+    let raced = false;
+    a.spy.before = async (method, path) => {
+      if (raced || method !== 'PUT' || !path.endsWith(hostId)) return;
+      raced = true;
+      const current = b.client.getItem(vaultId, hostId)!.payload;
+      await b.client.putItem(vaultId, hostId, edit(current, { password: 'pw-raced' }));
+    };
+    const env = managerOn(a.client, 'ubuntu');
+    env.manager.open(hostId, 80, 24);
+    await waitFor(() => raced, 'the background write');
+    await new Promise((r) => setTimeout(r, 300));
+    const after = await serverCopy(b.client, vaultId, hostId);
+    expect(after).toMatchObject({ password: 'pw-raced' });
+    expect(after).not.toHaveProperty('os');
+    // Skipped, not retried: one write went out.
+    expect(a.spy.count('PUT', `/items/${hostId}`)).toBe(2); // the create, the skipped write
+    expect(env.log).not.toHaveBeenCalled();
+  });
+
+  it('does not revive a host another device deleted', async () => {
+    const { a, b, vaultId, hostId } = await twoDevices();
+    await b.client.deleteItem(vaultId, hostId);
+    const putsBefore = a.spy.count('PUT', `/items/${hostId}`);
+
+    const env = managerOn(a.client, 'ubuntu');
+    env.manager.open(hostId, 80, 24);
+    await waitFor(() => env.sessions[0]?.detectOs.mock.calls.length === 1, 'the probe');
+    await new Promise((r) => setTimeout(r, 300));
+    expect(await serverCopy(b.client, vaultId, hostId)).toBeNull();
+    expect(a.spy.count('PUT', `/items/${hostId}`)).toBe(putsBefore);
+  });
+
+  it('loses to an editor save on this device that was already on its way', async () => {
+    const { a, b, vaultId, hostId } = await twoDevices();
+    const gate = deferred();
+    let held = false;
+    a.spy.before = async (method, path) => {
+      if (held || method !== 'PUT' || !path.endsWith(hostId)) return;
+      held = true;
+      await gate.promise;
+    };
+    // The editor saves (without `os`, as the renderer does); the request is held on the way.
+    const original = a.client.getItem(vaultId, hostId)!.payload;
+    const saving = a.client.putItem(
+      vaultId,
+      hostId,
+      edit(original, { label: 'edited', password: 'pw-typed' }),
+    );
+    await waitFor(() => held, 'the editor save to be on its way');
+
+    // Detection writes first.
+    const env = managerOn(a.client, 'ubuntu');
+    env.manager.open(hostId, 80, 24);
+    await waitFor(async () => {
+      const p = await serverCopy(b.client, vaultId, hostId);
+      return p?.type === 'host' && p.os === 'ubuntu';
+    }, 'the detected OS on the server');
+
+    gate.resolve();
+    const result = await saving;
+    expect(result.status).toBe('saved');
+    expect(await serverCopy(b.client, vaultId, hostId)).toMatchObject({
+      label: 'edited',
+      password: 'pw-typed',
+    });
   });
 });

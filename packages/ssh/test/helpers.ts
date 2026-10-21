@@ -105,6 +105,8 @@ export type ExecReply =
   | 'refuse'
   /** Accept and never answer, to exercise timeouts. */
   | 'hang'
+  /** Answer only when the test calls `releaseExecs`, then accept and never answer. */
+  | 'hold'
   | { stdout?: string | Buffer; stderr?: string; code?: number };
 
 export interface TestServerOptions {
@@ -134,6 +136,10 @@ export class TestSshServer {
   readonly tcpip: { host: string; port: number }[] = [];
   readonly keepalives: number[] = [];
   readonly agentForwardRequests: number[] = [];
+  /** The kind of each session channel that asked for agent forwarding before it started. */
+  readonly agentForwardChannels: ('shell' | 'exec')[] = [];
+  /** Exec requests held by an `exec` reply of `'hold'`. */
+  readonly heldExecs: (() => void)[] = [];
   readonly remoteListeners = new Map<number, NetServer>();
   readonly clients = new Set<Connection>();
   /** Cancelled remote forwards (`cancel-tcpip-forward`), by bound port. */
@@ -198,6 +204,11 @@ export class TestSshServer {
   /** Drop every client connection without a goodbye, as a network failure would. */
   dropClients(): void {
     for (const client of this.clients) client.end();
+  }
+
+  /** Accept the held exec requests. */
+  releaseExecs(): void {
+    for (const start of this.heldExecs.splice(0)) start();
   }
 
   /** Let the held `tcpip-forward` requests through. */
@@ -276,7 +287,9 @@ export class TestSshServer {
     client.on('ready', () => {
       client.on('session', (accept) => {
         const session = accept();
+        let agent = false;
         session.on('auth-agent', (acceptAgent) => {
+          agent = true;
           this.agentForwardRequests.push(Date.now());
           acceptAgent?.();
         });
@@ -288,13 +301,19 @@ export class TestSshServer {
         });
         session.on('exec', (acceptExec, rejectExec, info) => {
           this.execs.push({ command: info.command, pty });
+          if (agent) this.agentForwardChannels.push('exec');
           const reply = options.exec?.(info.command) ?? 'refuse';
           if (reply === 'refuse') return void rejectExec?.();
-          const stream = acceptExec();
-          stream.on('end', () => (this.execStdinEnded += 1));
-          stream.on('close', () => (this.execClosed += 1));
-          stream.on('error', () => undefined);
-          stream.resume();
+          const start = () => {
+            const stream = acceptExec();
+            stream.on('end', () => (this.execStdinEnded += 1));
+            stream.on('close', () => (this.execClosed += 1));
+            stream.on('error', () => undefined);
+            stream.resume();
+            return stream;
+          };
+          if (reply === 'hold') return void this.heldExecs.push(() => void start());
+          const stream = start();
           if (reply === 'hang') return;
           if (reply.stderr) stream.stderr.write(reply.stderr);
           if (reply.stdout) stream.write(reply.stdout);
@@ -305,7 +324,10 @@ export class TestSshServer {
           this.windows.push({ cols: info.cols, rows: info.rows });
           acceptWindow?.();
         });
-        session.on('shell', (acceptShell) => this.runShell(acceptShell()));
+        session.on('shell', (acceptShell) => {
+          if (agent) this.agentForwardChannels.push('shell');
+          this.runShell(acceptShell());
+        });
       });
 
       client.on('tcpip', (accept, reject, info) => {

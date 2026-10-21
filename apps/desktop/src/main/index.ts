@@ -134,7 +134,15 @@ async function start(): Promise<void> {
 
   const ssh = new SshManager({
     snapshot: () => snapshotItems(client),
-    putItem: (vaultId, itemId, draft) => client.putItem(vaultId, itemId, draft),
+    putItem: (vaultId, itemId, draft, options) =>
+      options && itemId !== undefined
+        ? client.putItem(vaultId, itemId, draft, options)
+        : client.putItem(vaultId, itemId, draft),
+    pullVault: (vaultId) => client.pullVault(vaultId),
+    accountId: () => {
+      const account = client.account;
+      return account ? `${account.serverUrl} ${account.user.id}` : undefined;
+    },
     emit,
     sendTerminal: (id, data) => {
       const contents = activeContents();
@@ -171,6 +179,9 @@ async function start(): Promise<void> {
   client.on('state', (state) => {
     emit('client.state', state);
     if (state !== 'unlocked') ssh.cancelAllPrompts();
+    // Terminals of an expired session stay open for the next sign-in; what was shown to this
+    // account alone does not.
+    if (state === 'expired') ssh.forgetAccount();
     if (state === 'loggedOut') void ssh.closeAll();
   });
   client.on('connection', (state) => emit('client.connection', state));

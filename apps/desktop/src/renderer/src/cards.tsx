@@ -2,7 +2,7 @@ import type { HostOs } from '@ternix/core/items';
 import { type LucideIcon, Server } from 'lucide-react';
 import type { KeyboardEvent, ReactNode } from 'react';
 import { tileColor } from './items.js';
-import { glyphColorOn, OS_LOOKS, OsGlyph } from './osIcons.js';
+import { glyphColorOn, OsGlyph, osLook } from './osIcons.js';
 
 /** The 40px coloured square at the start of a card; a glyph, or a letter for port forwards. */
 export function Tile({
@@ -42,7 +42,7 @@ export function HostTile({
   os?: HostOs | undefined;
   small?: boolean;
 }) {
-  const look = os ? OS_LOOKS[os] : undefined;
+  const look = osLook(os);
   const background = color || look?.color || tileColor(label);
   const size = small ? 18 : 20;
   return (

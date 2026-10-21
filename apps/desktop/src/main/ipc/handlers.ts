@@ -145,6 +145,7 @@ export function createHandlers(deps: HandlerDeps): Handlers {
     'auth.register': async (input) => {
       const checkPage = choosingServer();
       secrets.assertAvailable();
+      ssh.forgetAccount();
       const account = await client.register(input);
       checkPage();
       return rememberServer(account);
@@ -152,6 +153,7 @@ export function createHandlers(deps: HandlerDeps): Handlers {
     'auth.login': async (input) => {
       const checkPage = choosingServer();
       secrets.assertAvailable();
+      ssh.forgetAccount();
       const account = await client.login(input);
       checkPage();
       return rememberServer(account);

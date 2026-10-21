@@ -50,6 +50,7 @@ function fakeDialog(answer: { response: number; checkboxChecked?: boolean } = { 
 function ipcFor(t: Registered, dialog = fakeDialog()) {
   const ssh = {
     cancelAllPrompts: vi.fn(),
+    forgetAccount: vi.fn(),
     closeAll: vi.fn(async () => undefined),
     displayItems: <T>(vault: T) => vault,
   };

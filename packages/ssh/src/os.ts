@@ -39,37 +39,40 @@ export function osFromIdent(ident: string | undefined): HostOs | undefined {
   return undefined;
 }
 
-/** os-release `ID` (and `ID_LIKE` entries) to the operating systems the protocol names. */
-const RELEASE_IDS: Record<string, HostOs> = {
-  ubuntu: 'ubuntu',
-  debian: 'debian',
-  fedora: 'fedora',
-  centos: 'centos',
-  rhel: 'rhel',
-  rocky: 'rocky',
-  almalinux: 'alma',
-  arch: 'arch',
-  archarm: 'arch',
-  alpine: 'alpine',
-  opensuse: 'opensuse',
-  'opensuse-leap': 'opensuse',
-  'opensuse-tumbleweed': 'opensuse',
-  'opensuse-microos': 'opensuse',
-  suse: 'opensuse',
-  sles: 'opensuse',
-  nixos: 'nixos',
-  raspbian: 'raspbian',
-  amzn: 'amazon',
-  ol: 'oracle',
-  gentoo: 'gentoo',
-  manjaro: 'manjaro',
-  'manjaro-arm': 'manjaro',
-  linuxmint: 'mint',
-  kali: 'kali',
-  freebsd: 'freebsd',
-  openbsd: 'openbsd',
-  netbsd: 'netbsd',
-};
+/**
+ * os-release `ID` (and `ID_LIKE` entries) to the operating systems the protocol names. A `Map`:
+ * the tokens come from the remote host, and `__proto__` or `constructor` must not find anything.
+ */
+const RELEASE_IDS: ReadonlyMap<string, HostOs> = new Map<string, HostOs>([
+  ['ubuntu', 'ubuntu'],
+  ['debian', 'debian'],
+  ['fedora', 'fedora'],
+  ['centos', 'centos'],
+  ['rhel', 'rhel'],
+  ['rocky', 'rocky'],
+  ['almalinux', 'alma'],
+  ['arch', 'arch'],
+  ['archarm', 'arch'],
+  ['alpine', 'alpine'],
+  ['opensuse', 'opensuse'],
+  ['opensuse-leap', 'opensuse'],
+  ['opensuse-tumbleweed', 'opensuse'],
+  ['opensuse-microos', 'opensuse'],
+  ['suse', 'opensuse'],
+  ['sles', 'opensuse'],
+  ['nixos', 'nixos'],
+  ['raspbian', 'raspbian'],
+  ['amzn', 'amazon'],
+  ['ol', 'oracle'],
+  ['gentoo', 'gentoo'],
+  ['manjaro', 'manjaro'],
+  ['manjaro-arm', 'manjaro'],
+  ['linuxmint', 'mint'],
+  ['kali', 'kali'],
+  ['freebsd', 'freebsd'],
+  ['openbsd', 'openbsd'],
+  ['netbsd', 'netbsd'],
+]);
 
 /** `uname -s` output, exactly; anything else on a line is not a kernel name. */
 function osFromKernel(line: string): HostOs | 'Linux' | undefined {
@@ -132,7 +135,7 @@ export function osFromProbe(output: string): HostOs | undefined {
   if (kernel && kernel !== 'Linux') return kernel;
   const release = parseOsRelease(output);
   for (const token of [release.id, ...release.idLike]) {
-    const os = token !== undefined ? RELEASE_IDS[token] : undefined;
+    const os = token !== undefined ? RELEASE_IDS.get(token) : undefined;
     if (os) return os;
   }
   return kernel === 'Linux' ? 'linux' : undefined;

@@ -58,6 +58,7 @@ function wire(t: TestClient) {
   const serverAddress = new ServerAddressStore(dir);
   const ssh = {
     cancelAllPrompts: vi.fn(),
+    forgetAccount: vi.fn(),
     closeAll: vi.fn(async () => undefined),
     displayItems: <T>(vault: T) => vault,
   };
