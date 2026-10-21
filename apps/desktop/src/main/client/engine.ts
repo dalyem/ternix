@@ -823,7 +823,7 @@ export class VaultEngine {
     if (options?.background) {
       return this.putInBackground(state, id, draft, options.background.baseSeq);
     }
-    const payload = this.preparePayload(draft, this.deps.now().toISOString());
+    const payload = this.preparePayload(draft, this.editTime(state, id));
     const baseSeq = state.items.get(id)?.seq ?? null;
     if (baseSeq === null && state.items.size >= MAX_LIVE_ITEMS_PER_VAULT) {
       throw new TernixError(
@@ -834,6 +834,19 @@ export class VaultEngine {
     const write: PendingWrite = { op: 'put', id, baseSeq, at: payload.updated_at, payload };
     this.encryptPending(state, [write]);
     return this.writeOne(vaultId, write);
+  }
+
+  /**
+   * The `updated_at` of a write a person makes: now, but strictly later than the version it
+   * edits. A slow clock, or a background write that kept the older timestamp, would otherwise
+   * make the edit lose the conflict rule against the very version it was based on.
+   */
+  private editTime(state: VaultState, id: string): string {
+    const now = this.deps.now().getTime();
+    const live = state.items.get(id);
+    const base = live ? this.readItem(state, live) : undefined;
+    const baseAt = base && 'payload' in base ? Date.parse(base.payload.updated_at) : NaN;
+    return new Date(Number.isFinite(baseAt) ? Math.max(now, baseAt + 1) : now).toISOString();
   }
 
   private async putInBackground(
@@ -862,7 +875,7 @@ export class VaultEngine {
       op: 'delete',
       id: itemId,
       baseSeq: existing.seq,
-      at: this.deps.now().toISOString(),
+      at: this.editTime(state, itemId),
     });
   }
 
@@ -875,7 +888,6 @@ export class VaultEngine {
     let state = this.writable(vaultId);
     const results: WriteResultDto[] = [];
     const failed: BatchFailureDto[] = [];
-    const at = this.deps.now().toISOString();
     const seen = new Set<string>();
     let queue: PendingWrite[] = [];
     for (const input of inputs) {
@@ -883,6 +895,7 @@ export class VaultEngine {
       if (seen.has(id))
         throw new TernixError('invalid_input', `Item ${id} appears twice in one batch`);
       seen.add(id);
+      const at = this.editTime(state, id);
       if (input.op === 'put') {
         const payload = this.preparePayload(input.payload, at);
         queue.push({ op: 'put', id, baseSeq: state.items.get(id)?.seq ?? null, at, payload });

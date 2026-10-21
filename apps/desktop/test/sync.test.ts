@@ -285,6 +285,42 @@ describe('background writes', () => {
     expect(a.spy.calls.length).toBe(before);
     expect(labelOf(a.client.getItem(vaultId, id))).toBe('from b');
   });
+
+  // A background write keeps the old updated_at, so a person's edit made from that same old
+  // version must still count as newer, even on a device whose clock is behind.
+  for (const skewMs of [0, -10_000]) {
+    it(`loses to a later edit from a device whose clock is ${skewMs ? 'behind' : 'equal'}`, async () => {
+      const { a, b, vaultId, id, seq } = await stale();
+      b.clock.offsetMs = skewMs;
+      const bg = await a.client.putItem(vaultId, id, snippet('background'), {
+        background: { baseSeq: seq },
+      });
+      expect(bg.status).toBe('saved');
+      const res = await b.client.putItem(vaultId, id, snippet('from b'));
+      expect(res.status).toBe('saved');
+      await a.client.sync();
+      expect(labelOf(a.client.getItem(vaultId, id))).toBe('from b');
+    });
+  }
+
+  it('loses to a later delete and batch edit from a device whose clock is behind', async () => {
+    const { a, b, vaultId, id, seq } = await stale();
+    const other = (await a.client.putItem(vaultId, undefined, snippet('other'))).item!;
+    await b.client.sync();
+    b.clock.offsetMs = -10_000;
+    await a.client.putItem(vaultId, id, snippet('background'), { background: { baseSeq: seq } });
+    await a.client.putItem(vaultId, other.id, snippet('background'), {
+      background: { baseSeq: other.seq },
+    });
+    expect((await b.client.deleteItem(vaultId, id)).status).toBe('saved');
+    const batch = await b.client.applyBatch(vaultId, [
+      { op: 'put', id: other.id, payload: snippet('batch from b') },
+    ]);
+    expect(batch.results.map((r) => r.status)).toEqual(['saved']);
+    await a.client.sync();
+    expect(a.client.getItem(vaultId, id)).toBeNull();
+    expect(labelOf(a.client.getItem(vaultId, other.id))).toBe('batch from b');
+  });
 });
 
 describe('batch import', () => {
