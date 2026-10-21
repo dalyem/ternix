@@ -1,6 +1,13 @@
 import { useSyncExternalStore } from 'react';
 import type { ItemType } from '@ternix/core/items';
-import type { AppInfo, AppSettings, PromptDto, TerminalDto } from '../../shared/app.js';
+import type {
+  AppInfo,
+  AppSettings,
+  PromptDto,
+  SftpSessionDto,
+  TerminalDto,
+  TransferDto,
+} from '../../shared/app.js';
 import { DEFAULT_SETTINGS } from '../../shared/app.js';
 import type { SessionNotice } from '../../shared/ipc.js';
 import type {
@@ -55,8 +62,14 @@ export interface State {
   itemById: Map<string, ItemView>;
   unreadable: number;
   terminals: TerminalDto[];
-  /** The terminal tab in front; null shows the vault views. */
+  /** The terminal tab in front, `SFTP_TAB` for the SFTP browser; null shows the vault views. */
   activeTab: string | null;
+  sftpSessions: SftpSessionDto[];
+  /** The SFTP session the browser shows; null shows the host picker. */
+  activeSftp: string | null;
+  /** The directory each SFTP session shows. */
+  sftpPaths: Record<string, string>;
+  transfers: TransferDto[];
   view: NavView;
   editor: EditorTarget | null;
   /** Vault whose items the lists show, or `all`. */
@@ -93,6 +106,10 @@ let state: State = {
   unreadable: 0,
   terminals: [],
   activeTab: null,
+  sftpSessions: [],
+  activeSftp: null,
+  sftpPaths: {},
+  transfers: [],
   view: 'hosts',
   editor: null,
   vaultFilter: 'all',
@@ -260,6 +277,10 @@ function applyClientState(clientState: ClientState): void {
       account: null,
       terminals: [],
       activeTab: null,
+      sftpSessions: [],
+      activeSftp: null,
+      sftpPaths: {},
+      transfers: [],
       view: 'hosts',
       vaultFilter: 'all',
       ownKeyMismatch: false,
@@ -336,6 +357,87 @@ export async function closeTerminal(id: string): Promise<void> {
   await call('ssh.close', { id }).catch(() => undefined);
 }
 
+// SFTP
+
+/** `activeTab` while the SFTP browser is in front. Terminal IDs are UUIDs, so it never collides. */
+export const SFTP_TAB = 'sftp';
+
+const closedSftp = new Set<string>();
+
+function upsertSftp(dto: SftpSessionDto): void {
+  if (closedSftp.has(dto.id)) return;
+  setState((s) => {
+    const index = s.sftpSessions.findIndex((x) => x.id === dto.id);
+    const sftpSessions =
+      index === -1
+        ? [...s.sftpSessions, dto]
+        : s.sftpSessions.map((x, i) => (i === index ? dto : x));
+    // The browser starts in the login directory once it is known.
+    const sftpPaths =
+      dto.home !== undefined && s.sftpPaths[dto.id] === undefined
+        ? { ...s.sftpPaths, [dto.id]: dto.home }
+        : s.sftpPaths;
+    return { sftpSessions, sftpPaths };
+  });
+}
+
+function upsertTransfer(dto: TransferDto): void {
+  setState((s) => {
+    const index = s.transfers.findIndex((t) => t.id === dto.id);
+    return {
+      transfers:
+        index === -1 ? [...s.transfers, dto] : s.transfers.map((t, i) => (i === index ? dto : t)),
+    };
+  });
+}
+
+/** Show the SFTP browser, on `id` or on the host picker. */
+export function showSftp(id?: string | null): void {
+  setState((s) => ({
+    activeTab: SFTP_TAB,
+    activeSftp: id === undefined ? s.activeSftp : id,
+  }));
+}
+
+export async function openSftp(hostId: string): Promise<void> {
+  try {
+    const dto = await call('sftp.open', { hostId });
+    upsertSftp(dto);
+    showSftp(dto.id);
+  } catch (err) {
+    reportError(err);
+  }
+}
+
+export async function reconnectSftp(id: string): Promise<void> {
+  try {
+    upsertSftp(await call('sftp.reconnect', { id }));
+  } catch (err) {
+    reportError(err);
+  }
+}
+
+export async function closeSftp(id: string): Promise<void> {
+  closedSftp.add(id);
+  setState((s) => {
+    const index = s.sftpSessions.findIndex((x) => x.id === id);
+    const sftpSessions = s.sftpSessions.filter((x) => x.id !== id);
+    const next = sftpSessions[Math.min(index, sftpSessions.length - 1)];
+    const { [id]: _gone, ...sftpPaths } = s.sftpPaths;
+    return {
+      sftpSessions,
+      sftpPaths,
+      transfers: s.transfers.filter((t) => t.sessionId !== id),
+      activeSftp: s.activeSftp === id ? (next?.id ?? null) : s.activeSftp,
+    };
+  });
+  await call('sftp.close', { id }).catch(() => undefined);
+}
+
+export function setSftpPath(id: string, path: string): void {
+  setState((s) => ({ sftpPaths: { ...s.sftpPaths, [id]: path } }));
+}
+
 // Setup
 
 /** The bundled fonts, loaded before the first screen so terminals measure the right glyphs. */
@@ -379,6 +481,12 @@ async function doBoot(): Promise<void> {
     setState((s) => ({ prompts: s.prompts.filter((p) => p.promptId !== promptId) })),
   );
   on('ssh.notice', (notice) => toast(notice.message, notice.level));
+  on('sftp.status', upsertSftp);
+  on('sftp.transfer', upsertTransfer);
+  on('sftp.transfers-removed', ({ ids }) => {
+    const gone = new Set(ids);
+    setState((s) => ({ transfers: s.transfers.filter((t) => !gone.has(t.id)) }));
+  });
 
   try {
     window.localStorage.removeItem(LEGACY_SERVER_URL_KEY);
@@ -386,11 +494,13 @@ async function doBoot(): Promise<void> {
     // Nothing to clean up.
   }
 
-  const [info, settings, snapshot, terminals] = await Promise.all([
+  const [info, settings, snapshot, terminals, sftpSessions, transfers] = await Promise.all([
     call('app.info'),
     call('settings.get'),
     call('client.snapshot'),
     call('ssh.list'),
+    call('sftp.list'),
+    call('sftp.transfers'),
     fontsReady(),
   ]);
   setState({
@@ -401,6 +511,12 @@ async function doBoot(): Promise<void> {
     account: snapshot.account,
     terminals,
     activeTab: terminals[0]?.id ?? null,
+    sftpSessions,
+    activeSftp: sftpSessions[0]?.id ?? null,
+    sftpPaths: Object.fromEntries(
+      sftpSessions.filter((x) => x.home !== undefined).map((x) => [x.id, x.home as string]),
+    ),
+    transfers,
     serverUrl: snapshot.serverUrl,
     booted: true,
   });

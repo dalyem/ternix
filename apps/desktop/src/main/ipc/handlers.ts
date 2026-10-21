@@ -10,6 +10,7 @@ import type { ServerAddressStore } from '../app/serverAddress.js';
 import type { SettingsStore } from '../app/settings.js';
 import { confirmMember, type MemberAction, type MessageBox } from '../app/trust.js';
 import type { SshManager } from '../ssh/manager.js';
+import type { SftpManager } from '../ssh/sftp.js';
 import type { Handlers } from './dispatch.js';
 import { type PageGate, type SessionNotices, stalePageError } from './pageGate.js';
 import { itemDraftSchema } from './schemas.js';
@@ -19,6 +20,7 @@ export interface HandlerDeps {
   client: TernixClient;
   settings: SettingsStore;
   ssh: SshManager;
+  sftp: SftpManager;
   secrets: SafeStorageSecretStore;
   /** The server address the sign-in screen starts with. */
   serverAddress: ServerAddressStore;
@@ -286,5 +288,19 @@ export function createHandlers(deps: HandlerDeps): Handlers {
     'ssh.answerKeyboard': async ({ promptId, answers }) => ssh.answerKeyboard(promptId, answers),
     'ssh.forward.start': ({ id, forwardId }) => ssh.startForward(id, forwardId),
     'ssh.forward.stop': ({ id, forwardId }) => ssh.stopForward(id, forwardId),
+
+    'sftp.list': async () => deps.sftp.list(),
+    'sftp.open': async ({ hostId }) => deps.sftp.open(hostId),
+    'sftp.reconnect': async ({ id }) => deps.sftp.reconnect(id),
+    'sftp.close': ({ id }) => deps.sftp.close(id),
+    'sftp.readdir': ({ id, path }) => deps.sftp.readdir(id, path),
+    'sftp.mkdir': ({ id, path }) => deps.sftp.mkdir(id, path),
+    'sftp.rename': ({ id, from, to }) => deps.sftp.rename(id, from, to),
+    'sftp.remove': ({ id, paths }) => deps.sftp.remove(id, paths),
+    'sftp.upload': ({ id, remoteDir, kind }) => deps.sftp.upload(id, remoteDir, kind),
+    'sftp.download': ({ id, paths }) => deps.sftp.download(id, paths),
+    'sftp.transfers': async () => deps.sftp.transfers(),
+    'sftp.cancelTransfer': async ({ transferId }) => deps.sftp.cancel(transferId),
+    'sftp.clearTransfers': async () => deps.sftp.clearFinished(),
   };
 }

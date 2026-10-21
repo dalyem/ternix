@@ -18,6 +18,7 @@ import {
   type ResolvedConnection,
   type SessionHooks,
   type SessionOptions,
+  type SftpClient,
   type ShellStream,
   SshSession,
   type Unsubscribe,
@@ -28,6 +29,7 @@ import type {
   ForwardDto,
   HostKeyDecision,
   KeyboardPromptDto,
+  SftpSessionDto,
   TerminalClosedDto,
   TerminalDto,
 } from '../../shared/app.js';
@@ -107,6 +109,8 @@ type Source =
 
 interface Terminal {
   id: string;
+  /** A terminal tab, or an SFTP browser: same connection path, different channel. */
+  kind: 'shell' | 'sftp';
   source: Source;
   label: string;
   target: string;
@@ -118,6 +122,9 @@ interface Terminal {
   specs: Map<string, PortForwardSpec>;
   session: SshSession | null;
   shell: ShellStream | null;
+  sftp: SftpClient | null;
+  /** SFTP: the login directory of the current connection. */
+  home: string | undefined;
   /** Bumped for every connection attempt; events from older attempts are ignored. */
   attempt: number;
   attached: boolean;
@@ -212,25 +219,62 @@ export class SshManager {
   private readonly osOverrides = new Map<string, OsOverride>();
   /** Bumped when the account changes: detections started before then are dropped. */
   private accountEpoch = 0;
+  private readonly sftpEndedListeners = new Set<(id: string) => void>();
 
   constructor(private readonly deps: SshManagerDeps) {}
 
   list(): TerminalDto[] {
-    return [...this.terminals.values()].map((t) => this.toDto(t));
+    return [...this.terminals.values()].filter((t) => t.kind === 'shell').map((t) => this.toDto(t));
   }
 
   open(hostId: string, cols: number, rows: number): TerminalDto {
-    return this.create({ kind: 'host', hostId }, cols, rows);
+    return this.toDto(this.create({ kind: 'host', hostId }, 'shell', cols, rows));
   }
 
   quickConnect(target: string, password: string | undefined, cols: number, rows: number) {
     parseQuickTarget(target); // fail fast, before a tab exists
-    return this.create({ kind: 'quick', target, password }, cols, rows);
+    return this.toDto(this.create({ kind: 'quick', target, password }, 'shell', cols, rows));
   }
 
-  private create(source: Source, cols: number, rows: number): TerminalDto {
+  // SFTP sessions: saved hosts only, through the same resolution, approval, host-key, prompt and
+  // teardown paths as terminals (they live in the same table, so lock, sign-out and quit treat
+  // them alike). Only the channel opened after signing in differs.
+
+  openSftp(hostId: string): SftpSessionDto {
+    return this.toSftpDto(this.create({ kind: 'host', hostId }, 'sftp', 80, 24));
+  }
+
+  listSftp(): SftpSessionDto[] {
+    return [...this.terminals.values()]
+      .filter((t) => t.kind === 'sftp')
+      .map((t) => this.toSftpDto(t));
+  }
+
+  reconnectSftp(id: string): SftpSessionDto {
+    const t = this.requireSftp(id);
+    void this.connect(t);
+    return this.toSftpDto(t);
+  }
+
+  /** The open SFTP channel of a connected SFTP session. */
+  sftpClient(id: string): SftpClient {
+    const t = this.requireSftp(id);
+    if (t.state !== 'ready' || !t.sftp || t.sftp.closed) {
+      throw new AppError('invalid_input', 'This SFTP session is not connected');
+    }
+    return t.sftp;
+  }
+
+  /** Called with the ID of every SFTP session that is closed for good (its tab is gone). */
+  onSftpEnded(listener: (id: string) => void): Unsubscribe {
+    this.sftpEndedListeners.add(listener);
+    return () => void this.sftpEndedListeners.delete(listener);
+  }
+
+  private create(source: Source, kind: Terminal['kind'], cols: number, rows: number): Terminal {
     const t: Terminal = {
       id: randomUUID(),
+      kind,
       source,
       label: source.kind === 'quick' ? source.target : 'Connecting',
       target: source.kind === 'quick' ? source.target : '',
@@ -242,6 +286,8 @@ export class SshManager {
       specs: new Map(),
       session: null,
       shell: null,
+      sftp: null,
+      home: undefined,
       attempt: 0,
       attached: false,
       shown: false,
@@ -254,7 +300,7 @@ export class SshManager {
     };
     this.terminals.set(t.id, t);
     void this.connect(t);
-    return this.toDto(t);
+    return t;
   }
 
   reconnect(id: string, cols: number, rows: number): TerminalDto {
@@ -312,6 +358,7 @@ export class SshManager {
     t.attempt++;
     this.cancelPrompts(t.id);
     this.dropOutput(t);
+    if (t.kind === 'sftp') for (const listener of [...this.sftpEndedListeners]) listener(id);
     await t.session?.close();
   }
 
@@ -550,6 +597,8 @@ export class SshManager {
     const previousShell = t.shell;
     t.session = null;
     t.shell = null;
+    t.sftp = null;
+    t.home = undefined;
     t.exit = undefined;
     t.closed = undefined;
     t.state = 'connecting';
@@ -697,6 +746,10 @@ export class SshManager {
       if (t.source.kind === 'quick' && t.source.password !== undefined) {
         t.source = { kind: 'quick', target: t.source.target, password: undefined };
       }
+      if (t.kind === 'sftp') {
+        await this.startSftp(t, session, live);
+        return;
+      }
       const shell = await session.openShell({ cols: t.cols, rows: t.rows });
       if (!live()) {
         shell.close();
@@ -731,6 +784,37 @@ export class SshManager {
       this.dropOutput(t);
       this.fail(t, err);
     }
+  }
+
+  /**
+   * The SFTP tab's channel, opened on the signed-in session. The tab reads `ready` once the
+   * subsystem runs and the login directory is known. When the channel ends (the server closed it,
+   * or it stopped answering), the connection is closed too and the tab reads closed.
+   */
+  private async startSftp(t: Terminal, session: SshSession, live: () => boolean): Promise<void> {
+    const sftp = await session.openSftp();
+    if (!live()) {
+      sftp.close();
+      void session.close();
+      return;
+    }
+    const home = await sftp.realpath('.').catch(() => '/');
+    if (!live() || sftp.closed) {
+      sftp.close();
+      void session.close();
+      if (live()) this.fail(t, new AppError('channel_failed', 'The SFTP channel closed'));
+      return;
+    }
+    t.sftp = sftp;
+    t.home = home;
+    t.state = 'ready';
+    t.hop = undefined;
+    sftp.onClose((error) => {
+      if (t.sftp !== sftp || !live()) return;
+      if (error) t.closed ??= { kind: 'error', message: error.message, code: error.code };
+      void session.close();
+    });
+    this.publish(t);
   }
 
   /**
@@ -924,7 +1008,8 @@ export class SshManager {
 
   private require(id: string): Terminal {
     const t = this.terminals.get(id);
-    if (!t) throw new AppError('invalid_input', 'That terminal no longer exists');
+    if (!t || t.kind !== 'shell')
+      throw new AppError('invalid_input', 'That terminal no longer exists');
     return t;
   }
 
@@ -938,8 +1023,30 @@ export class SshManager {
     this.publish(t);
   }
 
+  private requireSftp(id: string): Terminal {
+    const t = this.terminals.get(id);
+    if (!t || t.kind !== 'sftp')
+      throw new AppError('invalid_input', 'That SFTP session no longer exists');
+    return t;
+  }
+
   private publish(t: Terminal): void {
-    if (this.terminals.has(t.id)) this.deps.emit('ssh.status', this.toDto(t));
+    if (!this.terminals.has(t.id)) return;
+    if (t.kind === 'sftp') this.deps.emit('sftp.status', this.toSftpDto(t));
+    else this.deps.emit('ssh.status', this.toDto(t));
+  }
+
+  private toSftpDto(t: Terminal): SftpSessionDto {
+    return {
+      id: t.id,
+      hostId: t.source.kind === 'host' ? t.source.hostId : '',
+      label: t.label,
+      target: t.target,
+      state: t.state,
+      ...(t.hop ? { hop: t.hop } : {}),
+      ...(t.closed ? { closed: t.closed } : {}),
+      ...(t.home !== undefined && t.state === 'ready' ? { home: t.home } : {}),
+    };
   }
 
   private toDto(t: Terminal): TerminalDto {

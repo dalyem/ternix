@@ -209,7 +209,7 @@ test('packaged app: setup, register, host, host key, terminal, forwards, snippet
       ipcRenderer: typeof (window as unknown as { ipcRenderer?: unknown }).ipcRenderer,
       origin: location.origin,
     }));
-    expect(exposed.bridge).toEqual(['invoke', 'onEvent', 'onTerminalData']);
+    expect(exposed.bridge).toEqual(['invoke', 'onEvent', 'onTerminalData', 'uploadDropped']);
     expect(exposed.hasRequire).toBe('undefined');
     expect(exposed.hasProcess).toBe('undefined');
     expect(exposed.ipcRenderer).toBe('undefined');

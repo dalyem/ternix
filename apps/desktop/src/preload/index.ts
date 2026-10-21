@@ -1,14 +1,16 @@
-import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron';
+import { contextBridge, ipcRenderer, type IpcRendererEvent, webUtils } from 'electron';
 import {
   EVENT_CHANNEL,
   PAGE_CHANNEL,
   RPC_CHANNEL,
+  SFTP_DROP_CHANNEL,
+  type SftpDropRequest,
   TERMINAL_CHANNEL_PREFIX,
   type TernixBridge,
 } from '../shared/ipc.js';
 
 /**
- * The renderer's only door to the main process: three narrow functions. Method names are
+ * The renderer's only door to the main process: four narrow functions. Method names are
  * not allow-listed here (main does that and validates every argument); what this file
  * guarantees is that the renderer never touches `ipcRenderer`, an event object, or any
  * channel but these.
@@ -40,6 +42,26 @@ const bridge: TernixBridge = {
     };
     ipcRenderer.on(channel, handler);
     return () => void ipcRenderer.off(channel, handler);
+  },
+
+  uploadDropped(id, remoteDir, files) {
+    // Paths come from the files themselves, never from the page: a `File` the page constructed
+    // (or anything else) has no path on disk and is left out.
+    const list: unknown[] = Array.isArray(files) ? files : [];
+    const paths: string[] = [];
+    for (const file of list) {
+      try {
+        const path = webUtils.getPathForFile(file as File);
+        if (path) paths.push(path);
+      } catch {
+        // Not a File.
+      }
+    }
+    if (paths.length === 0) {
+      return Promise.resolve({ ok: true as const, value: { queued: 0, skipped: list.length } });
+    }
+    const request: SftpDropRequest = { id, remoteDir, paths };
+    return ipcRenderer.invoke(SFTP_DROP_CHANNEL, page, request);
   },
 };
 

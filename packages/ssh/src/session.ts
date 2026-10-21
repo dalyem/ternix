@@ -9,6 +9,7 @@ import type {
   KeyboardInteractiveCallback,
   ParsedKey,
   Prompt,
+  SFTPWrapper,
   ShellOptions as Ssh2ShellOptions,
 } from 'ssh2';
 import type { HostOs, KnownHostPayload } from '@ternix/core/items';
@@ -30,6 +31,8 @@ import {
   osFromProbe,
 } from './os.js';
 import type { HopSettings, PortForwardSpec, ResolvedConnection, ResolvedKey } from './resolve.js';
+import { SftpClient } from './sftp.js';
+import type { SftpOptions } from './sftp.js';
 
 const { Client, utils } = ssh2;
 
@@ -158,6 +161,7 @@ const DEFAULT_CONNECT_TIMEOUT_MS = 15_000;
 const DEFAULT_READY_TIMEOUT_MS = 60_000;
 const DEFAULT_KEEPALIVE_COUNT_MAX = 3;
 const CLIENT_CLOSE_GRACE_MS = 1_500;
+const SFTP_OPEN_TIMEOUT_MS = 15_000;
 const PASSWORD_PROMPT = /password/i;
 const SECOND_FACTOR_PROMPT = /one.?time|otp|token|verification|code|duo|2fa/i;
 
@@ -428,6 +432,7 @@ export class SshSession {
   private readonly clients: Ssh2Client[] = [];
   private readonly closedClients = new WeakSet<Ssh2Client>();
   private readonly shells = new Set<Shell>();
+  private readonly sftps = new Set<SftpClient>();
   private target: Ssh2Client | undefined;
   private forwards: ForwardManager | undefined;
   private startupScript: string | undefined;
@@ -536,6 +541,51 @@ export class SshSession {
     return shell;
   }
 
+  /**
+   * Open the SFTP subsystem on its own channel (no agent forwarding, no startup snippet). Fails
+   * with `channel_failed` when the server refuses it, or `timeout` when it does not answer.
+   */
+  async openSftp(options: SftpOptions & { openTimeoutMs?: number } = {}): Promise<SftpClient> {
+    const client = this.requireReady();
+    const wrapper = await new Promise<SFTPWrapper>((resolve, reject) => {
+      let done = false;
+      const timer = setTimeout(() => {
+        done = true;
+        reject(new SshError('timeout', 'The server did not start SFTP in time'));
+      }, options.openTimeoutMs ?? SFTP_OPEN_TIMEOUT_MS);
+      try {
+        client.sftp((err, sftp) => {
+          if (done) {
+            // Answered after the timeout: nobody uses it, so it would stay open on the server.
+            if (!err) sftp.end();
+            return;
+          }
+          done = true;
+          clearTimeout(timer);
+          if (err) reject(err);
+          else resolve(sftp);
+        });
+      } catch (err) {
+        done = true;
+        clearTimeout(timer);
+        reject(err);
+      }
+    }).catch((err: unknown) => {
+      if (err instanceof SshError) throw err;
+      throw new SshError('channel_failed', `Cannot start SFTP: ${errorMessage(err)}`, {
+        cause: err,
+      });
+    });
+    const sftp = new SftpClient(wrapper, options);
+    if (this.shutdownPromise) {
+      sftp.destroy();
+      throw new SshError('closed', 'The session closed while SFTP was starting');
+    }
+    this.sftps.add(sftp);
+    sftp.onClose(() => this.sftps.delete(sftp));
+    return sftp;
+  }
+
   async startForward(spec: PortForwardSpec): Promise<ForwardStatus> {
     this.requireReady();
     return this.forwards!.start(spec);
@@ -580,7 +630,7 @@ export class SshSession {
     return fromProbe ?? fromIdent;
   }
 
-  /** Stop forwards and shells, end every connection in the chain. Safe to call repeatedly. */
+  /** Stop forwards, shells and SFTP, end every connection in the chain. Safe to call repeatedly. */
   close(): Promise<void> {
     return this.shutdown({ kind: 'requested' });
   }
@@ -605,6 +655,8 @@ export class SshSession {
   private async runShutdown(reason: CloseReason): Promise<void> {
     for (const shell of this.shells) shell.destroy();
     this.shells.clear();
+    for (const sftp of [...this.sftps]) sftp.destroy();
+    this.sftps.clear();
     await this.forwards?.stopAll();
     await Promise.all([...this.clients].reverse().map((client) => this.endClient(client)));
     this.state = 'closed';

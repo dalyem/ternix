@@ -51,5 +51,18 @@ export type {
   Unsubscribe,
 } from './session.js';
 export type { ForwardListener, ForwardState, ForwardStatus } from './forwards.js';
+export { SftpClient, remoteBaseName, remoteChild } from './sftp.js';
+export type {
+  LocalSink,
+  LocalSource,
+  RemoveOptions,
+  SftpEntry,
+  SftpEntryType,
+  SftpOptions,
+  SftpStat,
+  TransferOptions,
+  TransferProgress,
+  UploadOptions,
+} from './sftp.js';
 export { parseSocksRequest, serveSocks5 } from './socks.js';
 export type { SocksConnector, SocksParse, SocksRequest } from './socks.js';

@@ -1,4 +1,14 @@
-import type { AppEvents, AppInfo, AppSettings, ImportedFile, TerminalDto } from './app.js';
+import type {
+  AppEvents,
+  AppInfo,
+  AppSettings,
+  ImportedFile,
+  SftpListingDto,
+  SftpSessionDto,
+  TerminalDto,
+  TransferBatchDto,
+  TransferDto,
+} from './app.js';
 import type {
   AccountDto,
   ClientState,
@@ -45,6 +55,18 @@ export const TERMINAL_CHANNEL_PREFIX = 'ternix:term:';
  * replaced after the user signed out (see `main/ipc/pageGate.ts`).
  */
 export const PAGE_CHANNEL = 'ternix:page';
+/**
+ * Files dropped on the SFTP browser: the preload sends their paths here (from
+ * `webUtils.getPathForFile`). Page scripts cannot use this channel; they hand the preload `File`
+ * objects, never path strings. Checked like `RPC_CHANNEL`, argument `SftpDropRequest`.
+ */
+export const SFTP_DROP_CHANNEL = 'ternix:sftp-drop';
+
+export interface SftpDropRequest {
+  id: string;
+  remoteDir: string;
+  paths: string[];
+}
 
 /** A probed server, plus whether its address looks like a tailnet one (a UI hint only). */
 export interface ProbedServerDto extends ServerInfoDto {
@@ -166,6 +188,26 @@ export interface RpcMethods {
   'ssh.answerKeyboard': Rpc<{ promptId: string; answers: string[] | null }, void>;
   'ssh.forward.start': Rpc<{ id: string; forwardId: string }, void>;
   'ssh.forward.stop': Rpc<{ id: string; forwardId: string }, void>;
+
+  /** SFTP browser tabs. Each has its own connection to a saved host (`ssh.*` rules apply). */
+  'sftp.list': Rpc<void, SftpSessionDto[]>;
+  'sftp.open': Rpc<{ hostId: string }, SftpSessionDto>;
+  'sftp.reconnect': Rpc<{ id: string }, SftpSessionDto>;
+  'sftp.close': Rpc<{ id: string }, void>;
+  /** List a remote directory; `path` may be relative to the login directory. */
+  'sftp.readdir': Rpc<{ id: string; path: string }, SftpListingDto>;
+  'sftp.mkdir': Rpc<{ id: string; path: string }, void>;
+  /** Fails with `already_exists` rather than replacing. */
+  'sftp.rename': Rpc<{ id: string; from: string; to: string }, void>;
+  /** Main asks the user to confirm in a native dialog; declining fails with `cancelled`. */
+  'sftp.remove': Rpc<{ id: string; paths: string[] }, void>;
+  /** Main shows its open dialog (files, or one folder) and uploads what the user picks. */
+  'sftp.upload': Rpc<{ id: string; remoteDir: string; kind: 'files' | 'folder' }, TransferBatchDto>;
+  /** Main shows its save (one file) or folder dialog and downloads into what the user picks. */
+  'sftp.download': Rpc<{ id: string; paths: string[] }, TransferBatchDto>;
+  'sftp.transfers': Rpc<void, TransferDto[]>;
+  'sftp.cancelTransfer': Rpc<{ transferId: string }, void>;
+  'sftp.clearTransfers': Rpc<void, void>;
 }
 
 export type RpcMethodName = keyof RpcMethods;
@@ -180,6 +222,11 @@ export interface TernixBridge {
   onEvent(listener: (name: string, payload: unknown) => void): () => void;
   /** Terminal output of one session. */
   onTerminalData(id: string, listener: (data: Uint8Array) => void): () => void;
+  /**
+   * Upload files dropped on the SFTP browser into `remoteDir`. Takes the dropped `File` objects
+   * (the preload looks up their paths); a `File` the page made itself has no path and is ignored.
+   */
+  uploadDropped(id: string, remoteDir: string, files: File[]): Promise<RpcResult<TransferBatchDto>>;
 }
 
 export type { AppEvents };

@@ -14,8 +14,8 @@ narrow, validated bridge.
 | `src/main/index.ts`           | Startup: client, SSH manager, IPC, window, auto-lock, quit                                                                                                     |
 | `src/main/app`                | Electron glue: `safeStorage` secret store, settings, Argon2 worker, window hardening, `ternix://` protocol, auto-lock, menu, native trust dialogs (`trust.ts`) |
 | `src/main/ipc`                | The request table: zod schema per method (`schemas.ts`), dispatcher (`dispatch.ts`), handlers (`handlers.ts`), secret redaction and merging (`secrets.ts`)     |
-| `src/main/ssh`                | `SshManager`: one `SshSession` per terminal tab, host-key and keyboard-interactive prompts, forwards                                                           |
-| `src/preload`                 | The bridge: `window.ternix` with `invoke`, `onEvent`, `onTerminalData`                                                                                         |
+| `src/main/ssh`                | `SshManager`: one `SshSession` per terminal or SFTP tab, host-key and keyboard-interactive prompts, forwards; `SftpManager` and the local file boundary        |
+| `src/preload`                 | The bridge: `window.ternix` with `invoke`, `onEvent`, `onTerminalData`, `uploadDropped`                                                                        |
 | `src/renderer`                | React UI: sign-in screens, vault views, editors, terminals, sharing, settings                                                                                  |
 | `src/shared`                  | Types shared by main and renderer: client DTOs (`types.ts`), shell DTOs (`app.ts`), the IPC contract (`ipc.ts`)                                                |
 | `build`                       | Icon (`icon.png`, drawn by `generate-icon.mjs`), macOS entitlements                                                                                            |
@@ -85,6 +85,34 @@ typecheck test` covers everything that does not need the Electron binary).
   never with the agent. A quick-connect password is dropped once the session has signed in, so
   reconnecting that tab can only sign in through keyboard-interactive; a server that does not
   offer it needs a new quick connect.
+- **SFTP.** The SFTP tab (second in the tab bar; the sidebar hides while it is in front) browses
+  a saved host's files: breadcrumbs or a typed path (`~` is the login directory), a sortable list
+  (name, size, modified, permissions; symlinks show what they point to), double-click to open a
+  folder or download a file, a context menu (download, rename, new folder, copy path, delete),
+  uploads by button or by dropping files and folders on the list, and a transfers panel with
+  progress and cancel. "Open SFTP" on a host card or in a terminal's toolbar opens one; several
+  can be open. Each SFTP session is its own connection, made by `SshManager` exactly like a
+  terminal's (same approval before DNS, host-key dialog, jump hosts, credentials and prompts) and
+  kept in the same table, so it closes on sign-out, account switch and quit like a terminal and,
+  like one, stays connected while the vault is locked (the browser itself unmounts; its
+  transfers go on). File operations need an unlocked vault. Transfers run two at a time per
+  session, 16 requests in flight each, with every request timed out (a server that stops
+  answering has its SFTP channel closed). **No renderer-supplied local path reaches the
+  filesystem**, so there is no local file pane: uploads read only what the user picked in main's
+  open dialog or dropped on the window (the preload turns the dropped `File` objects into paths
+  with `webUtils.getPathForFile` and sends them on its own channel, `ternix:sftp-drop`, which page
+  scripts cannot reach; a `File` the page builds has no path and is ignored). Downloads write
+  only to the file chosen in main's save dialog or inside the folder chosen in its folder dialog:
+  names from the server must be one plain component (no `.`/`..`, separators or NUL; on Windows
+  no reserved device names, `<>:"|?*`, control characters or trailing dots and spaces) or the
+  file is skipped and listed with the reason; every folder written to must resolve to itself
+  inside the destination (a symlink in the way is refused, never followed); new files are
+  created with `O_EXCL`, and a replaced file is written to a temporary file that is renamed over
+  it once complete. An existing file (local or remote) is replaced only after main's "File
+  already exists" dialog (Skip is the default; "do the same for the other files" applies to that
+  transfer). Deletes are confirmed in main's dialog; folders are deleted recursively without
+  following symlinks (each entry is `lstat`ed and links are unlinked). The renderer gets file
+  names and remote paths, never local paths.
 - **Host operating system.** Once a saved host's shell is open (never for a quick connect, and
   only while Settings → Terminal → "Detect host operating system after connecting" is on, the
   default), main asks `SshSession.detectOs()` in the background: it reads the server's
@@ -177,7 +205,7 @@ The renderer is untrusted: anything it can do, an XSS in it could do. So:
 | Control                                                                                                                        | Where                                                                                       |
 | ------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------- |
 | `contextIsolation: true`, `sandbox: true`, `nodeIntegration: false`                                                            | `src/main/app/window.ts` (`webPreferences`); `app.enableSandbox()` in `src/main/index.ts`   |
-| Preload exposes three functions, never `ipcRenderer`                                                                           | `src/preload/index.ts`                                                                      |
+| Preload exposes four functions, never `ipcRenderer`                                                                            | `src/preload/index.ts`                                                                      |
 | Every IPC argument validated with zod in main, unknown keys refused                                                            | `src/main/ipc/schemas.ts`, `dispatch.ts`; sender, frame and page URL checked in `index.ts`  |
 | CSP: `default-src 'none'`, `script-src 'self'`, no remote content, no eval                                                     | `<meta>` injected by `electron.vite.config.ts` into `index.html`                            |
 | Renderer served from `ternix://app/`, not `file://`                                                                            | `src/main/app/protocol.ts`; fuse `grantFileProtocolExtraPrivileges` off                     |
@@ -192,6 +220,9 @@ The renderer is untrusted: anything it can do, an XSS in it could do. So:
 | Leaving a session reloads the window; requests from the page before the reload are refused (`stale_page`)                      | `src/main/ipc/pageGate.ts`, `PAGE_CHANNEL` in `src/preload/index.ts`                        |
 | A hop without a stored host key is approved in main's dialog before any DNS lookup or connection                               | `confirmNewHosts` in `trust.ts`, `ssh/manager.ts`                                           |
 | Local and dynamic forwards listen only on an IP address or `localhost`, never a name to look up                                | `startForward` in `ssh/manager.ts`; the forward editor checks too                           |
+| SFTP takes no local path from the page: uploads from main's open dialog or a drop, downloads into main's save or folder dialog | `ssh/sftp.ts`, `ssh/localFiles.ts`, `uploadDropped` in `src/preload/index.ts`               |
+| Downloaded names are checked (one component, no reserved names), no local symlink is followed, nothing is silently replaced    | `unsafeLocalName`, `LocalDestination` in `ssh/localFiles.ts`                                |
+| SFTP deletes and replacing existing files are confirmed in main's native dialog                                                | `ssh/sftp.ts`                                                                               |
 | Locking unmounts everything but the terminals and clears decrypted state                                                       | `src/renderer/src/screens/Shell.tsx`, `store.ts` (`clearData`)                              |
 | Session on disk only through `safeStorage`; refuses when unavailable                                                           | `src/main/app/secretStore.ts`; login and register check it first                            |
 | Fuses: `runAsNode` off, `NODE_OPTIONS` off, `--inspect` off, `onlyLoadAppFromAsar` on, ASAR integrity on, cookie encryption on | `electron-builder.common.mjs` (`releaseFuses`); read back in CI by `scripts/check-fuses.sh` |
@@ -229,6 +260,11 @@ compromised renderer can still:
   through it, without a dialog, so an attacker-chosen forward on a trusted host can make the
   computer look up a name. Local and dynamic forwards hand their destinations to the SSH
   server, and their bind address cannot be a name;
+- browse, upload to, download from, rename and delete files on connected SFTP sessions (as a
+  shell could), but deletes and replacing an existing file wait for main's dialog, and it can
+  only start an upload or a download, never pick what is read or where it is written: the user
+  picks that in main's dialogs or by dropping files. It can read the files the user drops (it
+  could anyway, through the `File` objects);
 - show misleading information next to a native dialog; the dialog's own text comes from main.
 
 The review recommended moving secret editing out of the renderer entirely (a separate,
@@ -310,7 +346,10 @@ the mark-verified flow) and a malicious server: the test rewrites a member's `pu
 the server's SQLite database and checks that removal and rotation open the key change dialog,
 send nothing until the new fingerprint is accepted, and then go through. By default the SSH server is an in-process `ssh2` server
 with a fake shell; set `E2E_SSH_ADDRESS`, `E2E_SSH_PORT`, `E2E_SSH_USER` and `E2E_SSH_PASSWORD`
-to use a real OpenSSH `sshd`. Screenshots go to `e2e/artifacts/` (ignored by git); `e2e/restyle.e2e.ts` writes a full-window
+to use a real OpenSSH `sshd`. `e2e/sftp.e2e.ts` covers the SFTP browser against the fake sshd,
+whose SFTP subsystem serves a temporary directory (the server from `packages/ssh/test/sftpServer.ts`);
+main's open and save dialogs are answered through `stubFileDialogs` in `e2e/support/dialogs.ts`.
+Screenshots go to `e2e/artifacts/` (ignored by git); `e2e/restyle.e2e.ts` writes a full-window
 PNG of each main screen (`restyle-*.png`) for design review.
 
 ```sh

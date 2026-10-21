@@ -80,6 +80,65 @@ export interface TerminalDto {
   forwards: ForwardDto[];
 }
 
+/** An SFTP browser tab: its own connection to a saved host, made like a terminal's. */
+export interface SftpSessionDto {
+  id: string;
+  hostId: string;
+  label: string;
+  /** `user@address:port`. */
+  target: string;
+  state: SshState;
+  hop?: { label: string; index: number; total: number };
+  closed?: TerminalClosedDto;
+  /** The login directory, once connected. */
+  home?: string;
+}
+
+export type SftpEntryType = 'file' | 'directory' | 'symlink' | 'other';
+
+export interface SftpEntryDto {
+  name: string;
+  /** Absolute POSIX path on the server. */
+  path: string;
+  type: SftpEntryType;
+  /** For a symlink: what it points to, or `missing`. */
+  targetType?: SftpEntryType | 'missing';
+  size: number;
+  /** Seconds since the epoch. */
+  mtime: number;
+  /** Mode bits as the server reports them. */
+  mode: number;
+}
+
+export interface SftpListingDto {
+  /** The directory listed, as the server resolved it. */
+  path: string;
+  entries: SftpEntryDto[];
+}
+
+export type TransferState = 'queued' | 'running' | 'done' | 'failed' | 'cancelled' | 'skipped';
+
+/** One file being copied. Local paths are never sent to the renderer, only names. */
+export interface TransferDto {
+  id: string;
+  sessionId: string;
+  direction: 'upload' | 'download';
+  /** The file's name (a folder transfer lists each file under its own name). */
+  name: string;
+  remotePath: string;
+  state: TransferState;
+  transferred: number;
+  total: number;
+  error?: string;
+}
+
+/** What an upload or download request queued. */
+export interface TransferBatchDto {
+  queued: number;
+  /** Items left out (unreadable, unsafe name, symlinked folder, conflict skipped). */
+  skipped: number;
+}
+
 export interface KeyboardPromptDto {
   kind: 'keyboard';
   promptId: string;
@@ -118,6 +177,11 @@ export interface AppEvents {
   /** The prompt's connection attempt ended or it timed out: dismiss its dialog. */
   'ssh.prompt-cancelled': { promptId: string };
   'ssh.notice': NoticeDto;
+  'sftp.status': SftpSessionDto;
+  /** A transfer changed (throttled while bytes move). */
+  'sftp.transfer': TransferDto;
+  /** Transfers that are no longer listed (cleared, or their session closed). */
+  'sftp.transfers-removed': { ids: string[] };
   'settings.changed': AppSettings;
 }
 
