@@ -12,9 +12,10 @@ import {
   unlink,
   writeFile,
 } from 'node:fs/promises';
+import type * as fsPromises from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { LocalFileHooks } from '../src/main/ssh/localFiles.js';
 import {
   createLocalFile,
@@ -24,8 +25,44 @@ import {
   unsafeLocalName,
 } from '../src/main/ssh/localFiles.js';
 
+type HandleMethod = 'chmod' | 'close';
+
+/**
+ * File handles from `open` run `next.during` inside their next `next.method` call, before the
+ * call itself: another process acting while main waits on its own handle. Otherwise the real
+ * module.
+ */
+const handleHooks = vi.hoisted(() => ({
+  next: undefined as { method: HandleMethod; during: () => Promise<void> } | undefined,
+}));
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const real = await importOriginal<typeof fsPromises>();
+  const open = async (...args: Parameters<typeof real.open>) => {
+    const handle = await real.open(...args);
+    for (const method of ['chmod', 'close'] as const) {
+      const original = handle[method].bind(handle) as (...a: unknown[]) => Promise<void>;
+      Object.defineProperty(handle, method, {
+        configurable: true,
+        writable: true,
+        value: async (...a: unknown[]) => {
+          const next = handleHooks.next;
+          if (next?.method === method) {
+            handleHooks.next = undefined;
+            await next.during();
+          }
+          return original(...a);
+        },
+      });
+    }
+    return handle;
+  };
+  const fs = { ...real, open };
+  return { ...fs, default: fs };
+});
+
 const cleanup: (() => void)[] = [];
 afterEach(() => {
+  handleHooks.next = undefined;
   for (const fn of cleanup.splice(0)) fn();
 });
 
@@ -338,6 +375,62 @@ describe('a folder swapped while a download writes into it', () => {
       code: 'unsafe_name',
     });
     expect((await stat(join(outside, 'x'))).size).toBe(0);
+  });
+});
+
+describe('a folder swapped while a finished or failed download is put away', () => {
+  // The swap happens while main waits on its own handle (setting the mode, closing), after the
+  // checks a caller could see. Main must check after that work, right before the rename or unlink.
+  const posixOnly = it.skipIf(process.platform === 'win32');
+
+  /** Run `during` inside the next `method` call on a file handle, before the call itself. */
+  function duringNext(method: HandleMethod, during: () => Promise<void>): void {
+    handleHooks.next = { method, during };
+  }
+
+  /** `root/d` moved to `root/d-moved`, a link to `outside` in its place. */
+  const swap = async (root: string, outside: string) => {
+    await rename(join(root, 'd'), join(root, 'd-moved'));
+    await symlink(outside, join(root, 'd'));
+  };
+
+  for (const method of ['chmod', 'close'] as const) {
+    posixOnly(`a parent swapped during the handle ${method} renames nothing outside`, async () => {
+      const root = tempDir();
+      const outside = tempDir();
+      await mkdir(join(root, 'd'));
+      await writeFile(join(root, 'd', 'x'), 'old');
+      await chmod(join(root, 'd', 'x'), 0o640);
+      await writeFile(join(outside, 'x'), 'precious');
+      const dest = await LocalDestination.open(root, 'linux');
+      const file = await dest.file(join(dest.root, 'd'), 'x', true);
+      await file.sink.write(Buffer.from('downloaded'), 0);
+      const [temp] = (await readdir(join(root, 'd'))).filter((n) => n !== 'x');
+      // The other process can read the temporary name and plant the same name outside.
+      duringNext(method, async () => {
+        await swap(root, outside);
+        await writeFile(join(outside, temp!), 'planted');
+      });
+      await expect(file.finish()).rejects.toMatchObject({ code: 'unsafe_name' });
+      expect(await readFile(join(outside, 'x'), 'utf8')).toBe('precious');
+      expect(await readFile(join(outside, temp!), 'utf8')).toBe('planted');
+      expect(await readFile(join(root, 'd-moved', 'x'), 'utf8')).toBe('old');
+    });
+  }
+
+  posixOnly('a parent swapped while a failed download closes unlinks nothing outside', async () => {
+    const root = tempDir();
+    const outside = tempDir();
+    await mkdir(join(root, 'd'));
+    await writeFile(join(outside, 'x'), 'precious');
+    const dest = await LocalDestination.open(root, 'linux');
+    const file = await dest.file(join(dest.root, 'd'), 'x', false);
+    await file.sink.write(Buffer.from('half'), 0);
+    duringNext('close', () => swap(root, outside));
+    await file.discard();
+    expect(await readFile(join(outside, 'x'), 'utf8')).toBe('precious');
+    // What was written is gone from the file that is ours, though its name stays.
+    expect((await stat(join(root, 'd-moved', 'x'))).size).toBe(0);
   });
 });
 

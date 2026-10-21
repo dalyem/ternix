@@ -332,7 +332,7 @@ export class SftpManager {
       prep.check();
       visit();
       const local = await this.safely(id, prep, remote, () =>
-        dest.directory(parent, remoteBaseName(remote)),
+        dest.directory(parent, remoteBaseName(remote), prep.check),
       );
       prep.check();
       if (local === undefined) {
@@ -535,7 +535,7 @@ export class SftpManager {
     prep: Preparation,
   ): Promise<TransferBatchDto> {
     const sftp = this.client(id);
-    const plan = await planUpload(paths);
+    const plan = await planUpload(paths, prep.check);
     prep.check();
     const remotePathOf = (dirs: string[], name?: string) =>
       [...dirs, ...(name === undefined ? [] : [name])].reduce(

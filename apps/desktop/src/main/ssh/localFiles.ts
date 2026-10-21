@@ -67,6 +67,14 @@ export interface LocalFileHooks {
   afterOpen?: () => Promise<void>;
 }
 
+/**
+ * Throws when the work it belongs to should stop (its tab closed, the user cancelled). Called
+ * after every wait and right before every change on disk.
+ */
+export type StillWanted = () => void;
+
+const always: StillWanted = () => {};
+
 const outsideError = () =>
   new AppError('unsafe_name', 'That would write outside the chosen folder');
 
@@ -104,12 +112,16 @@ export class LocalDestination {
   /**
    * The folder `name` inside `parent` (a folder this destination returned, or its root): made
    * when missing, reused when it is a real folder, refused when a file or a link is in the way.
+   * `check` runs after each wait, so nothing is made once the work is no longer wanted.
    */
-  async directory(parent: string, name: string): Promise<string> {
+  async directory(parent: string, name: string, check: StillWanted = always): Promise<string> {
     requireSafeName(name, this.platform);
+    check();
     await this.requireRealDir(parent);
+    check();
     const target = join(parent, name);
     const existing = await lstat(target).catch(() => undefined);
+    check();
     if (!existing) {
       await mkdir(target);
       // Made by us just now; check again in case something raced us to it, or swapped a folder
@@ -118,6 +130,7 @@ export class LocalDestination {
         throw new AppError('unsafe_name', `"${printable(name)}" changed while it was created`);
       }
       await this.requireRealDir(target);
+      check();
       return target;
     }
     if (existing.isSymbolicLink()) {
@@ -187,10 +200,12 @@ export async function createLocalFile(
  * `createLocalFile` in `dir`, a folder that resolves to itself inside `root`. Node has no
  * `openat`, so every path operation resolves `dir` again, and a local process that can write to
  * the folder could swap it (or the file) for a link in between. The gaps are kept as small as
- * Node allows: right after the open, before the rename into place and before removing a failed
- * download, the folder must still resolve to itself inside `root` and the name must still be the
- * file the handle has open (same device and inode, not a link). When it is not, the name is left
- * alone, what the handle has open is emptied (that file is provably ours), and the download fails.
+ * Node allows: right after the open, and after all work on the handle (mode, close) right before
+ * the rename into place or the removal of a failed download, the folder must still resolve to
+ * itself inside `root` and the name must still be the file the handle has open (same device and
+ * inode, not a link). Nothing is awaited between that last check and the rename or unlink. When
+ * the check fails, the name is left alone and the download fails; what was written is emptied
+ * through the handle when it is still open (that file is provably ours).
  *
  * Modes: a new file is created with 0666 less the umask, like any new file. A temporary file is
  * 0600 while it is written; on `finish` it takes the permission bits of the file it replaces
@@ -278,18 +293,27 @@ async function createIn(
       },
     },
     finish: async () => {
+      // A swap during the download: caught while the handle can still empty the file.
       if (!(await isOurs())) await refuse();
+      // All work on the handle before the last check; `fchmod`, never the path.
       if (keepMode !== undefined) await handle.chmod(keepMode);
       await close();
+      // A swap meanwhile: the file keeps its data, wherever the other process moved it.
+      if (!(await isOurs())) {
+        throw new AppError(
+          'unsafe_name',
+          `The chosen folder changed while "${printable(name)}" was saved; it may have moved`,
+        );
+      }
+      // No wait between the check and the rename.
       if (path !== target) await rename(path, target);
     },
     discard: async () => {
-      if (!(await isOurs())) {
-        await refuse().catch(() => undefined);
-        return;
-      }
+      // Emptied through the handle first: whatever happens to the name, nothing is left in it.
+      if (!closed) await handle.truncate(0).catch(() => undefined);
       await close().catch(() => undefined);
-      await unlink(path).catch(() => undefined);
+      // No wait between the check and the unlink; when the check fails the name is left.
+      if (await isOurs()) await unlink(path).catch(() => undefined);
     },
   };
 }
@@ -340,9 +364,13 @@ const MAX_UPLOAD_DEPTH = 64;
  * What uploading `paths` (picked or dropped by the user) means: each file as it is, each folder
  * with everything in it. Inside a folder, symlinks to files are uploaded as files and symlinks to
  * folders are skipped (they could loop or reach anywhere). A picked path that is itself a link is
- * followed: the user chose it.
+ * followed: the user chose it. `check` runs after every wait, so the walk stops as soon as the
+ * upload is no longer wanted.
  */
-export async function planUpload(paths: readonly string[]): Promise<UploadPlan> {
+export async function planUpload(
+  paths: readonly string[],
+  check: StillWanted = always,
+): Promise<UploadPlan> {
   const plan: UploadPlan = { dirs: [], files: [], skipped: 0 };
   const addFile = (local: string, dirs: string[], st: Stats) => {
     if (plan.files.length >= MAX_UPLOAD_FILES) {
@@ -359,6 +387,7 @@ export async function planUpload(paths: readonly string[]): Promise<UploadPlan> 
       return;
     }
     plan.dirs.push(dirs);
+    check();
     let handle;
     try {
       handle = await opendir(dir);
@@ -367,11 +396,17 @@ export async function planUpload(paths: readonly string[]): Promise<UploadPlan> 
       return;
     }
     const names: string[] = [];
-    for await (const entry of handle) names.push(entry.name);
+    // Throwing inside the loop closes the directory.
+    for await (const entry of handle) {
+      check();
+      names.push(entry.name);
+    }
+    check();
     names.sort();
     for (const name of names) {
       const local = join(dir, name);
       const entry = await lstat(local).catch(() => undefined);
+      check();
       if (!entry) {
         plan.skipped++;
       } else if (entry.isDirectory()) {
@@ -380,6 +415,7 @@ export async function planUpload(paths: readonly string[]): Promise<UploadPlan> 
         addFile(local, dirs, entry);
       } else if (entry.isSymbolicLink()) {
         const target = await stat(local).catch(() => undefined);
+        check();
         if (target?.isFile()) addFile(local, dirs, target);
         else plan.skipped++;
       } else {
@@ -388,7 +424,9 @@ export async function planUpload(paths: readonly string[]): Promise<UploadPlan> 
     }
   };
   for (const path of paths) {
+    check();
     const st = await stat(path).catch(() => undefined);
+    check();
     if (st?.isFile()) addFile(path, [], st);
     else if (st?.isDirectory()) await walk(path, [basename(path)]);
     else plan.skipped++;

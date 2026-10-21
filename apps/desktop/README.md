@@ -293,16 +293,33 @@ compromised renderer can still:
   could anyway, through the `File` objects);
 - show misleading information next to a native dialog; the dialog's own text comes from main.
 
-Downloads also have a local race that main can narrow but not close. Node has no `openat`, so
-every path operation resolves the chosen folder again. A local process that can write to the
-chosen folder (or a folder below it) while a transfer runs could swap a folder for a symlink in
-the instant between a check and the next operation, and so make one empty file appear outside
-the folder (between the check and the open) or one finished temporary file be renamed outside
-it (between the last check and the rename). Main checks, right after the open, before the rename
-into place and before removing a failed download, that the folder still resolves to itself
-inside the destination and that the name is still the file it has open (same device and inode).
-When it is not, the download stops, the name is left alone and what main opened is emptied. The
-risk needs a local attacker with write access to the chosen folder during the transfer.
+Downloads also have a local race that main can narrow but not close. Node has no `openat`,
+`unlinkat` or `renameat`, so every path operation resolves the chosen folder again, and a check
+by path can never be atomic with the operation after it. A local process that can write to the
+chosen folder (or a folder below it) while a transfer runs, and that swaps a folder for a symlink
+to some folder O the user can write to in the instant between a check and the next system call,
+can still:
+
+- make one empty file (named as the download, or a `.ternix-<random>.part` temporary name) or
+  one empty folder appear in O, between the check and the open or `mkdir`. Main notices right
+  after, stops the download and leaves that entry where it is;
+- delete a file in O that has the same name as a new download, between the last check and the
+  `unlink` that removes the download after it failed or was cancelled. A download that replaces
+  a file only ever removes its own random temporary name;
+- rename `O/.ternix-<random>.part` over the file of the download's name in O, between the last
+  check and the rename into place. That needs a file with that random name to be in O already,
+  which only someone who can write to O could arrange.
+
+Each of these windows is one gap between system calls: main sets the mode (through the handle)
+and closes the file before its last check, then runs the rename or `unlink` with nothing awaited
+in between. That last check, also run right after the open, requires the folder to still
+resolve to itself inside the destination and the name to still be the file main opened (same
+device and inode, not a link). When it fails, the download stops and the name is left alone.
+What was written is emptied through the handle if the file is still open; a swap during the
+final close leaves the complete file wherever the other process moved the folder. Preparing a
+download or upload (walking folders, making local folders) stops after each wait once its tab
+closes, so no `mkdir` starts after that. All of this needs a local attacker with write access to
+the chosen folder during the transfer.
 
 The review recommended moving secret editing out of the renderer entirely (a separate,
 minimal window or native forms owned by main). That is out of scope for v1.

@@ -1,6 +1,8 @@
 import { randomBytes } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
-import { lstat, mkdir, readFile, readdir, symlink, writeFile } from 'node:fs/promises';
+import type { PathLike } from 'node:fs';
+import { lstat, mkdir, readFile, readdir, realpath, symlink, writeFile } from 'node:fs/promises';
+import type * as fsPromises from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -13,11 +15,36 @@ import { SftpManager, type SftpManagerDeps } from '../src/main/ssh/sftp.js';
 import { TestSshServer } from '../../../packages/ssh/test/helpers.js';
 import type { SftpServerOptions } from '../../../packages/ssh/test/sftpServer.js';
 
+/**
+ * Runs `before` ahead of main's local `realpath`, `lstat` and `opendir` calls, so a test can act
+ * (close a tab) while main waits on one. Everything else is the real module.
+ */
+const localFs = vi.hoisted(() => ({
+  before: undefined as ((op: string, path: string) => Promise<void>) | undefined,
+}));
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const real = await importOriginal<typeof fsPromises>();
+  const gate =
+    <A extends unknown[], R>(op: string, fn: (path: PathLike, ...rest: A) => Promise<R>) =>
+    async (path: PathLike, ...rest: A): Promise<R> => {
+      await localFs.before?.(op, String(path));
+      return fn(path, ...rest);
+    };
+  const fs = {
+    ...real,
+    realpath: gate('realpath', real.realpath),
+    lstat: gate('lstat', real.lstat),
+    opendir: gate('opendir', real.opendir),
+  };
+  return { ...fs, default: fs };
+});
+
 const HOST_ID = '3f1c9a52-8e6b-4d0a-9b7e-0a1b2c3d4e5f';
 const PERSONAL = '9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d';
 
 const cleanup: (() => Promise<void> | void)[] = [];
 afterEach(async () => {
+  localFs.before = undefined;
   for (const fn of cleanup.splice(0).reverse()) await fn();
 });
 
@@ -463,6 +490,57 @@ describe('SFTP review regressions', () => {
     expect(await readdir(join(s.local, 'tree', made[0]!))).toEqual([]);
     expect(s.sftp.transfers()).toEqual([]);
     expect(transferEvents(s, mark)).toEqual([]);
+  });
+
+  for (const op of ['realpath', 'lstat'] as const) {
+    it(`a tab closed while a download waits on a local ${op} makes no folder`, async () => {
+      const s = await setup();
+      const { id } = await connected(s);
+      await mkdir(join(s.remote, 'tree', 'sub'), { recursive: true });
+      await writeFile(join(s.remote, 'tree', 'sub', 'f'), 'x');
+      const root = await realpath(s.local);
+      // Making `tree` in the picked folder: the folder is resolved again, then `tree` looked up.
+      const at = op === 'realpath' ? root : join(root, 'tree');
+      let calls = 0;
+      localFs.before = async (o, path) => {
+        if (o !== op || path !== at) return;
+        // The first realpath of the folder is opening the destination, before the walk.
+        if (++calls !== (op === 'realpath' ? 2 : 1)) return;
+        await s.sftp.close(id);
+      };
+      await expect(s.sftp.download(id, ['/tree'])).rejects.toMatchObject({ code: 'cancelled' });
+      expect(calls).toBeGreaterThanOrEqual(op === 'realpath' ? 2 : 1);
+      expect(await readdir(s.local)).toEqual([]);
+      expect(s.sftp.transfers()).toEqual([]);
+    });
+  }
+
+  it('a tab closed while an upload walks local folders stops the walk', async () => {
+    const s = await setup();
+    const { id } = await connected(s);
+    const up = join(await realpath(s.local), 'up');
+    for (const dir of ['a', 'b', 'c']) {
+      await mkdir(join(up, dir), { recursive: true });
+      await writeFile(join(up, dir, 'f'), dir);
+    }
+    let closed = false;
+    const after: string[] = [];
+    localFs.before = async (op, path) => {
+      if (path !== up && !path.startsWith(`${up}/`)) return;
+      if (closed) {
+        after.push(`${op} ${path}`);
+      } else if (op === 'opendir' && path === join(up, 'a')) {
+        await s.sftp.close(id);
+        closed = true;
+      }
+    };
+    await expect(s.sftp.uploadDropped(id, '/', [up])).rejects.toMatchObject({
+      code: 'cancelled',
+    });
+    expect(closed).toBe(true);
+    // Nothing after the folder being opened when the tab closed.
+    expect(after).toEqual([]);
+    expect(await readdir(s.remote)).toEqual([]);
   });
 
   it('a download prepared across a page or account change is dropped', async () => {
