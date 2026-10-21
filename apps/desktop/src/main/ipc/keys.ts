@@ -58,8 +58,9 @@ export async function generateKeyDraft(
  * replaced. A matching one is kept as typed, comment and all. When the key cannot be read
  * the draft goes through unchanged, as it always did; connecting reports the problem.
  *
- * `stored` is the item being edited: a draft that changes neither the private key nor the
- * passphrase and already has a public key is left alone (decrypting costs time).
+ * `stored` is the item being edited: a draft that changes none of the private key, the
+ * passphrase and the public key is left alone (decrypting costs time). A changed public key
+ * alone is checked like a new one, so it cannot drift from the private key.
  */
 export function withPublicKey(draft: ItemDraft, stored: ItemPayload | undefined): ItemDraft {
   if (draft.type !== 'ssh_key') return draft;
@@ -68,13 +69,18 @@ export function withPublicKey(draft: ItemDraft, stored: ItemPayload | undefined)
   const unchanged =
     stored?.type === 'ssh_key' &&
     stored.private_key === draft.private_key &&
-    (stored.passphrase ?? '') === (draft.passphrase ?? '');
+    (stored.passphrase ?? '') === (draft.passphrase ?? '') &&
+    (stored.public_key?.trim() ?? '') === supplied;
   if (unchanged && supplied !== '') return draft;
   let derived: string;
   try {
     derived = describePrivateKey(draft.private_key, draft.passphrase).publicKey;
   } catch {
-    return draft;
+    // Unreadable here (encrypted without its passphrase, or not a key): keep what was typed,
+    // but never a second line, which would become a second entry in authorized_keys.
+    if (oneLine) return draft;
+    const { public_key: _dropped, ...rest } = draft;
+    return rest;
   }
   if (supplied !== '' && oneLine && samePublicKey(supplied, derived)) {
     return { ...draft, public_key: supplied };

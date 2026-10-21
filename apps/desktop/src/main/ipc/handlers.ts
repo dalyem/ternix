@@ -286,8 +286,10 @@ export function createHandlers(deps: HandlerDeps): Handlers {
       redactWrite(await client.deleteItem(vaultId, itemId)),
     'keys.generate': async (input) => {
       // Generation takes a while (RSA 4096 seconds): the page, the session and the account
-      // must still be the ones that asked when the key is ready to be saved.
+      // must still be the ones that asked when the key is ready to be saved. The epoch
+      // catches a lock and unlock in between, which leaves the state and account unchanged.
       const page = deps.pages.issue();
+      const epoch = client.epoch;
       const accountId = client.account?.user.id;
       const vault = client.getVault(input.vaultId);
       if (vault.error !== null || vault.role === 'viewer') {
@@ -296,6 +298,7 @@ export function createHandlers(deps: HandlerDeps): Handlers {
       const { key, draft } = await generateKeyDraft(input);
       if (
         !deps.pages.isCurrent(page) ||
+        client.epoch !== epoch ||
         client.state !== 'unlocked' ||
         client.account?.user.id !== accountId
       ) {

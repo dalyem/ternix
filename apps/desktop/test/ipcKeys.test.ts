@@ -303,6 +303,17 @@ describe('keys.generate', () => {
     expect(keysIn(a, vaultId)).toHaveLength(1);
   });
 
+  it('saves nothing when the vault was locked and unlocked again while the key was generated', async () => {
+    const { a, ipc, vaultId } = await setup();
+    const release = slowGeneration();
+    const pending = ipc.call('keys.generate', { vaultId, label: 'late' });
+    await a.client.lock();
+    await a.client.unlock(a.password);
+    release();
+    await expect(pending).rejects.toMatchObject({ code: 'cancelled' });
+    expect(keysIn(a, vaultId)).toEqual([]);
+  });
+
   it('is refused while locked', async () => {
     const { a, ipc, vaultId } = await setup();
     await a.client.lock();
@@ -463,6 +474,57 @@ describe('public keys of pasted private keys', () => {
       label: 'renamed',
       public_key: second.public.trim(),
     });
+  });
+
+  it('checks an edit that changes only the public key against the stored private key', async () => {
+    const { a, ipc, vaultId } = await setup();
+    const pair = utils.generateKeyPairSync('ed25519');
+    const other = utils.generateKeyPairSync('ed25519');
+    const saved = await ipc.call('items.put', {
+      vaultId,
+      draft: { type: 'ssh_key', label: 'k', private_key: pair.private },
+    });
+    // The secrets stay as stored (the editor never sees them); only the public line changes.
+    await ipc.call('items.put', {
+      vaultId,
+      itemId: saved.id,
+      draft: { type: 'ssh_key', label: 'k', public_key: other.public.trim() },
+    });
+    expect(stored(a, vaultId, saved.id).public_key).toBe(pair.public.trim());
+  });
+
+  it('never stores a public key of more than one line', async () => {
+    const { a, ipc, vaultId } = await setup();
+    const pair = utils.generateKeyPairSync('ed25519');
+    const other = utils.generateKeyPairSync('ed25519');
+    const twoLines = `${pair.public.trim()}\n${other.public.trim()}`;
+    const saved = await ipc.call('items.put', {
+      vaultId,
+      draft: { type: 'ssh_key', label: 'k', private_key: pair.private },
+    });
+    await ipc.call('items.put', {
+      vaultId,
+      itemId: saved.id,
+      draft: { type: 'ssh_key', label: 'k', public_key: twoLines },
+    });
+    expect(stored(a, vaultId, saved.id).public_key).toBe(pair.public.trim());
+
+    // A key that cannot be read here keeps a typed public key only when it is one line.
+    const encrypted = utils.generateKeyPairSync('ed25519', {
+      passphrase: PASSPHRASE,
+      cipher: 'aes256-ctr',
+      rounds: 4,
+    });
+    const unreadable = await ipc.call('items.put', {
+      vaultId,
+      draft: {
+        type: 'ssh_key',
+        label: 'enc',
+        private_key: encrypted.private,
+        public_key: `${encrypted.public.trim()}\n${other.public.trim()}`,
+      },
+    });
+    expect(stored(a, vaultId, unreadable.id)).not.toHaveProperty('public_key');
   });
 
   it('does not decrypt again when an edit leaves the key and passphrase alone', async () => {

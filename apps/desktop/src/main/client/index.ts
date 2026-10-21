@@ -251,6 +251,14 @@ export class TernixClient {
     return this.realtime?.connection ?? 'offline';
   }
 
+  /**
+   * Changes on every lock, logout, close, login and register. Work that outlives a call (key
+   * generation) compares it before writing, so a lock followed by an unlock still cancels it.
+   */
+  get epoch(): number {
+    return this.lifecycle;
+  }
+
   /** The logged-in account (also while locked or expired), or null. */
   get account(): AccountDto | null {
     const s = this.session;
