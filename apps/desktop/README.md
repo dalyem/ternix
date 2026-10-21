@@ -85,6 +85,20 @@ typecheck test` covers everything that does not need the Electron binary).
   never with the agent. A quick-connect password is dropped once the session has signed in, so
   reconnecting that tab can only sign in through keyboard-interactive; a server that does not
   offer it needs a new quick connect.
+- **Host operating system.** Once a saved host's shell is open (never for a quick connect, and
+  only while Settings → Terminal → "Detect host operating system after connecting" is on, the
+  default), main asks `SshSession.detectOs()` in the background: it reads the server's
+  identification line and, unless that says Windows, runs **one read-only command on the remote
+  host**, `uname -s 2>/dev/null; cat /etc/os-release 2>/dev/null`, on its own exec channel (no
+  PTY, stdin closed, 5 s timeout, 16 KiB of output at most; see `packages/ssh/README.md`). The
+  command shows up in the remote host's logs like any `ssh host command`. The terminal never
+  waits for it and failures only reach the log. When the result differs from the host's stored
+  `os`, main writes the host item once, from its own decrypted copy (secrets kept, the renderer
+  not involved), as a normal write under the conflict rule. In a vault where the account is a
+  viewer nothing is written: the detected value is shown on this device only (kept in memory,
+  merged into `items.all`, forgotten on sign-out). `items.put` keeps the stored `os` when a
+  draft leaves it out, as the host editor does, unless the address changed. Tiles show the
+  system's mark (see "Look and feel").
 - **Secrets in the renderer.** `items.all` and every write result carry payloads without
   `password`, `passphrase` and `private_key`; `has_password`, `has_passphrase` and
   `has_private_key` say whether a value is stored. An editor fetches one item's secrets with
@@ -238,6 +252,19 @@ Vaults tab, hosts and keys are cards, and every item editor is a 340px drawer (a
 over a terminal) instead of a dialog. The terminals use the "Termius Dark" colour scheme
 whatever the UI theme. Fonts are bundled (Inter, Source Code Pro; both OFL) and icons come from
 `lucide-react`, so the CSP stays `font-src 'self'` (the build never inlines fonts as `data:`).
+
+Host tiles show the operating system's mark (`src/renderer/src/osIcons.tsx`) in white (dark on
+the two yellow tiles) on the host's own colour, else the system's colour (Termius's host palette,
+else the brand colour), else a colour picked from the label; unknown systems keep the server
+glyph, and a terminal tab shows the same mark in its text colour. The marks are the
+[simple-icons](https://simpleicons.org) paths, imported one by one so only these are bundled,
+unmodified except for the fill, and used only to name the system a host runs. The trademarks
+belong to their owners. simple-icons is CC0 as a collection, but a few marks carry their owners'
+terms: Debian (CC BY-SA 3.0, the Debian Project), Rocky Linux (CC BY-SA 4.0, the Rocky
+Enterprise Software Foundation), NixOS (CC BY 4.0, the NixOS contributors), Gentoo (CC BY-SA
+2.5, Gentoo Foundation) and Fedora (Fedora's trademark guidelines). simple-icons has no mark for
+Windows, Amazon Linux or Oracle Linux: Windows uses Lucide's neutral `AppWindow` glyph, the other
+two the Linux penguin on their brand colour.
 
 ## Packaging
 

@@ -93,12 +93,19 @@ vaults it can read and treats a missing reference as unset.
 | type           | fields                                                                                                                                                                                                                                   |
 | -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `group`        | `label`, `parent_id?`, `username?`, `port?`, `identity_id?`                                                                                                                                                                              |
-| `host`         | `label`, `address`, `port` (default 22), `username?`, `password?`, `identity_id?`, `key_id?`, `group_id?`, `jump_host_id?`, `tags: string[]`, `startup_snippet_id?`, `keepalive_interval?`, `agent_forwarding: bool`, `color?`, `notes?` |
+| `host`         | `label`, `address`, `port` (default 22), `username?`, `password?`, `identity_id?`, `key_id?`, `group_id?`, `jump_host_id?`, `tags: string[]`, `startup_snippet_id?`, `keepalive_interval?`, `agent_forwarding: bool`, `color?`, `notes?`, `os?` |
 | `identity`     | `label`, `username`, `password?`, `key_id?`                                                                                                                                                                                              |
 | `ssh_key`      | `label`, `private_key` (OpenSSH PEM), `passphrase?`, `public_key?`                                                                                                                                                                       |
 | `snippet`      | `label`, `script`, `tags: string[]`                                                                                                                                                                                                      |
 | `port_forward` | `label`, `host_id`, `kind: "local"\|"remote"\|"dynamic"`, `bind_address`, `bind_port`, `dest_host?`, `dest_port?`                                                                                                                        |
 | `known_host`   | `host`, `port`, `key_type`, `public_key` (b64 wire format)                                                                                                                                                                               |
+
+`os` on a host is the operating system a client detected when it connected: one of `ubuntu`,
+`debian`, `fedora`, `centos`, `rhel`, `rocky`, `alma`, `arch`, `alpine`, `opensuse`, `nixos`,
+`raspbian`, `amazon`, `oracle`, `gentoo`, `manjaro`, `mint`, `kali`, `freebsd`, `openbsd`,
+`netbsd`, `macos`, `windows`, or `linux` (a Linux that is none of the others). It is a display
+hint and may be stale. Clients treat a value they do not know as unset, so later versions can add
+values; absent means unknown.
 
 Effective connection settings resolve as: host fields, then identity, then group
 chain (nearest first).

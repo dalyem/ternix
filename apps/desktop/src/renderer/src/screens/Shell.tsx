@@ -6,6 +6,7 @@ import {
   CloudOff,
   FingerprintPattern,
   KeyRound,
+  Layers,
   Loader,
   Lock,
   Plus,
@@ -13,12 +14,13 @@ import {
   Settings,
   SquareTerminal,
   Users,
-  Vault as VaultIcon,
   Waypoints,
   X,
 } from 'lucide-react';
 import { type ReactNode, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import type { HostOs } from '@ternix/core/items';
 import { itemsOfType, vaultTitle } from '../items.js';
+import { OsGlyph } from '../osIcons.js';
 import { closeTerminal, type NavView, reportError, setState, useStore } from '../store.js';
 import { Badge, ConfirmDialog, RoleBadge } from '../ui.js';
 import { TerminalHost } from '../terminal.js';
@@ -114,7 +116,7 @@ function VaultMenu({ anchor, onClose }: { anchor: DOMRect; onClose: () => void }
       title={title}
       onClick={() => choose(id)}
     >
-      <VaultIcon size={14} aria-hidden />
+      <Layers size={14} aria-hidden />
       <span className="ellipsis" style={{ flex: 1 }}>
         {label}
       </span>
@@ -159,8 +161,14 @@ function VaultMenu({ anchor, onClose }: { anchor: DOMRect; onClose: () => void }
   );
 }
 
-function TabIcon({ state }: { state: string }) {
-  if (state === 'ready') return <SquareTerminal size={14} className="tab-icon-glyph" aria-hidden />;
+function TabIcon({ state, os }: { state: string; os: HostOs | undefined }) {
+  if (state === 'ready') {
+    return os ? (
+      <OsGlyph os={os} size={14} className="tab-icon-glyph" />
+    ) : (
+      <SquareTerminal size={14} className="tab-icon-glyph" aria-hidden />
+    );
+  }
   if (state === 'closed') return <span className="state-dot closed tab-icon-glyph" aria-hidden />;
   return (
     <Loader
@@ -179,6 +187,7 @@ function TitleBar() {
   const filter = useStore((s) => s.vaultFilter);
   const connection = useStore((s) => s.connection);
   const account = useStore((s) => s.account);
+  const itemById = useStore((s) => s.itemById);
   const [closing, setClosing] = useState<string | null>(null);
   const [menu, setMenu] = useState<DOMRect | null>(null);
   const chevron = useRef<HTMLButtonElement>(null);
@@ -210,7 +219,7 @@ function TitleBar() {
             className={`tab tab-vault ${activeTab === null ? 'active' : ''}`}
             onClick={() => setState({ activeTab: null })}
           >
-            <VaultIcon size={14} aria-hidden />
+            <Layers size={14} aria-hidden />
             <span>Vaults</span>
             {vaultCount > 0 ? <span className="tab-count">{vaultCount}</span> : null}
           </button>
@@ -227,39 +236,43 @@ function TitleBar() {
             <ChevronDown size={14} aria-hidden />
           </button>
         </div>
-        {terminals.map((t) => (
-          <div
-            key={t.id}
-            role="tab"
-            aria-selected={activeTab === t.id}
-            className={`tab tab-terminal ${activeTab === t.id ? 'active' : ''}`}
-            onClick={() => setState({ activeTab: t.id })}
-            onAuxClick={(e) => {
-              if (e.button === 1) {
-                if (t.state === 'ready') setClosing(t.id);
-                else void closeTerminal(t.id);
-              }
-            }}
-            title={`${t.label}: ${t.target}`}
-            data-testid="terminal-tab"
-          >
-            <span className="tab-icon">
-              <TabIcon state={t.state} />
-              <button
-                className="tab-close"
-                aria-label={`Close ${t.label}`}
-                onClick={(e) => {
-                  e.stopPropagation();
+        {terminals.map((t) => {
+          const host = t.hostId ? itemById.get(t.hostId)?.payload : undefined;
+          const os = host?.type === 'host' ? host.os : undefined;
+          return (
+            <div
+              key={t.id}
+              role="tab"
+              aria-selected={activeTab === t.id}
+              className={`tab tab-terminal ${activeTab === t.id ? 'active' : ''}`}
+              onClick={() => setState({ activeTab: t.id })}
+              onAuxClick={(e) => {
+                if (e.button === 1) {
                   if (t.state === 'ready') setClosing(t.id);
                   else void closeTerminal(t.id);
-                }}
-              >
-                <X size={14} aria-hidden />
-              </button>
-            </span>
-            <span className="tab-title ellipsis">{t.label}</span>
-          </div>
-        ))}
+                }
+              }}
+              title={`${t.label}: ${t.target}`}
+              data-testid="terminal-tab"
+            >
+              <span className="tab-icon">
+                <TabIcon state={t.state} os={os} />
+                <button
+                  className="tab-close"
+                  aria-label={`Close ${t.label}`}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    if (t.state === 'ready') setClosing(t.id);
+                    else void closeTerminal(t.id);
+                  }}
+                >
+                  <X size={14} aria-hidden />
+                </button>
+              </span>
+              <span className="tab-title ellipsis">{t.label}</span>
+            </div>
+          );
+        })}
       </div>
       <button
         className="titlebar-icon-btn"

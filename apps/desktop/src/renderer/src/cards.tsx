@@ -1,5 +1,8 @@
-import type { LucideIcon } from 'lucide-react';
+import type { HostOs } from '@ternix/core/items';
+import { type LucideIcon, Server } from 'lucide-react';
 import type { KeyboardEvent, ReactNode } from 'react';
+import { tileColor } from './items.js';
+import { glyphColorOn, OS_LOOKS, OsGlyph } from './osIcons.js';
 
 /** The 40px coloured square at the start of a card; a glyph, or a letter for port forwards. */
 export function Tile({
@@ -20,6 +23,37 @@ export function Tile({
       aria-hidden
     >
       {Icon ? <Icon size={small ? 18 : 20} /> : letter}
+    </span>
+  );
+}
+
+/**
+ * A host's tile: its operating system's mark when known, else the server glyph. The colour is the
+ * one the user chose, else the system's, else a stable pick from the label.
+ */
+export function HostTile({
+  label,
+  color,
+  os,
+  small,
+}: {
+  label: string;
+  color?: string | undefined;
+  os?: HostOs | undefined;
+  small?: boolean;
+}) {
+  const look = os ? OS_LOOKS[os] : undefined;
+  const background = color || look?.color || tileColor(label);
+  const size = small ? 18 : 20;
+  return (
+    <span
+      className={`tile ${small ? 'tile-sm' : ''}`}
+      style={{ background, color: glyphColorOn(background) }}
+      data-os={os ?? ''}
+      title={look?.title}
+      aria-hidden
+    >
+      {os ? <OsGlyph os={os} size={size} /> : <Server size={size} />}
     </span>
   );
 }

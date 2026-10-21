@@ -56,7 +56,11 @@ function wire(t: TestClient) {
   const notices = new SessionNotices();
   notices.watch(t.client);
   const serverAddress = new ServerAddressStore(dir);
-  const ssh = { cancelAllPrompts: vi.fn(), closeAll: vi.fn(async () => undefined) };
+  const ssh = {
+    cancelAllPrompts: vi.fn(),
+    closeAll: vi.fn(async () => undefined),
+    displayItems: <T>(vault: T) => vault,
+  };
   const handlers = createHandlers({
     client: t.client,
     ssh,

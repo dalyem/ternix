@@ -30,6 +30,50 @@ export const groupPayloadSchema = z.object({
   identity_id: idRef.optional(),
 });
 
+/**
+ * Operating systems a client may detect on a host. `linux` is a Linux whose distribution is not
+ * one of the others. Absent means unknown.
+ */
+export const HOST_OS = [
+  'ubuntu',
+  'debian',
+  'fedora',
+  'centos',
+  'rhel',
+  'rocky',
+  'alma',
+  'arch',
+  'alpine',
+  'opensuse',
+  'nixos',
+  'raspbian',
+  'amazon',
+  'oracle',
+  'gentoo',
+  'manjaro',
+  'mint',
+  'kali',
+  'freebsd',
+  'openbsd',
+  'netbsd',
+  'macos',
+  'windows',
+  'linux',
+] as const;
+
+export const hostOsSchema = z.enum(HOST_OS);
+export type HostOs = z.infer<typeof hostOsSchema>;
+
+/**
+ * A host's `os` when reading: a value this version does not know (written by a newer client)
+ * reads as unset instead of making the whole item unreadable. Typed as what writers send.
+ */
+const hostOsField = hostOsSchema.optional().catch(undefined) as unknown as z.ZodType<
+  HostOs | undefined,
+  z.ZodTypeDef,
+  HostOs | undefined
+>;
+
 export const hostPayloadSchema = z.object({
   type: z.literal('host'),
   ...common,
@@ -48,6 +92,8 @@ export const hostPayloadSchema = z.object({
   agent_forwarding: z.boolean().default(false),
   color: z.string().max(32).optional(),
   notes: z.string().optional(),
+  /** Detected by clients when they connect; may be stale. */
+  os: hostOsField,
 });
 
 export const identityPayloadSchema = z.object({

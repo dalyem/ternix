@@ -56,6 +56,7 @@ terminal.onData((text) => shell.write(text));
 terminal.onResize(({ cols, rows }) => shell.resize(cols, rows));
 
 for (const forward of settings.portForwards) await session.startForward(forward);
+const os = await session.detectOs(); // 'ubuntu', 'macos', ... or undefined; never rejects
 await session.close();
 ```
 
@@ -93,3 +94,22 @@ identity. Keepalive, agent forwarding and the startup snippet come from the host
 - Agent forwarding applies to the target hop only, never to jump hosts.
 - Port forwards bind to 127.0.0.1 when `bindAddress` is empty. `dynamic` is a SOCKS5 server
   (no authentication, CONNECT only).
+
+## Operating system detection
+
+`session.detectOs()` guesses the target's operating system (the `os` values of a host item in
+`docs/protocol.md`). It first reads the server's identification line: distribution builds of
+OpenSSH append their name (`SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.5`), and Windows reports
+`OpenSSH_for_Windows`. Unless that says Windows, it then opens one exec channel (no PTY, stdin
+closed at once, stderr discarded) running exactly `OS_PROBE_COMMAND`:
+
+```sh
+uname -s 2>/dev/null; cat /etc/os-release 2>/dev/null
+```
+
+The kernel name decides macOS, the BSDs and Cygwin/MSYS; on Linux the os-release `ID`, then each
+`ID_LIKE` entry, picks the distribution, else plain `linux`. Output past 16 KiB is not read (the
+channel is closed) and the probe gives up after 5 s. The output is untrusted: only exact
+`KEY=value` lines with plain or simply quoted values count. When the probe is refused, times out
+or says nothing, the identification line decides; when neither knows, the result is `undefined`.
+The command runs on the remote host and shows up in its logs like any other `ssh host command`.

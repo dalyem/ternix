@@ -7,6 +7,7 @@ import { connect, createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import ssh2 from 'ssh2';
+import { OS_PROBE_COMMAND } from '@ternix/ssh';
 
 const { Server, utils } = ssh2;
 
@@ -189,8 +190,15 @@ interface FakeSshd {
   stop(): Promise<void>;
 }
 
-/** An `ssh2` server with a tiny fake shell (password auth, `echo`, `exit`) and port forwarding. */
-async function startFakeSshd(port: number, authorizedKey: string): Promise<FakeSshd> {
+/**
+ * An `ssh2` server with a tiny fake shell (password auth, `echo`, `exit`) and port forwarding.
+ * `exec` is refused, except the OS probe when `probeOutput` is set: then it prints that.
+ */
+async function startFakeSshd(
+  port: number,
+  authorizedKey: string,
+  probeOutput?: string,
+): Promise<FakeSshd> {
   const allowed = utils.parseKey(authorizedKey) as ssh2.ParsedKey;
   const hostKey = utils.generateKeyPairSync('ed25519');
   const wire = (utils.parseKey(hostKey.public) as ssh2.ParsedKey).getPublicSSH();
@@ -234,6 +242,15 @@ async function startFakeSshd(port: number, authorizedKey: string): Promise<FakeS
         const session = accept();
         session.on('pty', (acceptPty) => acceptPty?.());
         session.on('window-change', (acceptResize) => acceptResize?.());
+        session.on('exec', (acceptExec, rejectExec, info) => {
+          if (probeOutput === undefined || info.command !== OS_PROBE_COMMAND) {
+            return void rejectExec?.();
+          }
+          const stream = acceptExec();
+          stream.write(probeOutput);
+          stream.exit(0);
+          stream.end();
+        });
         session.on('shell', (acceptShell) => {
           const stream = acceptShell();
           let line = '';
@@ -285,7 +302,12 @@ async function startFakeSshd(port: number, authorizedKey: string): Promise<FakeS
  * E2E_SSH_ADDRESS, E2E_SSH_PORT, E2E_SSH_USER and E2E_SSH_PASSWORD to use a real OpenSSH
  * `sshd` instead (then `fingerprint` is undefined and `rotateHostKey` is unavailable).
  */
-export async function startSshTarget(): Promise<SshTarget> {
+export async function startSshTarget(
+  options: {
+    /** What the fake server prints for the OS probe (ignored for a real sshd). */
+    probeOutput?: string;
+  } = {},
+): Promise<SshTarget> {
   const external = process.env['E2E_SSH_ADDRESS'];
   if (external) {
     return {
@@ -303,7 +325,7 @@ export async function startSshTarget(): Promise<SshTarget> {
   }
   const port = await freePort();
   const pair = utils.generateKeyPairSync('ed25519', { comment: 'e2e' });
-  let current = await startFakeSshd(port, pair.public);
+  let current = await startFakeSshd(port, pair.public, options.probeOutput);
   const target: SshTarget = {
     address: '127.0.0.1',
     port,
@@ -313,7 +335,7 @@ export async function startSshTarget(): Promise<SshTarget> {
     userKey: { privateKey: pair.private, publicKey: pair.public },
     rotateHostKey: async () => {
       await current.stop();
-      current = await startFakeSshd(port, pair.public);
+      current = await startFakeSshd(port, pair.public, options.probeOutput);
       target.fingerprint = current.fingerprint;
     },
     stop: () => current.stop(),

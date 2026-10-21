@@ -48,7 +48,11 @@ function fakeDialog(answer: { response: number; checkboxChecked?: boolean } = { 
 }
 
 function ipcFor(t: Registered, dialog = fakeDialog()) {
-  const ssh = { cancelAllPrompts: vi.fn(), closeAll: vi.fn(async () => undefined) };
+  const ssh = {
+    cancelAllPrompts: vi.fn(),
+    closeAll: vi.fn(async () => undefined),
+    displayItems: <T>(vault: T) => vault,
+  };
   const handlers = createHandlers({
     client: t.client,
     ssh,
@@ -183,6 +187,49 @@ describe('item secrets over IPC', () => {
     expect(
       (await ipc.failure('items.put', { vaultId, draft: { type: 'ssh_key', label: 'k' } })).code,
     ).toBe('invalid_input');
+  });
+
+  it('keeps the detected OS through an edit that leaves it out, unless the address changed', async () => {
+    const { a, ipc, vaultId, hostId } = await withSecrets();
+    const stored = () => a.client.getItem(vaultId, hostId)!.payload;
+    // Main stores what it detected (as SshManager does, through the client).
+    const { updated_at: _stamp, ...payload } = stored();
+    await a.client.putItem(vaultId, hostId, { ...payload, os: 'ubuntu' } as never);
+    expect((await ipc.call('items.all')).flatMap((v) => v.items)).toContainEqual(
+      expect.objectContaining({ id: hostId, payload: expect.objectContaining({ os: 'ubuntu' }) }),
+    );
+
+    // The editor does not send `os`: a relabel keeps it, with the password.
+    await ipc.call('items.put', {
+      vaultId,
+      itemId: hostId,
+      draft: { type: 'host', label: 'renamed', address: 'BOX.example.com' },
+    });
+    expect(stored()).toMatchObject({ label: 'renamed', os: 'ubuntu', password: HOST_PASSWORD });
+
+    // An explicit value wins (an import, a test seeding hosts).
+    await ipc.call('items.put', {
+      vaultId,
+      itemId: hostId,
+      draft: { type: 'host', label: 'renamed', address: 'box.example.com', os: 'debian' },
+    });
+    expect(stored()).toMatchObject({ os: 'debian' });
+
+    // A new address may be another machine: the stale OS goes.
+    await ipc.call('items.put', {
+      vaultId,
+      itemId: hostId,
+      draft: { type: 'host', label: 'renamed', address: 'other.example.com' },
+    });
+    expect(stored()).not.toHaveProperty('os');
+
+    // A value this version does not know is dropped, not stored and not an error.
+    await ipc.call('items.put', {
+      vaultId,
+      itemId: hostId,
+      draft: { type: 'host', label: 'renamed', address: 'other.example.com', os: 'haiku' } as never,
+    });
+    expect(stored()).not.toHaveProperty('os');
   });
 
   it('does not carry secrets over to another item type', async () => {

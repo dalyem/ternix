@@ -1,6 +1,12 @@
 import { randomUUID } from 'node:crypto';
 import { isIP } from 'node:net';
-import { hostPayloadSchema, type ItemPayload, type KnownHostPayload } from '@ternix/core/items';
+import {
+  type HostOs,
+  hostPayloadSchema,
+  type ItemPayload,
+  type KnownHostPayload,
+} from '@ternix/core/items';
+import type { VaultRole } from '@ternix/core/protocol';
 import {
   type CloseReason,
   type HostKeyInfo,
@@ -25,7 +31,7 @@ import type {
   TerminalDto,
 } from '../../shared/app.js';
 import { BIND_ADDRESS_MESSAGE } from '../../shared/forwards.js';
-import type { ItemDraft } from '../../shared/types.js';
+import type { ItemDraft, VaultItemsDto } from '../../shared/types.js';
 import { AppError } from '../app/errors.js';
 import type { HostKeyFacts, RouteHop } from '../app/trust.js';
 import type { ItemSnapshot } from './items.js';
@@ -51,6 +57,15 @@ export interface SshManagerDeps {
    */
   confirmNewHosts(route: RouteHop[], signal: AbortSignal): Promise<boolean>;
   agentPath: string | undefined;
+  /**
+   * Whether to learn a saved host's operating system after it connects (the app setting). When
+   * absent, never.
+   */
+  detectHostOs?: () => boolean;
+  /** This account's role in a vault, or undefined when the vault is unknown. */
+  vaultRole?: (vaultId: string) => VaultRole | undefined;
+  /** For the log only; never shown to the user. */
+  log?: (message: string) => void;
   createSession?: (options: SessionOptions) => SshSession;
   /** How long a keyboard-interactive prompt waits before it is denied. Default 5 minutes. */
   keyboardTimeoutMs?: number;
@@ -151,6 +166,13 @@ function isLocalBindAddress(address: string): boolean {
 export class SshManager {
   private readonly terminals = new Map<string, Terminal>();
   private readonly prompts = new Map<string, Pending>();
+  /** Hosts whose operating system is being detected, so parallel tabs probe once. */
+  private readonly detecting = new Set<string>();
+  /**
+   * Operating systems detected on hosts this account may not write (viewer): shown on this device
+   * only, never synced. Keyed by host item ID.
+   */
+  private readonly osOverrides = new Map<string, { vaultId: string; os: HostOs }>();
 
   constructor(private readonly deps: SshManagerDeps) {}
 
@@ -255,7 +277,24 @@ export class SshManager {
   }
 
   async closeAll(): Promise<void> {
+    // Called on sign-out too: the next account must not see this one's local overrides.
+    this.osOverrides.clear();
     await Promise.all([...this.terminals.keys()].map((id) => this.close(id)));
+  }
+
+  /** A vault's items as this device shows them: hosts carry an OS detected for a viewer. */
+  displayItems(vault: VaultItemsDto): VaultItemsDto {
+    if (this.osOverrides.size === 0) return vault;
+    return {
+      ...vault,
+      items: vault.items.map((item) => {
+        const override = this.osOverrides.get(item.id);
+        if (!override || override.vaultId !== vault.vaultId || item.payload.type !== 'host') {
+          return item;
+        }
+        return { ...item, payload: { ...item.payload, os: override.os } };
+      }),
+    };
   }
 
   async startForward(id: string, forwardId: string): Promise<void> {
@@ -620,6 +659,7 @@ export class SshManager {
       });
       this.pump(t);
       this.publish(t);
+      if (t.source.kind === 'host') this.detectOs(t.source.hostId, session);
     } catch (err) {
       // Signed in but no shell (or any other late failure): end this attempt's connection,
       // its prompts and its output before the tab reads closed.
@@ -630,6 +670,49 @@ export class SshManager {
       this.dropOutput(t);
       this.fail(t, err);
     }
+  }
+
+  /**
+   * Learn the host's operating system in the background, once the shell is open: nothing waits
+   * for it and failures only reach the log.
+   */
+  private detectOs(hostId: string, session: SshSession): void {
+    if (!this.deps.detectHostOs?.() || this.detecting.has(hostId)) return;
+    this.detecting.add(hostId);
+    void session
+      .detectOs()
+      .then((os) => (os ? this.recordOs(hostId, os) : undefined))
+      .catch((err: unknown) =>
+        this.deps.log?.(
+          `Could not record the operating system of host ${hostId}: ${errMessage(err)}`,
+        ),
+      )
+      .finally(() => this.detecting.delete(hostId));
+  }
+
+  /**
+   * Store a detected operating system on the host item when it differs from the stored one: one
+   * normal write from main's own decrypted copy (secrets included; the renderer is not involved).
+   * Someone who may not write the vault sees it on this device only.
+   */
+  private async recordOs(hostId: string, os: HostOs): Promise<void> {
+    const record = this.deps.snapshot().records.get(hostId);
+    if (record?.payload.type !== 'host') return;
+    const { vaultId, payload } = record;
+    if (payload.os === os) {
+      if (this.osOverrides.delete(hostId)) this.deps.emit('client.items-changed', { vaultId });
+      return;
+    }
+    const role = this.deps.vaultRole?.(vaultId);
+    if (role !== 'owner' && role !== 'editor') {
+      if (this.osOverrides.get(hostId)?.os === os) return;
+      this.osOverrides.set(hostId, { vaultId, os });
+      this.deps.emit('client.items-changed', { vaultId });
+      return;
+    }
+    this.osOverrides.delete(hostId);
+    const { updated_at: _stamp, ...draft } = payload;
+    await this.deps.putItem(vaultId, hostId, { ...draft, os } as ItemDraft);
   }
 
   /**

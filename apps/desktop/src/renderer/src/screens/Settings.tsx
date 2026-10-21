@@ -6,6 +6,7 @@ import { runAuthExclusive, toast, useStore } from '../store.js';
 import {
   Badge,
   Button,
+  Checkbox,
   ConfirmDialog,
   EmptyState,
   ErrorText,
@@ -247,6 +248,7 @@ function AppearanceTab() {
 
 function TerminalTab() {
   const size = useStore((s) => s.settings.terminalFontSize);
+  const detectOs = useStore((s) => s.settings.detectHostOs);
   const action = useAction();
   const set = (value: number) =>
     void action.run(() => call('settings.set', { terminalFontSize: value }));
@@ -279,6 +281,20 @@ function TerminalTab() {
           >
             +
           </Button>
+        </div>
+      </div>
+      <div className="field">
+        <Checkbox
+          label="Detect host operating system after connecting"
+          checked={detectOs}
+          onChange={(checked) =>
+            void action.run(() => call('settings.set', { detectHostOs: checked }))
+          }
+        />
+        <div className="hint">
+          Runs one read-only command on a saved host after it connects (
+          <code>uname -s; cat /etc/os-release</code>) and stores the result on the host, so its icon
+          shows the system on every device.
         </div>
       </div>
       <ErrorText error={action.error} />

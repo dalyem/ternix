@@ -10,7 +10,7 @@ import type {
   ParsedKey,
   Prompt,
 } from 'ssh2';
-import type { KnownHostPayload } from '@ternix/core/items';
+import type { HostOs, KnownHostPayload } from '@ternix/core/items';
 import { errorMessage, SshError } from './errors.js';
 import { ForwardManager } from './forwards.js';
 import type { ForwardListener, ForwardStatus } from './forwards.js';
@@ -21,6 +21,13 @@ import {
   preferredHostKeyAlgorithms,
 } from './knownHosts.js';
 import type { HostKeyStatus } from './knownHosts.js';
+import {
+  OS_PROBE_COMMAND,
+  OS_PROBE_MAX_BYTES,
+  OS_PROBE_TIMEOUT_MS,
+  osFromIdent,
+  osFromProbe,
+} from './os.js';
 import type { HopSettings, PortForwardSpec, ResolvedConnection, ResolvedKey } from './resolve.js';
 
 const { Client, utils } = ssh2;
@@ -119,6 +126,11 @@ export interface ShellExit {
 }
 
 export type Unsubscribe = () => void;
+
+export interface DetectOsOptions {
+  /** How long the probe command may take. Default 5 s. */
+  timeoutMs?: number;
+}
 
 export interface ShellStream {
   write(data: string | Uint8Array): void;
@@ -254,6 +266,69 @@ function toBuffer(data: string | Uint8Array): Buffer {
   return typeof data === 'string' ? Buffer.from(data, 'utf8') : Buffer.from(data);
 }
 
+/**
+ * The server's identification line. ssh2 has no public accessor for it: the whole line is kept on
+ * its protocol object, the software version alone on the client.
+ */
+function remoteIdent(client: Ssh2Client): string | undefined {
+  const internals = client as unknown as {
+    _protocol?: { _remoteIdentRaw?: unknown };
+    _remoteVer?: unknown;
+  };
+  const raw = internals._protocol?._remoteIdentRaw;
+  if (Buffer.isBuffer(raw)) return raw.toString('latin1').trim();
+  return typeof internals._remoteVer === 'string' ? `SSH-2.0-${internals._remoteVer}` : undefined;
+}
+
+/**
+ * Run `OS_PROBE_COMMAND` on its own channel: no PTY, stdin closed at once, stderr discarded.
+ * Resolves with at most `OS_PROBE_MAX_BYTES` of output (the channel is closed once that much
+ * arrived); rejects when the server refuses the channel or the command, or on timeout.
+ */
+function runOsProbe(client: Ssh2Client, timeoutMs: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let channel: ClientChannel | undefined;
+    let done = false;
+    const finish = (err?: unknown) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      if (channel) {
+        try {
+          channel.close();
+        } catch {
+          channel.destroy();
+        }
+      }
+      if (err !== undefined) reject(err instanceof Error ? err : new Error(String(err)));
+      else resolve(Buffer.concat(chunks).toString('utf8'));
+    };
+    const timer = setTimeout(() => finish(new Error('The OS probe timed out')), timeoutMs);
+    try {
+      client.exec(OS_PROBE_COMMAND, (err, stream) => {
+        if (err) return finish(err);
+        channel = stream;
+        if (done) return finish();
+        stream.on('error', () => undefined);
+        stream.stderr.on('data', () => undefined);
+        stream.on('data', (chunk: Buffer) => {
+          if (done) return;
+          const room = OS_PROBE_MAX_BYTES - size;
+          chunks.push(chunk.length > room ? chunk.subarray(0, room) : chunk);
+          size += Math.min(chunk.length, room);
+          if (size >= OS_PROBE_MAX_BYTES) finish();
+        });
+        stream.once('close', () => finish());
+        stream.end();
+      });
+    } catch (err) {
+      finish(err);
+    }
+  });
+}
+
 /** Output held for a shell nobody is listening to yet; older bytes are dropped past this. */
 const MAX_BUFFERED_OUTPUT_BYTES = 4 * 1024 * 1024;
 
@@ -355,6 +430,7 @@ export class SshSession {
   private startupScript: string | undefined;
   private runtimeError: SshError | undefined;
   private shutdownPromise: Promise<void> | undefined;
+  private targetIdent: string | undefined;
 
   constructor(private readonly options: SessionOptions = {}) {}
 
@@ -461,6 +537,37 @@ export class SshSession {
 
   forwardStatuses(): ForwardStatus[] {
     return this.forwards?.statuses() ?? [];
+  }
+
+  /** The target's identification line (`SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.5`), once connected. */
+  get serverIdent(): string | undefined {
+    return this.targetIdent;
+  }
+
+  /**
+   * Best guess at the target's operating system, or undefined. Reads the identification line,
+   * then (unless that says Windows) runs `OS_PROBE_COMMAND`, a fixed read-only command, on one
+   * exec channel. When the probe is refused, times out or says nothing, the identification line
+   * decides. Never rejects.
+   */
+  async detectOs(options: DetectOsOptions = {}): Promise<HostOs | undefined> {
+    const fromIdent = osFromIdent(this.targetIdent);
+    if (fromIdent === 'windows') return fromIdent;
+    let client: Ssh2Client;
+    try {
+      client = this.requireReady();
+    } catch {
+      return fromIdent;
+    }
+    let fromProbe: HostOs | undefined;
+    try {
+      fromProbe = osFromProbe(await runOsProbe(client, options.timeoutMs ?? OS_PROBE_TIMEOUT_MS));
+    } catch {
+      return fromIdent;
+    }
+    // A distribution named in the identification line beats a bare "Linux".
+    if (fromProbe === 'linux' && fromIdent) return fromIdent;
+    return fromProbe ?? fromIdent;
   }
 
   /** Stop forwards and shells, end every connection in the chain. Safe to call repeatedly. */
@@ -605,6 +712,7 @@ export class SshSession {
         if (settled) return;
         settled = true;
         clearTimers();
+        if (info.isTarget) this.targetIdent = remoteIdent(client);
         resolve(client);
       });
 
