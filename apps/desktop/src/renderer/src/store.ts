@@ -338,6 +338,17 @@ export async function closeTerminal(id: string): Promise<void> {
 
 // Setup
 
+/** The bundled fonts, loaded before the first screen so terminals measure the right glyphs. */
+async function fontsReady(): Promise<void> {
+  const loaded = Promise.all([
+    document.fonts.load('14px "Source Code Pro"'),
+    document.fonts.load('450 14px "Inter Variable"'),
+  ]).then(() => undefined);
+  await Promise.race([loaded, new Promise<void>((resolve) => setTimeout(resolve, 1500))]).catch(
+    () => undefined,
+  );
+}
+
 let booting: Promise<void> | undefined;
 
 /** Load the initial state and subscribe to main-process events. Call once. */
@@ -380,6 +391,7 @@ async function doBoot(): Promise<void> {
     call('settings.get'),
     call('client.snapshot'),
     call('ssh.list'),
+    fontsReady(),
   ]);
   setState({
     info,

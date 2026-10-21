@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { MAX_FONT_SIZE, MIN_FONT_SIZE } from '../../../shared/app.js';
 import { call } from '../api.js';
+import { type ThemePref, setThemePref, useThemePref } from '../theme.js';
 import { runAuthExclusive, toast, useStore } from '../store.js';
 import {
   Badge,
@@ -9,6 +10,7 @@ import {
   EmptyState,
   ErrorText,
   Fingerprint,
+  FormCard,
   formatDate,
   Notice,
   Select,
@@ -19,7 +21,7 @@ import {
 import { SignOutDialog } from './Auth.js';
 import { ServerAddressHint } from './Setup.js';
 
-type Tab = 'account' | 'security' | 'terminal' | 'devices' | 'admin';
+type Tab = 'account' | 'security' | 'appearance' | 'terminal' | 'devices' | 'admin';
 
 export function SettingsView() {
   const isAdmin = useStore((s) => s.account?.user.role === 'admin');
@@ -27,34 +29,39 @@ export function SettingsView() {
   const tabs: { id: Tab; label: string }[] = [
     { id: 'account', label: 'Account' },
     { id: 'security', label: 'Security' },
+    { id: 'appearance', label: 'Appearance' },
     { id: 'terminal', label: 'Terminal' },
     { id: 'devices', label: 'Devices' },
     ...(isAdmin ? [{ id: 'admin' as const, label: 'Admin' }] : []),
   ];
   return (
     <div className="view">
-      <div className="view-header">
-        <h1>Settings</h1>
+      <div className="toolbar">
+        <div className="tabs" role="tablist">
+          {tabs.map((t) => (
+            <button
+              key={t.id}
+              role="tab"
+              aria-selected={tab === t.id}
+              className={tab === t.id ? 'active' : ''}
+              onClick={() => setTab(t.id)}
+            >
+              {t.label}
+            </button>
+          ))}
+        </div>
       </div>
-      <div className="tabs" role="tablist">
-        {tabs.map((t) => (
-          <button
-            key={t.id}
-            role="tab"
-            aria-selected={tab === t.id}
-            className={tab === t.id ? 'active' : ''}
-            onClick={() => setTab(t.id)}
-          >
-            {t.label}
-          </button>
-        ))}
-      </div>
-      <div className="settings-body">
-        {tab === 'account' ? <AccountTab /> : null}
-        {tab === 'security' ? <SecurityTab /> : null}
-        {tab === 'terminal' ? <TerminalTab /> : null}
-        {tab === 'devices' ? <DevicesTab /> : null}
-        {tab === 'admin' && isAdmin ? <AdminTab /> : null}
+      <div className="view-scroll">
+        <div className="page">
+          <div className="settings-body">
+            {tab === 'account' ? <AccountTab /> : null}
+            {tab === 'security' ? <SecurityTab /> : null}
+            {tab === 'appearance' ? <AppearanceTab /> : null}
+            {tab === 'terminal' ? <TerminalTab /> : null}
+            {tab === 'devices' ? <DevicesTab /> : null}
+            {tab === 'admin' && isAdmin ? <AdminTab /> : null}
+          </div>
+        </div>
       </div>
     </div>
   );
@@ -69,25 +76,27 @@ function AccountTab() {
   if (!account) return null;
   return (
     <>
-      <dl className="facts">
-        <dt>Name</dt>
-        <dd>{account.user.name}</dd>
-        <dt>Email</dt>
-        <dd>{account.email}</dd>
-        <dt>Role</dt>
-        <dd>
-          <Badge>{account.user.role}</Badge>
-        </dd>
-        <dt>Server</dt>
-        <dd>
-          <span className="mono">{account.serverUrl}</span>{' '}
-          <Badge tone={connection === 'online' ? 'good' : 'warn'}>{connection}</Badge>
-        </dd>
-        <dt>Fingerprint</dt>
-        <dd>
-          <Fingerprint value={account.user.fingerprint} />
-        </dd>
-      </dl>
+      <FormCard title="Account">
+        <dl className="facts">
+          <dt>Name</dt>
+          <dd>{account.user.name}</dd>
+          <dt>Email</dt>
+          <dd>{account.email}</dd>
+          <dt>Role</dt>
+          <dd>
+            <Badge>{account.user.role}</Badge>
+          </dd>
+          <dt>Server</dt>
+          <dd>
+            <span className="mono">{account.serverUrl}</span>{' '}
+            <Badge tone={connection === 'online' ? 'good' : 'warn'}>{connection}</Badge>
+          </dd>
+          <dt>Fingerprint</dt>
+          <dd>
+            <Fingerprint value={account.user.fingerprint} />
+          </dd>
+        </dl>
+      </FormCard>
       <ChangePassword />
       <div className="row">
         <Button onClick={() => setChangeServer(true)}>Change server…</Button>
@@ -188,7 +197,7 @@ function SecurityTab() {
     ? [...AUTO_LOCK_OPTIONS]
     : [...AUTO_LOCK_OPTIONS, minutes];
   return (
-    <>
+    <FormCard title="Locking">
       <div className="row">
         <Button variant="primary" onClick={() => void action.run(() => call('auth.lock'))}>
           Lock now
@@ -213,7 +222,26 @@ function SecurityTab() {
         stay connected, and their output keeps arriving behind the lock screen; you cannot open new
         connections until you unlock.
       </Notice>
-    </>
+    </FormCard>
+  );
+}
+
+function AppearanceTab() {
+  const theme = useThemePref();
+  return (
+    <FormCard title="Appearance">
+      <Select<ThemePref>
+        label="Theme"
+        value={theme}
+        onChange={setThemePref}
+        options={[
+          { value: 'dark', label: 'Dark' },
+          { value: 'light', label: 'Light' },
+          { value: 'system', label: 'System' },
+        ]}
+        hint="System follows the operating system's light or dark setting. Terminals keep their own colour scheme."
+      />
+    </FormCard>
   );
 }
 
@@ -223,7 +251,7 @@ function TerminalTab() {
   const set = (value: number) =>
     void action.run(() => call('settings.set', { terminalFontSize: value }));
   return (
-    <>
+    <FormCard title="Terminal">
       <div className="field">
         <label htmlFor="font-size">Terminal font size</label>
         <div className="input-row">
@@ -254,7 +282,7 @@ function TerminalTab() {
         </div>
       </div>
       <ErrorText error={action.error} />
-    </>
+    </FormCard>
   );
 }
 
@@ -265,36 +293,38 @@ function DevicesTab() {
   return (
     <>
       <ErrorText error={devices.error} />
-      <table className="table">
-        <thead>
-          <tr>
-            <th>Device</th>
-            <th>Platform</th>
-            <th>Added</th>
-            <th>Last seen</th>
-            <th />
-          </tr>
-        </thead>
-        <tbody>
-          {(devices.data ?? []).map((d) => (
-            <tr key={d.id}>
-              <td>
-                {d.name} {d.current ? <Badge tone="good">this device</Badge> : null}
-              </td>
-              <td>{d.platform}</td>
-              <td className="muted">{formatDate(d.createdAt)}</td>
-              <td className="muted">{formatDate(d.lastSeenAt)}</td>
-              <td>
-                {!d.current ? (
-                  <Button variant="danger" onClick={() => setRevoking(d.id)}>
-                    Revoke
-                  </Button>
-                ) : null}
-              </td>
+      <FormCard>
+        <table className="table">
+          <thead>
+            <tr>
+              <th>Device</th>
+              <th>Platform</th>
+              <th>Added</th>
+              <th>Last seen</th>
+              <th />
             </tr>
-          ))}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {(devices.data ?? []).map((d) => (
+              <tr key={d.id}>
+                <td>
+                  {d.name} {d.current ? <Badge tone="good">this device</Badge> : null}
+                </td>
+                <td>{d.platform}</td>
+                <td className="muted">{formatDate(d.createdAt)}</td>
+                <td className="muted">{formatDate(d.lastSeenAt)}</td>
+                <td>
+                  {!d.current ? (
+                    <Button variant="danger" size="sm" onClick={() => setRevoking(d.id)}>
+                      Revoke
+                    </Button>
+                  ) : null}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </FormCard>
       <ErrorText error={action.error} />
       {revoking ? (
         <ConfirmDialog
@@ -332,8 +362,7 @@ function InvitesSection() {
   const copy = (text: string) =>
     void call('clipboard.write', { text }).then(() => toast('Copied to the clipboard.'));
   return (
-    <section>
-      <h3>Invites</h3>
+    <FormCard title="Invites">
       <form
         className="input-row"
         onSubmit={(e) => {
@@ -372,7 +401,9 @@ function InvitesSection() {
       {created ? (
         <Notice>
           New invite code: <code data-testid="invite-code">{created}</code>{' '}
-          <Button onClick={() => copy(created)}>Copy</Button>
+          <Button size="sm" onClick={() => copy(created)}>
+            Copy
+          </Button>
         </Notice>
       ) : null}
       <ErrorText error={invites.error ?? remove.error} />
@@ -399,9 +430,12 @@ function InvitesSection() {
                 <td className="muted">{formatDate(i.expiresAt)}</td>
                 <td>{i.usedAt ? <Badge>used</Badge> : <Badge tone="good">open</Badge>}</td>
                 <td className="actions">
-                  <Button onClick={() => copy(i.code)}>Copy</Button>
+                  <Button size="sm" onClick={() => copy(i.code)}>
+                    Copy
+                  </Button>
                   <Button
                     variant="danger"
+                    size="sm"
                     onClick={() =>
                       void remove.run(async () => {
                         await call('admin.invites.delete', { code: i.code });
@@ -417,7 +451,7 @@ function InvitesSection() {
           </tbody>
         </table>
       )}
-    </section>
+    </FormCard>
   );
 }
 
@@ -426,8 +460,7 @@ function UsersSection() {
   const account = useStore((s) => s.account);
   const [deleting, setDeleting] = useState<{ id: string; name: string } | null>(null);
   return (
-    <section>
-      <h3>Users</h3>
+    <FormCard title="Users">
       <ErrorText error={users.error} />
       <table className="table">
         <thead>
@@ -455,7 +488,11 @@ function UsersSection() {
               <td className="muted">{formatDate(u.createdAt)}</td>
               <td>
                 {u.id !== account?.user.id ? (
-                  <Button variant="danger" onClick={() => setDeleting({ id: u.id, name: u.name })}>
+                  <Button
+                    variant="danger"
+                    size="sm"
+                    onClick={() => setDeleting({ id: u.id, name: u.name })}
+                  >
                     Delete
                   </Button>
                 ) : null}
@@ -477,6 +514,6 @@ function UsersSection() {
           }}
         />
       ) : null}
-    </section>
+    </FormCard>
   );
 }

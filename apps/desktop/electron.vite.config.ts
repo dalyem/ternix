@@ -79,6 +79,8 @@ export default defineConfig({
   renderer: {
     plugins: [react(), csp()],
     build: {
+      // Bundled fonts stay files: `font-src 'self'` does not allow `data:` URLs.
+      assetsInlineLimit: 0,
       rollupOptions: { input: resolve('src/renderer/index.html') },
     },
   },

@@ -1,5 +1,16 @@
-import { useEffect, useMemo, useState } from 'react';
+import {
+  Braces,
+  Eye,
+  FingerprintPattern,
+  IdCard,
+  KeyRound,
+  Pencil,
+  Trash2,
+  Waypoints,
+} from 'lucide-react';
+import { type ReactNode, useEffect, useMemo, useState } from 'react';
 import { call } from '../api.js';
+import { EntityCard, Tile } from '../cards.js';
 import {
   byLabel,
   canWrite,
@@ -10,7 +21,7 @@ import {
   vaultTitle,
 } from '../items.js';
 import { type ItemView, openEditor, reportError, toast, useStore } from '../store.js';
-import { Badge, Button, ConfirmDialog, EmptyState } from '../ui.js';
+import { Badge, Button, ConfirmDialog, EmptyState, IconButton } from '../ui.js';
 import { useCreateVault } from './Hosts.js';
 
 function useScoped(): ItemView[] {
@@ -30,56 +41,84 @@ function VaultTag({ vaultId }: { vaultId: string }) {
 }
 
 function ListFrame({
-  title,
   actions,
   empty,
+  emptyIcon,
+  emptyTitle,
   isEmpty,
   children,
 }: {
-  title: string;
-  actions?: React.ReactNode;
+  actions?: ReactNode;
   empty: string;
+  emptyIcon: typeof KeyRound;
+  emptyTitle: string;
   isEmpty: boolean;
-  children: React.ReactNode;
+  children: ReactNode;
 }) {
   return (
     <div className="view">
-      <div className="view-header">
-        <h1>{title}</h1>
-        <span className="spacer" />
-        {actions}
+      {actions ? <div className="toolbar">{actions}</div> : null}
+      <div className="view-scroll">
+        <div className="page">
+          {isEmpty ? (
+            <EmptyState icon={emptyIcon} title={emptyTitle}>
+              {empty}
+            </EmptyState>
+          ) : (
+            children
+          )}
+        </div>
       </div>
-      <div className="list">{isEmpty ? <EmptyState>{empty}</EmptyState> : children}</div>
     </div>
   );
 }
 
-function Row({
+function Section({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <>
+      <h3 className="section-title">{title}</h3>
+      <div className="grid grid-wide">{children}</div>
+    </>
+  );
+}
+
+/** A card for an editable item: click selects and opens the editor, Enter or the pencil too. */
+function ItemCard({
   item,
+  type,
+  tile,
   sub,
-  onOpen,
-  extra,
+  mono,
 }: {
   item: ItemView;
-  sub?: React.ReactNode;
-  onOpen: () => void;
-  extra?: React.ReactNode;
+  type: 'identity' | 'ssh_key' | 'snippet' | 'port_forward';
+  tile: ReactNode;
+  sub?: ReactNode;
+  mono?: boolean;
 }) {
   const vault = useStore((s) => s.vaultById.get(item.vaultId));
+  const selectedId = useStore((s) => s.editor?.item?.id);
+  const writable = canWrite(vault);
+  const open = () => openEditor({ type, item });
   return (
-    <div className="host-row" onDoubleClick={onOpen}>
-      <div className="host-main">
-        <div className="host-label">{labelOf(item.payload)}</div>
-        {sub ? <div className="host-sub">{sub}</div> : null}
-      </div>
-      <div className="host-tags">
-        <VaultTag vaultId={item.vaultId} />
-      </div>
-      <div className="host-actions">
-        {extra}
-        <Button onClick={onOpen}>{canWrite(vault) ? 'Edit' : 'View'}</Button>
-      </div>
-    </div>
+    <EntityCard
+      selected={selectedId === item.id}
+      tile={tile}
+      title={<span className="entity-title-text">{labelOf(item.payload)}</span>}
+      sub={sub}
+      mono={mono}
+      meta={<VaultTag vaultId={item.vaultId} />}
+      onSelect={open}
+      onOpen={open}
+      actions={
+        <IconButton
+          icon={writable ? Pencil : Eye}
+          label={writable ? 'Edit' : 'View'}
+          size="sm"
+          onClick={open}
+        />
+      }
+    />
   );
 }
 
@@ -91,44 +130,62 @@ export function KeychainView() {
   const vaultArg = createVault ? { vaultId: createVault } : {};
   return (
     <ListFrame
-      title="Keychain"
+      emptyIcon={KeyRound}
+      emptyTitle="Keychain is empty"
       isEmpty={identities.length + keys.length === 0}
       empty="No identities or SSH keys yet. An identity bundles a username with a password or key, so many hosts can share it."
       actions={
         <>
-          <Button onClick={() => openEditor({ type: 'identity', ...vaultArg })}>
-            New identity
-          </Button>
-          <Button variant="primary" onClick={() => openEditor({ type: 'ssh_key', ...vaultArg })}>
+          <Button
+            size="md"
+            icon={KeyRound}
+            onClick={() => openEditor({ type: 'ssh_key', ...vaultArg })}
+          >
             New SSH key
+          </Button>
+          <Button
+            size="md"
+            variant="ghost"
+            icon={IdCard}
+            onClick={() => openEditor({ type: 'identity', ...vaultArg })}
+          >
+            New identity
           </Button>
         </>
       }
     >
-      {identities.length > 0 ? <h3 className="list-heading">Identities</h3> : null}
-      {identities.map((i) => (
-        <Row
-          key={i.id}
-          item={i}
-          sub={
-            <>
-              {i.payload.username}
-              {i.payload.has_password ? ' · password' : ''}
-              {i.payload.key_id ? ' · key' : ''}
-            </>
-          }
-          onOpen={() => openEditor({ type: 'identity', item: i })}
-        />
-      ))}
-      {keys.length > 0 ? <h3 className="list-heading">SSH keys</h3> : null}
-      {keys.map((k) => (
-        <Row
-          key={k.id}
-          item={k}
-          sub={k.payload.has_passphrase ? 'passphrase protected' : 'no passphrase'}
-          onOpen={() => openEditor({ type: 'ssh_key', item: k })}
-        />
-      ))}
+      {keys.length > 0 ? (
+        <Section title="SSH keys">
+          {keys.map((k) => (
+            <ItemCard
+              key={k.id}
+              item={k}
+              type="ssh_key"
+              tile={<Tile icon={KeyRound} />}
+              sub={k.payload.has_passphrase ? 'Passphrase protected' : 'No passphrase'}
+            />
+          ))}
+        </Section>
+      ) : null}
+      {identities.length > 0 ? (
+        <Section title="Identities">
+          {identities.map((i) => (
+            <ItemCard
+              key={i.id}
+              item={i}
+              type="identity"
+              tile={<Tile icon={IdCard} />}
+              sub={
+                <>
+                  {i.payload.username}
+                  {i.payload.has_password ? ' · password' : ''}
+                  {i.payload.key_id ? ' · key' : ''}
+                </>
+              }
+            />
+          ))}
+        </Section>
+      ) : null}
     </ListFrame>
   );
 }
@@ -139,12 +196,14 @@ export function SnippetsView() {
   const snippets = itemsOfType(visible, 'snippet').sort(byLabel);
   return (
     <ListFrame
-      title="Snippets"
+      emptyIcon={Braces}
+      emptyTitle="No snippets yet"
       isEmpty={snippets.length === 0}
-      empty="No snippets yet. Snippets are scripts you can paste or run in any open terminal, or run when a host connects."
+      empty="Snippets are scripts you can paste or run in any open terminal, or run when a host connects."
       actions={
         <Button
-          variant="primary"
+          size="md"
+          icon={Braces}
           onClick={() =>
             openEditor({ type: 'snippet', ...(createVault ? { vaultId: createVault } : {}) })
           }
@@ -153,17 +212,22 @@ export function SnippetsView() {
         </Button>
       }
     >
-      {snippets.map((s) => (
-        <Row
-          key={s.id}
-          item={s}
-          sub={<span className="mono">{s.payload.script.split('\n')[0]?.slice(0, 80)}</span>}
-          onOpen={() => openEditor({ type: 'snippet', item: s })}
-        />
-      ))}
+      <Section title="Snippets">
+        {snippets.map((s) => (
+          <ItemCard
+            key={s.id}
+            item={s}
+            type="snippet"
+            tile={<Tile icon={Braces} />}
+            sub={<span className="mono">{s.payload.script.split('\n')[0]?.slice(0, 80)}</span>}
+          />
+        ))}
+      </Section>
     </ListFrame>
   );
 }
+
+const FORWARD_LETTER = { local: 'L', remote: 'R', dynamic: 'D' } as const;
 
 export function ForwardsView() {
   const visible = useScoped();
@@ -183,12 +247,14 @@ export function ForwardsView() {
   };
   return (
     <ListFrame
-      title="Port forwards"
+      emptyIcon={Waypoints}
+      emptyTitle="No port forwards yet"
       isEmpty={forwards.length === 0}
-      empty="No port forwards yet. Start and stop them from an open terminal's Forwards panel."
+      empty="Start and stop them from an open terminal's Forwards panel."
       actions={
         <Button
-          variant="primary"
+          size="md"
+          icon={Waypoints}
           onClick={() =>
             openEditor({ type: 'port_forward', ...(createVault ? { vaultId: createVault } : {}) })
           }
@@ -197,18 +263,21 @@ export function ForwardsView() {
         </Button>
       }
     >
-      {forwards.map((f) => (
-        <Row
-          key={f.id}
-          item={f}
-          sub={
-            <>
-              <Badge>{f.payload.kind}</Badge> {describe(f)} · via {hostLabel(f.payload.host_id)}
-            </>
-          }
-          onOpen={() => openEditor({ type: 'port_forward', item: f })}
-        />
-      ))}
+      <Section title="Port forwards">
+        {forwards.map((f) => (
+          <ItemCard
+            key={f.id}
+            item={f}
+            type="port_forward"
+            tile={<Tile letter={FORWARD_LETTER[f.payload.kind]} />}
+            sub={
+              <>
+                {describe(f)} · via {hostLabel(f.payload.host_id)}
+              </>
+            }
+          />
+        ))}
+      </Section>
     </ListFrame>
   );
 }
@@ -233,36 +302,40 @@ export function KnownHostsView() {
   const [deleting, setDeleting] = useState<ItemOf<'known_host'> | null>(null);
   return (
     <ListFrame
-      title="Known hosts"
+      emptyIcon={FingerprintPattern}
+      emptyTitle="No trusted host keys yet"
       isEmpty={hosts.length === 0}
-      empty="No trusted host keys yet. When you connect to a new server, Ternix shows its fingerprint and saves the key you accept here."
+      empty="When you connect to a new server, Ternix shows its fingerprint and saves the key you accept here."
     >
-      {hosts.map((h) => {
-        const writable = canWrite(vaultById.get(h.vaultId));
-        return (
-          <div key={h.id} className="host-row">
-            <div className="host-main">
-              <div className="host-label mono">{labelOf(h.payload)}</div>
-              <div className="host-sub">
-                {h.payload.key_type} · <Fingerprint keyB64={h.payload.public_key} />
-              </div>
-            </div>
-            <div className="host-tags">
-              <VaultTag vaultId={h.vaultId} />
-            </div>
-            <div className="host-actions">
-              <Button
-                variant="danger"
-                disabled={!writable}
-                title={writable ? undefined : 'Read only'}
-                onClick={() => setDeleting(h)}
-              >
-                Forget
-              </Button>
-            </div>
-          </div>
-        );
-      })}
+      <Section title="Known hosts">
+        {hosts.map((h) => {
+          const writable = canWrite(vaultById.get(h.vaultId));
+          return (
+            <EntityCard
+              key={h.id}
+              mono
+              tile={<Tile icon={FingerprintPattern} />}
+              title={<span className="entity-title-text">{labelOf(h.payload)}</span>}
+              sub={
+                <>
+                  {h.payload.key_type} · <Fingerprint keyB64={h.payload.public_key} />
+                </>
+              }
+              meta={<VaultTag vaultId={h.vaultId} />}
+              actions={
+                <IconButton
+                  icon={Trash2}
+                  label="Forget"
+                  size="sm"
+                  disabled={!writable}
+                  title={writable ? 'Forget' : 'Read only'}
+                  onClick={() => setDeleting(h)}
+                />
+              }
+            />
+          );
+        })}
+      </Section>
       {deleting ? (
         <ConfirmDialog
           title="Forget this host key?"

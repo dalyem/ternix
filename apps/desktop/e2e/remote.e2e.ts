@@ -11,6 +11,7 @@ import {
 } from '@playwright/test';
 import { type SshTarget, startSshTarget } from './support/servers.js';
 import { answerDialog, stubDialogs } from './support/dialogs.js';
+import { hasVault, pickVault } from './support/ui.js';
 
 /**
  * The packaged app against a server it does not own: `E2E_SERVER_URL` is a deployed Ternix
@@ -263,7 +264,9 @@ test.describe('packaged app against a remote server', () => {
 
         await a.getByLabel('Email of the person to add').fill(bobEmail);
         await a.getByRole('button', { name: 'Look up' }).click();
-        const fingerprint = ((await a.locator('.card .fingerprint').textContent()) ?? '').trim();
+        const fingerprint = (
+          (await a.locator('[data-testid="add-member"] .fingerprint').textContent()) ?? ''
+        ).trim();
         await a.getByRole('button', { name: 'Add to vault' }).click();
         const confirm = await answerDialog(appA, 'Share vault', 'It matches, share');
         expect(confirm.message).toContain(bobEmail);
@@ -273,26 +276,28 @@ test.describe('packaged app against a remote server', () => {
 
         // No refresh on bob's side: the vault arrives over the WebSocket.
         await elapsedUntil(sharedAt, 'vault_appears_for_bob_ms', () =>
-          expect(nav(b, new RegExp(VAULT_NAME))).toBeVisible({ timeout: REALTIME_TIMEOUT }),
+          expect
+            .poll(() => hasVault(b, new RegExp(VAULT_NAME)), { timeout: REALTIME_TIMEOUT })
+            .toBe(true),
         );
         await shot(b, '07-bob-sees-vault');
 
         // Bob looks at the vault's snippets first, so the snippet's latency is not navigation.
-        await nav(b, new RegExp(VAULT_NAME)).click();
+        await pickVault(b, new RegExp(VAULT_NAME));
         await nav(b, /^Snippets/).click();
-        await expect(b.locator('.host-label', { hasText: SNIPPET_LABEL })).toHaveCount(0);
+        await expect(b.locator('.entity-title', { hasText: SNIPPET_LABEL })).toHaveCount(0);
 
-        await nav(a, new RegExp(VAULT_NAME)).click();
+        await pickVault(a, new RegExp(VAULT_NAME));
         await nav(a, /^Snippets/).click();
         await a.getByRole('button', { name: 'New snippet' }).click();
         await a.getByLabel('Label', { exact: true }).fill(SNIPPET_LABEL);
         await a.getByLabel('Script').fill('echo from-the-shared-vault');
         await a.getByRole('button', { name: 'Save' }).click();
-        await expect(a.locator('.host-label', { hasText: SNIPPET_LABEL })).toBeVisible();
+        await expect(a.locator('.entity-title', { hasText: SNIPPET_LABEL })).toBeVisible();
         const savedAt = Date.now();
 
         await elapsedUntil(savedAt, 'snippet_appears_for_bob_ms', () =>
-          expect(b.locator('.host-label', { hasText: SNIPPET_LABEL })).toBeVisible({
+          expect(b.locator('.entity-title', { hasText: SNIPPET_LABEL })).toBeVisible({
             timeout: REALTIME_TIMEOUT,
           }),
         );
@@ -312,7 +317,7 @@ test.describe('packaged app against a remote server', () => {
         await expect(a.getByRole('heading', { name: 'Ternix is locked' })).toBeVisible();
         await unlock(a, alicePassword);
         await expect(a.getByTestId(`host-${HOST_LABEL}`)).toBeVisible({ timeout: 90_000 });
-        await expect(nav(a, new RegExp(VAULT_NAME))).toBeVisible();
+        expect(await hasVault(a, new RegExp(VAULT_NAME))).toBe(true);
         await shot(a, '10-alice-after-restart');
       });
 
@@ -337,7 +342,9 @@ test.describe('packaged app against a remote server', () => {
         await shot(a, '11-alice-removed-bob');
 
         await elapsedUntil(removedAt, 'vault_disappears_for_bob_ms', () =>
-          expect(nav(b, new RegExp(VAULT_NAME))).toHaveCount(0, { timeout: REALTIME_TIMEOUT }),
+          expect
+            .poll(() => hasVault(b, new RegExp(VAULT_NAME)), { timeout: REALTIME_TIMEOUT })
+            .toBe(false),
         );
         await shot(b, '12-bob-vault-gone');
       });

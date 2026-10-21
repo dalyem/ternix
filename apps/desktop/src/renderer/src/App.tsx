@@ -1,3 +1,4 @@
+import { CircleAlert, Info, TriangleAlert, X } from 'lucide-react';
 import { useEffect } from 'react';
 import { OwnKeyMismatch, SignedOut, Unlock } from './screens/Auth.js';
 import { PromptHost } from './screens/Prompts.js';
@@ -10,9 +11,16 @@ function Toasts() {
     <div className="toasts" aria-live="polite">
       {toasts.map((t) => (
         <div key={t.id} className={`toast toast-${t.level}`} role="status">
+          {t.level === 'error' ? (
+            <CircleAlert size={14} aria-hidden />
+          ) : t.level === 'warning' ? (
+            <TriangleAlert size={14} aria-hidden />
+          ) : (
+            <Info size={14} aria-hidden />
+          )}
           <span>{t.message}</span>
-          <button aria-label="Dismiss" onClick={() => dismissToast(t.id)}>
-            ✕
+          <button className="toast-close" aria-label="Dismiss" onClick={() => dismissToast(t.id)}>
+            <X size={12} aria-hidden />
           </button>
         </div>
       ))}
@@ -30,7 +38,14 @@ export function App() {
     void boot();
   }, []);
 
-  if (!booted) return <div className="splash">Starting Ternix…</div>;
+  if (!booted) {
+    return (
+      <div className="splash">
+        <span className="welcome-drag" />
+        Starting Ternix…
+      </div>
+    );
+  }
 
   // While locked (or signed out by the server) the vault UI is hidden but mounted if terminals
   // exist, so their scrollback survives; the lock or sign-in screen is drawn over it.

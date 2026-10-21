@@ -1,3 +1,4 @@
+import { PanelRightClose, type LucideIcon } from 'lucide-react';
 import {
   type ButtonHTMLAttributes,
   type ReactNode,
@@ -13,23 +14,67 @@ import { runAuthExclusive, useStore } from './store.js';
 
 export function Button({
   variant = 'default',
+  size = 'lg',
+  icon: Icon,
   busy,
   children,
   ...props
 }: ButtonHTMLAttributes<HTMLButtonElement> & {
-  variant?: 'default' | 'primary' | 'danger' | 'ghost';
+  variant?: 'default' | 'primary' | 'danger' | 'ghost' | 'quiet';
+  /** Heights 36 (default), 30 and 24. */
+  size?: 'lg' | 'md' | 'sm';
+  icon?: LucideIcon;
   busy?: boolean;
 }) {
   return (
     <button
       type="button"
       {...props}
-      className={`btn btn-${variant} ${props.className ?? ''}`}
+      className={`btn btn-${variant} btn-${size} ${props.className ?? ''}`}
       disabled={props.disabled || busy}
     >
-      {busy ? <span className="spinner" aria-hidden /> : null}
+      {busy ? (
+        <span className="spinner" aria-hidden />
+      ) : Icon ? (
+        <Icon size={14} aria-hidden />
+      ) : null}
       {children}
     </button>
+  );
+}
+
+/** A square button with just a glyph; `label` is its accessible name and tooltip. */
+export function IconButton({
+  icon: Icon,
+  label,
+  size = 'md',
+  className,
+  ...props
+}: Omit<ButtonHTMLAttributes<HTMLButtonElement>, 'children'> & {
+  icon: LucideIcon;
+  label: string;
+  size?: 'md' | 'sm';
+}) {
+  return (
+    <button
+      type="button"
+      title={label}
+      {...props}
+      aria-label={label}
+      className={`btn btn-icon btn-${size} ${className ?? ''}`}
+    >
+      <Icon size={size === 'sm' ? 12 : 14} aria-hidden />
+    </button>
+  );
+}
+
+/** A group of fields on a raised card, with an optional heading. */
+export function FormCard({ title, children }: { title?: string; children: ReactNode }) {
+  return (
+    <section className="card">
+      {title ? <h3>{title}</h3> : null}
+      {children}
+    </section>
   );
 }
 
@@ -307,6 +352,65 @@ export function Modal({
   );
 }
 
+/**
+ * The right-hand panel that edits one item: a 340px drawer beside the lists, or a floating
+ * panel over a terminal. The body is a form of cards; `footer` holds Save, Cancel and Delete.
+ */
+export function Drawer({
+  title,
+  subtitle,
+  onClose,
+  children,
+  footer,
+  onSubmit,
+}: {
+  title: string;
+  subtitle?: ReactNode;
+  onClose: () => void;
+  children: ReactNode;
+  footer?: ReactNode;
+  onSubmit?: () => void;
+}) {
+  const floating = useStore((s) => s.activeTab !== null);
+  const ref = useRef<HTMLElement>(null);
+  useEffect(() => {
+    const first = ref.current?.querySelector<HTMLElement>(
+      'input:not([disabled]), textarea, select',
+    );
+    first?.focus();
+  }, []);
+  return (
+    <aside
+      ref={ref}
+      className={`drawer ${floating ? 'floating' : ''}`}
+      role="region"
+      aria-label={title}
+      onKeyDown={(e) => {
+        if (e.key === 'Escape' && !e.defaultPrevented) onClose();
+      }}
+    >
+      <header className="drawer-header">
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <h2 className="ellipsis">{title}</h2>
+          {subtitle ? <div className="drawer-sub ellipsis">{subtitle}</div> : null}
+        </div>
+        <IconButton icon={PanelRightClose} label="Hide panel" onClick={onClose} />
+      </header>
+      <form
+        className="drawer-form"
+        onSubmit={(e) => {
+          e.preventDefault();
+          onSubmit?.();
+        }}
+      >
+        <div className="drawer-body">{children}</div>
+        {footer ? <div className="drawer-footer">{footer}</div> : null}
+        <button type="submit" hidden />
+      </form>
+    </aside>
+  );
+}
+
 export function ConfirmDialog({
   title,
   message,
@@ -420,8 +524,29 @@ export function useLoad<T>(load: () => Promise<T>, deps: unknown[] = []) {
   return { data, error, loading, reload: () => setVersion((v) => v + 1) };
 }
 
-export function EmptyState({ children }: { children: ReactNode }) {
-  return <div className="empty">{children}</div>;
+export function EmptyState({
+  children,
+  icon: Icon,
+  title,
+  actions,
+}: {
+  children: ReactNode;
+  icon?: LucideIcon;
+  title?: string;
+  actions?: ReactNode;
+}) {
+  return (
+    <div className="empty">
+      {Icon ? (
+        <div className="empty-icon" aria-hidden>
+          <Icon size={20} />
+        </div>
+      ) : null}
+      {title ? <div className="empty-title">{title}</div> : null}
+      <div>{children}</div>
+      {actions}
+    </div>
+  );
 }
 
 export function formatDate(iso: string | null | undefined): string {

@@ -33,6 +33,29 @@ export function lockDownWebContents(contents: WebContents): void {
   contents.setWindowOpenHandler(() => ({ action: 'deny' }));
 }
 
+/** Colours of the 51px tab bar the renderer draws as the title bar (see styles.css). */
+const TITLE_BAR_HEIGHT = 51;
+const TITLE_BAR_COLOR = '#141729';
+
+/**
+ * The renderer's tab bar is the title bar. macOS keeps the traffic lights, inset into it;
+ * Windows and Linux get the native window buttons as an overlay on its right edge (the page
+ * pads for it with the `titlebar-area-*` env variables).
+ */
+function titleBarOptions(): Partial<Electron.BrowserWindowConstructorOptions> {
+  if (process.platform === 'darwin') {
+    return { titleBarStyle: 'hiddenInset', trafficLightPosition: { x: 16, y: 18 } };
+  }
+  return {
+    titleBarStyle: 'hidden',
+    titleBarOverlay: {
+      color: TITLE_BAR_COLOR,
+      symbolColor: '#8d91a5',
+      height: TITLE_BAR_HEIGHT - 1,
+    },
+  };
+}
+
 export function createMainWindow(): BrowserWindow {
   const win = new BrowserWindow({
     width: 1280,
@@ -41,8 +64,9 @@ export function createMainWindow(): BrowserWindow {
     minHeight: 600,
     show: false,
     title: 'Ternix',
-    backgroundColor: '#14161a',
+    backgroundColor: TITLE_BAR_COLOR,
     autoHideMenuBar: true,
+    ...titleBarOptions(),
     webPreferences: {
       preload: join(__dirname, '../preload/index.cjs'),
       contextIsolation: true,

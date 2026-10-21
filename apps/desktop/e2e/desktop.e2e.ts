@@ -19,6 +19,7 @@ import {
   startTernixServer,
 } from './support/servers.js';
 import { answerDialog, askedDialogs, stubDialogs } from './support/dialogs.js';
+import { hasVault, pickVault, restyleShot } from './support/ui.js';
 
 const ARTIFACTS = resolve(import.meta.dirname, 'artifacts');
 const EXECUTABLE = process.env['TERNIX_E2E_EXECUTABLE'];
@@ -149,7 +150,9 @@ const pinBadge = (scope: Locator, text: string) =>
 async function addMemberViaUi(app: ElectronApplication, page: Page, email: string) {
   await page.getByLabel('Email of the person to add').fill(email);
   await page.getByRole('button', { name: 'Look up' }).click();
-  const fingerprint = ((await page.locator('.card .fingerprint').textContent()) ?? '').trim();
+  const fingerprint = (
+    (await page.locator('[data-testid="add-member"] .fingerprint').textContent()) ?? ''
+  ).trim();
   await page.getByRole('button', { name: 'Add to vault' }).click();
   const asked = await answerDialog(app, 'Share vault', 'It matches, share');
   expect(asked.message).toContain(email);
@@ -263,14 +266,14 @@ test('packaged app: setup, register, host, host key, terminal, forwards, snippet
     await page.getByLabel('Destination host').fill('127.0.0.1');
     await page.getByLabel('Destination port').fill(String(echo.port));
     await page.getByRole('button', { name: 'Save' }).click();
-    await expect(page.locator('.host-label', { hasText: 'echo' })).toBeVisible();
+    await expect(page.locator('.entity-title', { hasText: 'echo' })).toBeVisible();
 
     await nav(page, /^Snippets/).click();
     await page.getByRole('button', { name: 'New snippet' }).click();
     await page.getByLabel('Label', { exact: true }).fill('greet');
     await page.getByLabel('Script').fill("echo sni''ppet");
     await page.getByRole('button', { name: 'Save' }).click();
-    await expect(page.locator('.host-label', { hasText: 'greet' })).toBeVisible();
+    await expect(page.locator('.entity-title', { hasText: 'greet' })).toBeVisible();
     await nav(page, /^Hosts/).click();
   });
 
@@ -356,7 +359,7 @@ test('packaged app: setup, register, host, host key, terminal, forwards, snippet
     await page.getByRole('tab', { name: 'Vaults' }).click();
     await nav(page, /^Known hosts/).click();
     await expect(
-      page.locator('.host-label', { hasText: `${target.address}:${target.port}` }),
+      page.locator('.entity-title', { hasText: `${target.address}:${target.port}` }),
     ).toBeVisible();
     if (target.fingerprint) {
       await expect(page.locator('.fingerprint', { hasText: target.fingerprint })).toBeVisible();
@@ -462,7 +465,7 @@ test('packaged app: setup, register, host, host key, terminal, forwards, snippet
     await page.getByLabel('Label', { exact: true }).fill('e2e-key');
     await page.getByLabel('Private key').fill(target.userKey.privateKey);
     await page.getByRole('button', { name: 'Save' }).click();
-    await expect(page.locator('.host-label', { hasText: 'e2e-key' })).toBeVisible();
+    await expect(page.locator('.entity-title', { hasText: 'e2e-key' })).toBeVisible();
 
     await nav(page, /^Hosts/).click();
     await page.getByTestId('new-host').click();
@@ -490,12 +493,12 @@ test('packaged app: setup, register, host, host key, terminal, forwards, snippet
       .fill(`-----BEGIN OPENSSH PRIVATE KEY-----\n${body}\n-----END OPENSSH PRIVATE KEY-----`);
     await page.getByLabel('Passphrase').fill('LOCKTEST-PASSPHRASE');
     await page.getByRole('button', { name: 'Save' }).click();
-    const row = page.locator('.host-row', { hasText: 'lock-key' });
+    const row = page.locator('.entity-card', { hasText: 'lock-key' });
     await expect(row).toBeVisible();
     // Lists carry no secrets: the reopened editor starts empty until "Show".
     expect(await pageText(page)).not.toContain(body);
     await row.getByRole('button', { name: 'Edit' }).click();
-    const editor = page.getByRole('dialog', { name: /Edit SSH key/ });
+    const editor = page.getByRole('region', { name: /Edit SSH key/ });
     await expect(editor.getByLabel('Private key')).toHaveValue('');
     await editor.getByRole('button', { name: 'Show' }).first().click();
     await expect(editor.getByLabel('Private key')).toHaveValue(new RegExp(body));
@@ -515,7 +518,7 @@ test('packaged app: setup, register, host, host key, terminal, forwards, snippet
     await page.getByLabel('Master password').fill(PASSWORD);
     await page.getByRole('button', { name: 'Unlock' }).click();
     await expect(page.getByTestId('lock-now')).toBeVisible();
-    await expect(page.getByRole('dialog')).toHaveCount(0);
+    await expect(page.getByRole('region', { name: /^(Edit|New) / })).toHaveCount(0);
     expect(await pageText(page)).not.toContain(body);
   });
 
@@ -528,7 +531,7 @@ test('packaged app: setup, register, host, host key, terminal, forwards, snippet
     await expect(page.getByText('Default port for new hosts in this group.')).toBeVisible();
     await shot(page, '12-group-port');
     await page.getByRole('button', { name: 'Save' }).click();
-    await expect(page.locator('.group-label', { hasText: 'lab' })).toBeVisible();
+    await expect(page.locator('.entity-title', { hasText: 'lab' })).toBeVisible();
 
     await page.getByTestId('new-host').click();
     const port = page.getByLabel('Port', { exact: true });
@@ -651,7 +654,7 @@ test('sharing: fingerprint check, roles, realtime, removal', async () => {
   await test.step('she must confirm the fingerprint in main’s dialog before adding Bob', async () => {
     await a.getByLabel('Email of the person to add').fill('bob@example.com');
     await a.getByRole('button', { name: 'Look up' }).click();
-    const found = a.locator('.card .fingerprint');
+    const found = a.locator('[data-testid="add-member"] .fingerprint');
     await expect(found).toBeVisible();
     expect(((await found.textContent()) ?? '').trim()).toBe(bobFingerprint);
     await shot(a, 'share-1-verify');
@@ -675,7 +678,7 @@ test('sharing: fingerprint check, roles, realtime, removal', async () => {
   });
 
   await test.step('a host saved in the shared vault reaches Bob in real time, read-only', async () => {
-    await nav(a, /^Team/).click();
+    await pickVault(a, /^Team/);
     await nav(a, /^Hosts/).click();
     await a.getByTestId('new-host').click();
     await a.getByLabel('Label', { exact: true }).fill('shared-box');
@@ -683,11 +686,11 @@ test('sharing: fingerprint check, roles, realtime, removal', async () => {
     await a.getByRole('button', { name: 'Save' }).click();
     await expect(a.getByTestId('host-shared-box')).toBeVisible();
 
-    await expect(nav(b, /Team/)).toBeVisible({ timeout: 30_000 });
+    await expect.poll(() => hasVault(b, /Team/), { timeout: 30_000 }).toBe(true);
     await expect(b.getByTestId('host-shared-box')).toBeVisible({ timeout: 30_000 });
     await shot(b, 'share-2-bob-viewer');
     await b.getByTestId('host-shared-box').getByRole('button', { name: 'View' }).click();
-    await expect(b.getByRole('dialog', { name: /read only/ })).toBeVisible();
+    await expect(b.getByRole('region', { name: /read only/ })).toBeVisible();
     await expect(b.getByRole('button', { name: 'Save' })).toHaveCount(0);
     await b.getByRole('button', { name: 'Close' }).click();
   });
@@ -737,7 +740,7 @@ test('sharing: fingerprint check, roles, realtime, removal', async () => {
       timeout: 60_000,
     });
     await shot(a, 'share-3-removed');
-    await expect(nav(b, /Team/)).toHaveCount(0, { timeout: 30_000 });
+    await expect.poll(() => hasVault(b, /Team/), { timeout: 30_000 }).toBe(false);
     await expect(b.getByTestId('host-shared-box')).toHaveCount(0);
   });
 
@@ -804,6 +807,7 @@ test('sharing: a substituted member key is refused until the owner verifies it',
     await expect(dialog).toContainText(evilFingerprint);
     await expect(dialog).toContainText('may be an attack');
     await shot(a, 'share-5-key-changed-dialog');
+    await restyleShot(a, '12-key-changed-dialog');
 
     await dialog.getByRole('button', { name: 'Cancel' }).click();
     await expect(dialog).toHaveCount(0);

@@ -50,3 +50,27 @@ export async function hostKeyFingerprint(publicKeyB64: string): Promise<string> 
   for (const byte of digest) binary += String.fromCharCode(byte);
   return `SHA256:${btoa(binary).replace(/=+$/, '')}`;
 }
+
+/** Brand colours the host tiles draw from (the same set the colour picker offers). */
+export const TILE_COLORS = [
+  '#E95420',
+  '#CE0056',
+  '#EFA720',
+  '#3C6EB4',
+  '#1793D1',
+  '#30BA78',
+  '#F26711',
+  '#54487A',
+  '#BE3956',
+  '#00A1F1',
+  '#3DDC84',
+  '#AF5FFF',
+];
+
+/** The tile colour of a host: the one the user chose, else a stable pick from its label. */
+export function tileColor(label: string, chosen?: string): string {
+  if (chosen) return chosen;
+  let hash = 0;
+  for (const ch of label) hash = (hash * 31 + ch.charCodeAt(0)) >>> 0;
+  return TILE_COLORS[hash % TILE_COLORS.length]!;
+}

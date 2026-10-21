@@ -1,3 +1,4 @@
+import { Plus } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import type {
   KeyChangeDto,
@@ -18,6 +19,7 @@ import {
   ErrorText,
   Fingerprint,
   formatDate,
+  FormCard,
   Modal,
   Notice,
   PinBadge,
@@ -45,46 +47,48 @@ export function SharingView() {
 
   return (
     <div className="view">
-      <div className="view-header">
-        <h1>Sharing</h1>
-        <span className="spacer" />
-        <Button variant="primary" onClick={() => setCreating(true)}>
+      <div className="toolbar">
+        <Button size="md" icon={Plus} onClick={() => setCreating(true)}>
           New shared vault
         </Button>
       </div>
-      {account ? (
-        <div className="server-card">
-          <div>
-            Your fingerprint: <Fingerprint value={account.user.fingerprint} />
-          </div>
-          <div className="muted">
-            When someone shares a vault with you, they should compare this with what they see. Read
-            it to them over a call or in person, not over the same channel as the invite.
-          </div>
-        </div>
-      ) : null}
-      <div className="split">
-        <div className="vault-list" role="listbox" aria-label="Shared vaults">
-          {shared.length === 0 ? (
-            <EmptyState>
-              No shared vaults yet. Create one to share hosts and keys with other people on this
-              server.
-            </EmptyState>
+      <div className="view-scroll">
+        <div className="page">
+          {account ? (
+            <div className="server-card">
+              <div>
+                Your fingerprint: <Fingerprint value={account.user.fingerprint} />
+              </div>
+              <div className="muted">
+                When someone shares a vault with you, they should compare this with what they see.
+                Read it to them over a call or in person, not over the same channel as the invite.
+              </div>
+            </div>
           ) : null}
-          {shared.map((v) => (
-            <button
-              key={v.id}
-              role="option"
-              aria-selected={v.id === selected?.id}
-              className={`vault-item ${v.id === selected?.id ? 'active' : ''}`}
-              onClick={() => setSelectedId(v.id)}
-            >
-              <span>{vaultTitle(v)}</span>
-              <RoleBadge role={v.role} />
-            </button>
-          ))}
+          <div className="split">
+            <div className="vault-list" role="listbox" aria-label="Shared vaults">
+              {shared.length === 0 ? (
+                <EmptyState>
+                  No shared vaults yet. Create one to share hosts and keys with other people on this
+                  server.
+                </EmptyState>
+              ) : null}
+              {shared.map((v) => (
+                <button
+                  key={v.id}
+                  role="option"
+                  aria-selected={v.id === selected?.id}
+                  className={`vault-item ${v.id === selected?.id ? 'active' : ''}`}
+                  onClick={() => setSelectedId(v.id)}
+                >
+                  <span>{vaultTitle(v)}</span>
+                  <RoleBadge role={v.role} />
+                </button>
+              ))}
+            </div>
+            <div className="split-main">{selected ? <VaultDetail vault={selected} /> : null}</div>
+          </div>
         </div>
-        <div className="split-main">{selected ? <VaultDetail vault={selected} /> : null}</div>
       </div>
       {creating ? <CreateVaultDialog onClose={() => setCreating(false)} /> : null}
     </div>
@@ -161,7 +165,7 @@ function VaultDetail({ vault }: { vault: VaultDto }) {
 
   return (
     <div className="vault-detail">
-      <div className="row">
+      <div className="row" style={{ marginTop: 0 }}>
         <h2>{vaultTitle(vault)}</h2>
         <RoleBadge role={vault.role} />
         <span className="muted">
@@ -170,13 +174,15 @@ function VaultDetail({ vault }: { vault: VaultDto }) {
         <span className="spacer" />
         {isOwner ? (
           <>
-            <Button onClick={() => setRenaming(true)}>Rename</Button>
-            <Button variant="danger" onClick={() => setDeleting(true)}>
+            <Button size="md" onClick={() => setRenaming(true)}>
+              Rename
+            </Button>
+            <Button variant="danger" size="md" onClick={() => setDeleting(true)}>
               Delete vault
             </Button>
           </>
         ) : (
-          <Button variant="danger" onClick={() => setLeaving(true)}>
+          <Button variant="danger" size="md" onClick={() => setLeaving(true)}>
             Leave vault
           </Button>
         )}
@@ -209,33 +215,34 @@ function VaultDetail({ vault }: { vault: VaultDto }) {
         <Notice>Member removed and the vault key rotated, so they cannot read new changes.</Notice>
       ) : null}
 
-      <h3>Members</h3>
-      <ErrorText error={members.error} />
-      <table className="table">
-        <thead>
-          <tr>
-            <th>Member</th>
-            <th>Fingerprint</th>
-            <th>Role</th>
-            <th>Added</th>
-            <th />
-          </tr>
-        </thead>
-        <tbody>
-          {(members.data ?? []).map((m) => (
-            <MemberRow
-              key={m.userId}
-              vault={vault}
-              member={m}
-              onChanged={members.reload}
-              onRemoved={(result) => {
-                setRotationNotice(result);
-                members.reload();
-              }}
-            />
-          ))}
-        </tbody>
-      </table>
+      <FormCard title="Members">
+        <ErrorText error={members.error} />
+        <table className="table">
+          <thead>
+            <tr>
+              <th>Member</th>
+              <th>Fingerprint</th>
+              <th>Role</th>
+              <th>Added</th>
+              <th />
+            </tr>
+          </thead>
+          <tbody>
+            {(members.data ?? []).map((m) => (
+              <MemberRow
+                key={m.userId}
+                vault={vault}
+                member={m}
+                onChanged={members.reload}
+                onRemoved={(result) => {
+                  setRotationNotice(result);
+                  members.reload();
+                }}
+              />
+            ))}
+          </tbody>
+        </table>
+      </FormCard>
       {isOwner ? <AddMember vault={vault} onAdded={members.reload} /> : null}
       {isOwner ? (
         <div className="row">
@@ -353,6 +360,7 @@ function MemberRow({
         {canVerify ? (
           <div>
             <Button
+              size="sm"
               busy={verify.busy}
               title="Ternix shows the fingerprint to compare in a system dialog"
               onClick={() =>
@@ -382,6 +390,7 @@ function MemberRow({
           <div>
             <Button
               variant="danger"
+              size="sm"
               onClick={() =>
                 setReviewing({
                   userId: member.userId,
@@ -443,7 +452,7 @@ function MemberRow({
       <td className="muted">{formatDate(member.addedAt)}</td>
       <td>
         {isOwner && !member.isSelf ? (
-          <Button variant="danger" onClick={() => setRemoving(true)}>
+          <Button variant="danger" size="sm" onClick={() => setRemoving(true)}>
             Remove
           </Button>
         ) : null}
@@ -485,7 +494,7 @@ function AddMember({ vault, onAdded }: { vault: VaultDto; onAdded: () => void })
   const reset = () => setFound(null);
 
   return (
-    <div className="card">
+    <div className="card" data-testid="add-member">
       <h3>Add a member</h3>
       <form
         onSubmit={(e) => {

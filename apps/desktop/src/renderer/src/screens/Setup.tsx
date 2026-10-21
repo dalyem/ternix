@@ -1,3 +1,4 @@
+import { Server, ShieldCheck, SquareTerminal, Users } from 'lucide-react';
 import { type ReactNode, useEffect, useState } from 'react';
 import type { ProbedServerDto } from '../../../shared/ipc.js';
 import { call, errorMessage } from '../api.js';
@@ -6,16 +7,32 @@ import { Badge, Button, Notice, TextField } from '../ui.js';
 
 export function AuthLayout({ title, children }: { title: string; children: ReactNode }) {
   return (
-    <div className="auth-screen">
+    <div className="welcome">
+      <div className="welcome-drag" />
       <div className="auth-card">
-        <div className="brand">
-          <span className="brand-mark" aria-hidden>
-            ▍
+        <div className="brand" aria-hidden>
+          <span className="brand-mark">
+            <SquareTerminal size={24} />
           </span>
-          Ternix
         </div>
         <h1>{title}</h1>
         {children}
+      </div>
+      <div className="welcome-hero" aria-hidden>
+        <div className="hero-tiles">
+          <span className="hero-tile big">
+            <Server size={44} />
+          </span>
+          <span className="hero-tile small">
+            <SquareTerminal size={30} />
+          </span>
+          <span className="hero-tile small">
+            <ShieldCheck size={30} />
+          </span>
+          <span className="hero-tile big">
+            <Users size={44} />
+          </span>
+        </div>
       </div>
     </div>
   );

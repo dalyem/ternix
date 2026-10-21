@@ -3,9 +3,11 @@ import { useMemo, useState } from 'react';
 import { call } from '../api.js';
 import { BIND_ADDRESS_MESSAGE, looksLikeLocalBindAddress } from '../../../shared/forwards.js';
 import { groupDefaultPort } from '../../../shared/groups.js';
-import type { PayloadOf } from '../items.js';
+import { type PayloadOf, tileColor, TILE_COLORS } from '../items.js';
 import { type EditorTarget, useStore } from '../store.js';
-import { Button, Checkbox, Select, TextArea, TextField, Notice } from '../ui.js';
+import { Button, Checkbox, FormCard, Notice, Select, TextArea, TextField } from '../ui.js';
+import { Tile } from '../cards.js';
+import { Server } from 'lucide-react';
 import {
   EditorFrame,
   ItemSelect,
@@ -18,7 +20,7 @@ import {
   useSecret,
 } from './common.js';
 
-const COLORS = ['', '#e5484d', '#f5a524', '#46a758', '#3e63dd', '#8e4ec6', '#12a594'];
+const COLORS = ['', ...TILE_COLORS];
 
 /** The payload being edited, when it is of the expected type. */
 function existing<T extends ItemType>(target: EditorTarget, type: T): PayloadOf<T> | undefined {
@@ -112,22 +114,18 @@ function HostEditor({ target }: { target: EditorTarget }) {
     >
       {({ vaultId, readOnly }) => (
         <>
-          <TextField
-            label="Label"
-            value={label}
-            onChange={setLabel}
-            disabled={readOnly}
-            autoFocus
-          />
-          <div className="grid-2">
-            <TextField
-              label="Address"
-              value={address}
-              onChange={setAddress}
-              disabled={readOnly}
-              placeholder="hostname or IP"
-              spellCheck={false}
-            />
+          <FormCard title="Address">
+            <div className="address-row">
+              <Tile color={tileColor(label.trim() || 'host', color || undefined)} icon={Server} />
+              <TextField
+                label="Address"
+                value={address}
+                onChange={setAddress}
+                disabled={readOnly}
+                placeholder="hostname or IP"
+                spellCheck={false}
+              />
+            </div>
             <TextField
               label="Port"
               value={port}
@@ -138,8 +136,55 @@ function HostEditor({ target }: { target: EditorTarget }) {
               disabled={readOnly}
               inputMode="numeric"
             />
-          </div>
-          <div className="grid-2">
+          </FormCard>
+          <FormCard title="General">
+            <TextField
+              label="Label"
+              value={label}
+              onChange={setLabel}
+              disabled={readOnly}
+              autoFocus
+            />
+            <ItemSelect
+              label="Group"
+              type="group"
+              value={groupId}
+              onChange={(id) => {
+                setGroupId(id);
+                if (!portTouched && (port === '22' || portFromGroup)) {
+                  const inherited = groupDefaultPort(items, id);
+                  setPort(String(inherited ?? 22));
+                  setPortFromGroup(inherited !== undefined);
+                }
+              }}
+              targetVaultId={vaultId}
+              disabled={readOnly}
+            />
+            <TextField
+              label="Tags"
+              value={tags}
+              onChange={setTags}
+              disabled={readOnly}
+              hint="Comma separated"
+            />
+            <div>
+              <div className="field-static-label">Color</div>
+              <div className="swatches">
+                {COLORS.map((c) => (
+                  <button
+                    key={c || 'none'}
+                    type="button"
+                    className={`swatch ${color === c ? 'selected' : ''}`}
+                    style={{ background: c || 'transparent' }}
+                    aria-label={c ? `Color ${c}` : 'No color'}
+                    disabled={readOnly}
+                    onClick={() => setColor(c)}
+                  />
+                ))}
+              </div>
+            </div>
+          </FormCard>
+          <FormCard title="Credentials">
             <TextField
               label="Username"
               value={username}
@@ -149,8 +194,6 @@ function HostEditor({ target }: { target: EditorTarget }) {
               spellCheck={false}
             />
             <SecretInput label="Password" secret={password} readOnly={readOnly} />
-          </div>
-          <div className="grid-2">
             <ItemSelect
               label="Identity"
               type="identity"
@@ -167,23 +210,8 @@ function HostEditor({ target }: { target: EditorTarget }) {
               targetVaultId={vaultId}
               disabled={readOnly}
             />
-          </div>
-          <div className="grid-2">
-            <ItemSelect
-              label="Group"
-              type="group"
-              value={groupId}
-              onChange={(id) => {
-                setGroupId(id);
-                if (!portTouched && (port === '22' || portFromGroup)) {
-                  const inherited = groupDefaultPort(items, id);
-                  setPort(String(inherited ?? 22));
-                  setPortFromGroup(inherited !== undefined);
-                }
-              }}
-              targetVaultId={vaultId}
-              disabled={readOnly}
-            />
+          </FormCard>
+          <FormCard title="Advanced">
             <ItemSelect
               label="Jump host"
               type="host"
@@ -193,23 +221,14 @@ function HostEditor({ target }: { target: EditorTarget }) {
               exclude={exclude}
               disabled={readOnly}
             />
-          </div>
-          <ItemSelect
-            label="Startup snippet"
-            type="snippet"
-            value={snippetId}
-            onChange={setSnippetId}
-            targetVaultId={vaultId}
-            disabled={readOnly}
-          />
-          <TextField
-            label="Tags"
-            value={tags}
-            onChange={setTags}
-            disabled={readOnly}
-            hint="Comma separated"
-          />
-          <div className="grid-2">
+            <ItemSelect
+              label="Startup snippet"
+              type="snippet"
+              value={snippetId}
+              onChange={setSnippetId}
+              targetVaultId={vaultId}
+              disabled={readOnly}
+            />
             <TextField
               label="Keepalive (seconds)"
               value={keepalive}
@@ -218,30 +237,22 @@ function HostEditor({ target }: { target: EditorTarget }) {
               placeholder="off"
               inputMode="numeric"
             />
-            <div className="field">
-              <label>Color</label>
-              <div className="swatches">
-                {COLORS.map((c) => (
-                  <button
-                    key={c || 'none'}
-                    type="button"
-                    className={`swatch ${color === c ? 'selected' : ''}`}
-                    style={{ background: c || 'transparent' }}
-                    aria-label={c ? `Color ${c}` : 'No color'}
-                    disabled={readOnly}
-                    onClick={() => setColor(c)}
-                  />
-                ))}
-              </div>
-            </div>
-          </div>
-          <Checkbox
-            label="Forward my SSH agent to this host"
-            checked={agent}
-            onChange={setAgent}
-            disabled={readOnly}
-          />
-          <TextArea label="Notes" value={notes} onChange={setNotes} disabled={readOnly} rows={3} />
+            <Checkbox
+              label="Forward my SSH agent to this host"
+              checked={agent}
+              onChange={setAgent}
+              disabled={readOnly}
+            />
+          </FormCard>
+          <FormCard title="Notes">
+            <TextArea
+              label="Notes"
+              value={notes}
+              onChange={setNotes}
+              disabled={readOnly}
+              rows={3}
+            />
+          </FormCard>
         </>
       )}
     </EditorFrame>
@@ -300,28 +311,30 @@ function GroupEditor({ target }: { target: EditorTarget }) {
     >
       {({ vaultId, readOnly }) => (
         <>
-          <TextField
-            label="Label"
-            value={label}
-            onChange={setLabel}
-            disabled={readOnly}
-            autoFocus
-          />
-          <ItemSelect
-            label="Inside group"
-            type="group"
-            value={parentId}
-            onChange={setParentId}
-            targetVaultId={vaultId}
-            exclude={exclude}
-            disabled={readOnly}
-            noneLabel="Top level"
-          />
-          <Notice>
-            Hosts in this group use the username and identity for anything they do not set
-            themselves. The port is only filled in when you create a host here.
-          </Notice>
-          <div className="grid-2">
+          <FormCard title="General">
+            <TextField
+              label="Label"
+              value={label}
+              onChange={setLabel}
+              disabled={readOnly}
+              autoFocus
+            />
+            <ItemSelect
+              label="Inside group"
+              type="group"
+              value={parentId}
+              onChange={setParentId}
+              targetVaultId={vaultId}
+              exclude={exclude}
+              disabled={readOnly}
+              noneLabel="Top level"
+            />
+          </FormCard>
+          <FormCard title="Defaults">
+            <Notice>
+              Hosts in this group use the username and identity for anything they do not set
+              themselves. The port is only filled in when you create a host here.
+            </Notice>
             <TextField
               label="Default username"
               value={username}
@@ -336,15 +349,15 @@ function GroupEditor({ target }: { target: EditorTarget }) {
               inputMode="numeric"
               hint="Default port for new hosts in this group."
             />
-          </div>
-          <ItemSelect
-            label="Default identity"
-            type="identity"
-            value={identityId}
-            onChange={setIdentityId}
-            targetVaultId={vaultId}
-            disabled={readOnly}
-          />
+            <ItemSelect
+              label="Default identity"
+              type="identity"
+              value={identityId}
+              onChange={setIdentityId}
+              targetVaultId={vaultId}
+              disabled={readOnly}
+            />
+          </FormCard>
         </>
       )}
     </EditorFrame>
@@ -374,29 +387,33 @@ function IdentityEditor({ target }: { target: EditorTarget }) {
     >
       {({ vaultId, readOnly }) => (
         <>
-          <TextField
-            label="Label"
-            value={label}
-            onChange={setLabel}
-            disabled={readOnly}
-            autoFocus
-          />
-          <TextField
-            label="Username"
-            value={username}
-            onChange={setUsername}
-            disabled={readOnly}
-            spellCheck={false}
-          />
-          <SecretInput label="Password" secret={password} readOnly={readOnly} />
-          <ItemSelect
-            label="SSH key"
-            type="ssh_key"
-            value={keyId}
-            onChange={setKeyId}
-            targetVaultId={vaultId}
-            disabled={readOnly}
-          />
+          <FormCard title="General">
+            <TextField
+              label="Label"
+              value={label}
+              onChange={setLabel}
+              disabled={readOnly}
+              autoFocus
+            />
+          </FormCard>
+          <FormCard title="Credentials">
+            <TextField
+              label="Username"
+              value={username}
+              onChange={setUsername}
+              disabled={readOnly}
+              spellCheck={false}
+            />
+            <SecretInput label="Password" secret={password} readOnly={readOnly} />
+            <ItemSelect
+              label="SSH key"
+              type="ssh_key"
+              value={keyId}
+              onChange={setKeyId}
+              targetVaultId={vaultId}
+              disabled={readOnly}
+            />
+          </FormCard>
         </>
       )}
     </EditorFrame>
@@ -446,45 +463,53 @@ function KeyEditor({ target }: { target: EditorTarget }) {
     >
       {({ readOnly }) => (
         <>
-          <TextField
-            label="Label"
-            value={label}
-            onChange={setLabel}
-            disabled={readOnly}
-            autoFocus
-          />
-          <SecretInput
-            label="Private key"
-            secret={privateKey}
-            readOnly={readOnly}
-            multiline
-            optional={false}
-            placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"
-            hint={
-              privateKey.value !== '' && !looksLikeKey ? (
-                <span className="warn">This does not look like a PEM/OpenSSH private key.</span>
-              ) : undefined
-            }
-          />
-          {!readOnly ? (
-            <div className="row">
-              <Button onClick={() => void importFile()}>Import from file…</Button>
-              {importError ? <span className="error-text">{importError}</span> : null}
-            </div>
-          ) : null}
-          <SecretInput
-            label="Passphrase"
-            secret={passphrase}
-            readOnly={readOnly}
-            hint="Only if the key is encrypted."
-          />
-          <TextField
-            label="Public key (optional)"
-            value={publicKey}
-            onChange={setPublicKey}
-            disabled={readOnly}
-            spellCheck={false}
-          />
+          <FormCard title="General">
+            <TextField
+              label="Label"
+              value={label}
+              onChange={setLabel}
+              disabled={readOnly}
+              autoFocus
+            />
+          </FormCard>
+          <FormCard title="Private key">
+            <SecretInput
+              label="Private key"
+              secret={privateKey}
+              readOnly={readOnly}
+              multiline
+              optional={false}
+              placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"
+              hint={
+                privateKey.value !== '' && !looksLikeKey ? (
+                  <span className="warn">This does not look like a PEM/OpenSSH private key.</span>
+                ) : undefined
+              }
+            />
+            {!readOnly ? (
+              <div className="row">
+                <Button size="md" onClick={() => void importFile()}>
+                  Import from file…
+                </Button>
+                {importError ? <span className="error-text">{importError}</span> : null}
+              </div>
+            ) : null}
+            <SecretInput
+              label="Passphrase"
+              secret={passphrase}
+              readOnly={readOnly}
+              hint="Only if the key is encrypted."
+            />
+          </FormCard>
+          <FormCard title="Public key">
+            <TextField
+              label="Public key (optional)"
+              value={publicKey}
+              onChange={setPublicKey}
+              disabled={readOnly}
+              spellCheck={false}
+            />
+          </FormCard>
         </>
       )}
     </EditorFrame>
@@ -505,28 +530,32 @@ function SnippetEditor({ target }: { target: EditorTarget }) {
     >
       {({ readOnly }) => (
         <>
-          <TextField
-            label="Label"
-            value={label}
-            onChange={setLabel}
-            disabled={readOnly}
-            autoFocus
-          />
-          <TextArea
-            label="Script"
-            value={script}
-            onChange={setScript}
-            disabled={readOnly}
-            mono
-            rows={8}
-          />
-          <TextField
-            label="Tags"
-            value={tags}
-            onChange={setTags}
-            disabled={readOnly}
-            hint="Comma separated"
-          />
+          <FormCard title="General">
+            <TextField
+              label="Label"
+              value={label}
+              onChange={setLabel}
+              disabled={readOnly}
+              autoFocus
+            />
+            <TextField
+              label="Tags"
+              value={tags}
+              onChange={setTags}
+              disabled={readOnly}
+              hint="Comma separated"
+            />
+          </FormCard>
+          <FormCard title="Script">
+            <TextArea
+              label="Script"
+              value={script}
+              onChange={setScript}
+              disabled={readOnly}
+              mono
+              rows={8}
+            />
+          </FormCard>
         </>
       )}
     </EditorFrame>
@@ -575,74 +604,80 @@ function ForwardEditor({ target }: { target: EditorTarget }) {
     >
       {({ vaultId, readOnly }) => (
         <>
-          <TextField
-            label="Label"
-            value={label}
-            onChange={setLabel}
-            disabled={readOnly}
-            autoFocus
-          />
-          <ItemSelect
-            label="Host"
-            type="host"
-            value={hostId}
-            onChange={setHostId}
-            targetVaultId={vaultId}
-            disabled={readOnly}
-            noneLabel="Choose a host"
-          />
-          <Select
-            label="Type"
-            value={kind}
-            onChange={setKind}
-            disabled={readOnly}
-            options={[
-              {
-                value: 'local',
-                label: 'Local: a port here reaches a destination through the host',
-              },
-              {
-                value: 'remote',
-                label: 'Remote: a port on the host reaches a destination from here',
-              },
-              { value: 'dynamic', label: 'Dynamic: a SOCKS5 proxy on this computer' },
-            ]}
-          />
-          <div className="grid-2">
+          <FormCard title="General">
             <TextField
-              label="Listen address"
-              value={bindAddress}
-              onChange={setBindAddress}
+              label="Label"
+              value={label}
+              onChange={setLabel}
               disabled={readOnly}
-              spellCheck={false}
-              hint={kind === 'remote' ? 'On the remote host.' : 'On this computer.'}
+              autoFocus
             />
-            <TextField
-              label="Listen port"
-              value={bindPort}
-              onChange={setBindPort}
+            <ItemSelect
+              label="Host"
+              type="host"
+              value={hostId}
+              onChange={setHostId}
+              targetVaultId={vaultId}
               disabled={readOnly}
-              inputMode="numeric"
-              hint="0 lets the system choose."
+              noneLabel="Choose a host"
             />
-          </div>
-          {needsDest ? (
-            <div className="grid-2">
+            <Select
+              label="Type"
+              value={kind}
+              onChange={setKind}
+              disabled={readOnly}
+              options={[
+                {
+                  value: 'local',
+                  label: 'Local: a port here reaches a destination through the host',
+                },
+                {
+                  value: 'remote',
+                  label: 'Remote: a port on the host reaches a destination from here',
+                },
+                { value: 'dynamic', label: 'Dynamic: a SOCKS5 proxy on this computer' },
+              ]}
+            />
+          </FormCard>
+          <FormCard title="Listen">
+            <div className="grid-addr">
               <TextField
-                label="Destination host"
-                value={destHost}
-                onChange={setDestHost}
+                label="Listen address"
+                value={bindAddress}
+                onChange={setBindAddress}
                 disabled={readOnly}
                 spellCheck={false}
+                hint={kind === 'remote' ? 'On the remote host.' : 'On this computer.'}
               />
               <TextField
-                label="Destination port"
-                value={destPort}
-                onChange={setDestPort}
+                label="Listen port"
+                value={bindPort}
+                onChange={setBindPort}
                 disabled={readOnly}
                 inputMode="numeric"
+                hint="0 lets the system choose."
               />
             </div>
+          </FormCard>
+          {needsDest ? (
+            <FormCard title="Destination">
+              <div className="grid-addr">
+                <TextField
+                  label="Destination host"
+                  value={destHost}
+                  onChange={setDestHost}
+                  disabled={readOnly}
+                  spellCheck={false}
+                />
+                <TextField
+                  label="Destination port"
+                  value={destPort}
+                  onChange={setDestPort}
+                  disabled={readOnly}
+                  inputMode="numeric"
+                />
+              </div>
+            </FormCard>
           ) : null}
         </>
       )}

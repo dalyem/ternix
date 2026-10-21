@@ -12,7 +12,17 @@ import {
   writableVaults,
 } from '../items.js';
 import { closeEditor, type EditorTarget, toast, useStore } from '../store.js';
-import { Button, ConfirmDialog, ErrorText, Field, Modal, Notice, useAction } from '../ui.js';
+import {
+  Button,
+  ConfirmDialog,
+  Drawer,
+  ErrorText,
+  Field,
+  FormCard,
+  Modal,
+  Notice,
+  useAction,
+} from '../ui.js';
 
 export const ITEM_TYPE_LABEL: Record<ItemType, string> = {
   host: 'host',
@@ -94,60 +104,58 @@ export function EditorFrame({
   }
 
   return (
-    <Modal
-      title={readOnly ? `${title} (read only)` : title}
-      onClose={closeEditor}
-      wide
-      footer={
-        <>
-          {editing && !readOnly ? (
-            <Button variant="danger" onClick={() => setConfirmDelete(true)}>
-              Delete
-            </Button>
-          ) : null}
-          <span className="spacer" />
-          <Button onClick={closeEditor}>{readOnly ? 'Close' : 'Cancel'}</Button>
-          {!readOnly ? (
-            <Button
-              variant="primary"
-              busy={action.busy}
-              disabled={problem !== null}
-              title={problem ?? undefined}
-              onClick={() => void onSave()}
-            >
-              Save
-            </Button>
-          ) : null}
-        </>
-      }
-    >
-      <form
-        onSubmit={(e) => {
-          e.preventDefault();
+    <>
+      <Drawer
+        title={readOnly ? `${title} (read only)` : title}
+        subtitle={vault ? vaultTitle(vault) : undefined}
+        onClose={closeEditor}
+        onSubmit={() => {
           if (!readOnly && problem === null) void onSave();
         }}
+        footer={
+          <>
+            {editing && !readOnly ? (
+              <Button variant="danger" onClick={() => setConfirmDelete(true)}>
+                Delete
+              </Button>
+            ) : null}
+            <Button onClick={closeEditor}>{readOnly ? 'Close' : 'Cancel'}</Button>
+            {!readOnly ? (
+              <Button
+                variant="primary"
+                busy={action.busy}
+                disabled={problem !== null}
+                title={problem ?? undefined}
+                onClick={() => void onSave()}
+              >
+                Save
+              </Button>
+            ) : null}
+          </>
+        }
       >
         {readOnly ? (
           <Notice>You are a viewer in this vault, so you can look but not change.</Notice>
         ) : null}
         {!editing && writable.length > 1 ? (
-          <Field label="Vault">
-            {(id) => (
-              <select id={id} value={vaultId} onChange={(e) => setVaultId(e.target.value)}>
-                {writable.map((v) => (
-                  <option key={v.id} value={v.id}>
-                    {vaultTitle(v)}
-                    {v.kind === 'shared' ? ' (shared)' : ''}
-                  </option>
-                ))}
-              </select>
-            )}
-          </Field>
+          <FormCard>
+            <Field label="Vault">
+              {(id) => (
+                <select id={id} value={vaultId} onChange={(e) => setVaultId(e.target.value)}>
+                  {writable.map((v) => (
+                    <option key={v.id} value={v.id}>
+                      {vaultTitle(v)}
+                      {v.kind === 'shared' ? ' (shared)' : ''}
+                    </option>
+                  ))}
+                </select>
+              )}
+            </Field>
+          </FormCard>
         ) : null}
         {children({ vaultId, readOnly })}
         <ErrorText error={action.error} />
-        <button type="submit" hidden />
-      </form>
+      </Drawer>
       {confirmDelete && editing ? (
         <ConfirmDialog
           title={`Delete ${ITEM_TYPE_LABEL[editing.payload.type]}?`}
@@ -170,7 +178,7 @@ export function EditorFrame({
           }}
         />
       ) : null}
-    </Modal>
+    </>
   );
 }
 
@@ -389,16 +397,16 @@ export function SecretInput({
           />
         )}
         {secret.stored && !secret.touched && !secret.revealed ? (
-          <Button variant="ghost" busy={secret.busy} onClick={() => void show()}>
+          <Button variant="quiet" size="md" busy={secret.busy} onClick={() => void show()}>
             Show
           </Button>
         ) : !multiline ? (
-          <Button variant="ghost" onClick={() => setVisible((v) => !v)}>
+          <Button variant="quiet" size="md" onClick={() => setVisible((v) => !v)}>
             {visible ? 'Hide' : 'Show'}
           </Button>
         ) : null}
         {optional && !readOnly && secret.stored && !(secret.touched && secret.value === '') ? (
-          <Button variant="ghost" onClick={secret.remove}>
+          <Button variant="quiet" size="md" onClick={secret.remove}>
             Remove
           </Button>
         ) : null}

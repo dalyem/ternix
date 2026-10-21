@@ -16,23 +16,40 @@ import {
   useStore,
 } from './store.js';
 import { Badge, Button, EmptyState } from './ui.js';
+import { Braces, Copy, Plus, Search, Waypoints } from 'lucide-react';
 
 const isMac = navigator.userAgent.includes('Mac');
 const FONT_FAMILY =
-  'ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", "DejaVu Sans Mono", monospace';
+  '"Source Code Pro", "JetBrains Mono", ui-monospace, Menlo, Consolas, "Liberation Mono", monospace';
 const WRITE_CHUNK = 32 * 1024;
 /** After a page reload the terminal starts blank, without the modes the shell had set. */
 const DISPLAY_RESET_NOTICE =
   '\r\n\x1b[2m[Ternix] Display was reset after signing back in. ' +
   'Full-screen apps may need a redraw (Ctrl+L) or restart.\x1b[0m\r\n';
 
+/** The "Termius Dark" scheme: the default for every terminal, whatever the UI theme. */
 const THEME = {
-  background: '#0d0f12',
-  foreground: '#d6dae1',
-  cursor: '#8ab4ff',
-  selectionBackground: '#33466e',
-  black: '#1b1e24',
-  brightBlack: '#5b6270',
+  background: '#141729',
+  foreground: '#21B568',
+  cursor: '#21B568',
+  cursorAccent: '#141729',
+  selectionBackground: '#21B56880',
+  black: '#343851',
+  red: '#F24E50',
+  green: '#008463',
+  yellow: '#ECA855',
+  blue: '#08639F',
+  magenta: '#C13282',
+  cyan: '#2091F6',
+  white: '#E2E3E8',
+  brightBlack: '#8D91A5',
+  brightRed: '#FF7375',
+  brightGreen: '#3ED7BE',
+  brightYellow: '#FDC47D',
+  brightBlue: '#6BA0C3',
+  brightMagenta: '#FF7DC5',
+  brightCyan: '#44A7FF',
+  brightWhite: '#FFFFFF',
 };
 
 /** Send terminal input to the remote shell, in pieces the IPC limits accept. */
@@ -224,16 +241,18 @@ function TerminalPane({
   return (
     <div className="terminal-pane" style={{ display: active ? 'flex' : 'none' }}>
       <div className="terminal-toolbar">
-        <div className="terminal-title">
+        <div className="terminal-title ellipsis">
           <strong>{dto.label}</strong>
-          <span className="muted mono"> {dto.target}</span>
+          <span className="mono"> {dto.target}</span>
         </div>
         <span className="spacer" />
-        <Button variant="ghost" onClick={() => setSearching((s) => !s)}>
+        <Button variant="ghost" size="md" icon={Search} onClick={() => setSearching((s) => !s)}>
           Search
         </Button>
         <Button
           variant="ghost"
+          size="md"
+          icon={Braces}
           aria-pressed={panel === 'snippets'}
           onClick={() => onPanel(panel === 'snippets' ? null : 'snippets')}
         >
@@ -241,6 +260,8 @@ function TerminalPane({
         </Button>
         <Button
           variant="ghost"
+          size="md"
+          icon={Waypoints}
           aria-pressed={panel === 'forwards'}
           onClick={() => onPanel(panel === 'forwards' ? null : 'forwards')}
         >
@@ -248,6 +269,8 @@ function TerminalPane({
         </Button>
         <Button
           variant="ghost"
+          size="md"
+          icon={Copy}
           onClick={() => {
             const text = handle.current?.term.getSelection() ?? '';
             if (text) call('clipboard.write', { text }).catch(reportError);
@@ -268,6 +291,7 @@ function TerminalPane({
             <>
               <Button
                 variant="primary"
+                size="md"
                 onClick={() => {
                   const t = handle.current?.term;
                   void reconnectTerminal(id, t?.cols ?? 120, t?.rows ?? 32);
@@ -275,7 +299,9 @@ function TerminalPane({
               >
                 Reconnect
               </Button>
-              <Button onClick={() => void closeTerminal(id)}>Close tab</Button>
+              <Button size="md" onClick={() => void closeTerminal(id)}>
+                Close tab
+              </Button>
             </>
           ) : null}
         </div>
@@ -301,9 +327,18 @@ function TerminalPane({
               }
             }}
           />
-          <Button onClick={() => find('previous')}>Prev</Button>
-          <Button type="submit">Next</Button>
-          <Button variant="ghost" onClick={() => setSearching(false)}>
+          <Button size="md" onClick={() => find('previous')}>
+            Prev
+          </Button>
+          <Button size="md" type="submit">
+            Next
+          </Button>
+          <Button
+            variant="ghost"
+            size="md"
+            aria-label="Close search"
+            onClick={() => setSearching(false)}
+          >
             ✕
           </Button>
         </form>
@@ -337,6 +372,7 @@ function SnippetsPanel({ dto }: { dto: TerminalDto }) {
           <pre className="snippet-preview">{s.payload.script.slice(0, 200)}</pre>
           <div className="row">
             <Button
+              size="sm"
               disabled={!ready}
               onClick={() => sendInput(dto.id, asInput(s.payload.script))}
               title="Type the script into the terminal without running it"
@@ -345,6 +381,7 @@ function SnippetsPanel({ dto }: { dto: TerminalDto }) {
             </Button>
             <Button
               variant="primary"
+              size="sm"
               disabled={!ready}
               onClick={() => sendInput(dto.id, asInput(s.payload.script) + '\r')}
             >
@@ -394,6 +431,7 @@ function ForwardRow({ dto, forward }: { dto: TerminalDto; forward: ForwardDto })
       <div className="row">
         <Button
           variant={running ? 'default' : 'primary'}
+          size="sm"
           busy={busy}
           disabled={dto.state !== 'ready'}
           onClick={() => void toggle()}
@@ -418,6 +456,8 @@ function ForwardsPanel({ dto }: { dto: TerminalDto }) {
       {dto.hostId ? (
         <>
           <Button
+            size="md"
+            icon={Plus}
             onClick={() => openEditor({ type: 'port_forward', preset: { host_id: dto.hostId! } })}
           >
             New port forward for this host

@@ -201,7 +201,8 @@ compromised renderer can still:
   `auth.register` are refused while signed in and from a page whose logout is still running,
   and leaving the session reloads the page and refuses the old page's requests.
   It can write what it read to the page's web storage (`localStorage`, `sessionStorage`),
-  which survives the reload; the app never reads either, so only a new compromise of the
+  which survives the reload; the app never reads either (except the theme choice, a value
+  checked against `system`, `dark` and `light`), so only a new compromise of the
   fresh page could pick it up;
 - read snippets and notes in bulk with `items.all` (only `password`, `passphrase` and
   `private_key` are held back): do not keep secrets in snippet scripts or notes;
@@ -223,6 +224,20 @@ session. The desktop app drops its own references once the session has signed in
 resolved connection right after `connect`, and a typed quick-connect password (kept in the
 tab's source until then, so a failed first attempt can be retried) as soon as that attempt has
 signed in.
+
+## Look and feel
+
+The renderer follows a documented design system (palette, metrics and component anatomy of
+a desktop SSH client; no third-party assets): `styles.css` defines every colour as a custom
+property and components use only those tokens. The light theme is the same set resolved with
+`light-dark()`; Settings → Appearance picks Dark (default), Light or System (`theme.ts`, kept
+in the page's own storage because it is not security relevant). The tab bar is the title bar
+(`titleBarStyle: 'hiddenInset'` on macOS, a `titleBarOverlay` on Windows and Linux; the page
+pads for the window buttons with `env(titlebar-area-*)`), the vault filter is a menu under the
+Vaults tab, hosts and keys are cards, and every item editor is a 340px drawer (a floating panel
+over a terminal) instead of a dialog. The terminals use the "Termius Dark" colour scheme
+whatever the UI theme. Fonts are bundled (Inter, Source Code Pro; both OFL) and icons come from
+`lucide-react`, so the CSP stays `font-src 'self'` (the build never inlines fonts as `data:`).
 
 ## Packaging
 
@@ -268,7 +283,8 @@ the mark-verified flow) and a malicious server: the test rewrites a member's `pu
 the server's SQLite database and checks that removal and rotation open the key change dialog,
 send nothing until the new fingerprint is accepted, and then go through. By default the SSH server is an in-process `ssh2` server
 with a fake shell; set `E2E_SSH_ADDRESS`, `E2E_SSH_PORT`, `E2E_SSH_USER` and `E2E_SSH_PASSWORD`
-to use a real OpenSSH `sshd`. Screenshots go to `e2e/artifacts/` (ignored by git).
+to use a real OpenSSH `sshd`. Screenshots go to `e2e/artifacts/` (ignored by git); `e2e/restyle.e2e.ts` writes a full-window
+PNG of each main screen (`restyle-*.png`) for design review.
 
 ```sh
 pnpm run build:packages && pnpm --filter @ternix/server build
